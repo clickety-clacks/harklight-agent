@@ -1829,9 +1829,14 @@ fn emit_pending(
     Ok(!follow && printed)
 }
 
+#[derive(serde::Serialize)]
+enum FinalTerminal {
+    NoComment,
+}
+
 fn event_line(entry: &JournalEntry, pending_remaining: usize) -> Value {
     let raw = files::file_event_view(&entry.raw, &entry.file_transfers);
-    json!({
+    let mut line = json!({
         "kind":"event",
         "session_handle":entry.session_handle,
         "event_id":entry.event_id,
@@ -1845,7 +1850,13 @@ fn event_line(entry: &JournalEntry, pending_remaining: usize) -> Value {
         "acted":entry.acted_at_ms.is_some() || entry.raw["acted"] == true,
         "pending_remaining":pending_remaining,
         "entry":raw
-    })
+    });
+
+    if entry.kind == "terminal" && raw["terminal_kind"] == "no_comment" {
+        line["final_terminal"] = json!(FinalTerminal::NoComment);
+    }
+
+    line
 }
 
 fn read_status(context: &CommandContext, session: Uuid) -> Result<Value, CommandError> {
