@@ -1,0 +1,2552 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use serde_json::{Map, Value, json};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::{
+    api::{ApiError, OriginClient},
+    config::{EnrolledIdentity, default_state_root},
+    files::{self, PreparedFiles, ServerFileLimits},
+    journal::{Journal, JournalEntry, JournalError, JournalStore, OperationRecord, OperationState},
+};
+
+pub const EXIT_REFUSED: i32 = 2;
+pub const EXIT_UNSUPPORTED: i32 = 5;
+pub const EXIT_LISTENER_ACTIVE: i32 = 6;
+pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct CommandError {
+    pub message: String,
+    pub exit_code: i32,
+}
+
+impl CommandError {
+    fn new(message: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            message: message.into(),
+            exit_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginHarness {
+    ClaudeCode,
+    Codex,
+    Other,
+}
+
+impl OriginHarness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Other => "other",
+        }
+    }
+
+    fn unsupported_reason(self) -> Value {
+        match self {
+            Self::ClaudeCode => Value::Null,
+            Self::Codex => Value::String(
+                "Codex listening is unsupported until AE-CX1 is authorized and passes".into(),
+            ),
+            Self::Other => Value::String(
+                "this CLI build does not implement listening for the other route".into(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionContext {
+    Interactive,
+    Bare,
+    Print,
+    Sdk,
+}
+
+pub struct CommandContext {
+    pub api: OriginClient,
+    pub state_root: PathBuf,
+    pub device_id: String,
+}
+
+impl CommandContext {
+    pub fn load(
+        identity_dir: Option<&Path>,
+        ca_file: Option<&Path>,
+        origin_port: Option<u16>,
+        state_dir: Option<&Path>,
+    ) -> Result<Self, String> {
+        let identity_dir = identity_dir
+            .map(Path::to_path_buf)
+            .or_else(|| env_path("HARKLIGHT_IDENTITY_DIR"))
+            .ok_or_else(|| "provide --identity-dir or HARKLIGHT_IDENTITY_DIR".to_owned())?;
+        let ca_file = ca_file
+            .map(Path::to_path_buf)
+            .or_else(|| env_path("HARKLIGHT_CA_FILE"))
+            .ok_or_else(|| {
+                "provide --ca-file or HARKLIGHT_CA_FILE for the enrolled server CA".to_owned()
+            })?;
+        let state_root = state_dir
+            .map(Path::to_path_buf)
+            .or_else(|| env_path("HARKLIGHT_AGENT_STATE_DIR"))
+            .map(Ok)
+            .unwrap_or_else(default_state_root)
+            .map_err(|error| error.to_string())?;
+        let identity =
+            EnrolledIdentity::load(&identity_dir, &ca_file).map_err(|error| error.to_string())?;
+        let device_id = identity.device_id.clone();
+        let api = OriginClient::new(identity, origin_port).map_err(|error| error.to_string())?;
+        Ok(Self {
+            api,
+            state_root,
+            device_id,
+        })
+    }
+
+    fn open_store(&self, session: Uuid) -> Result<JournalStore, CommandError> {
+        JournalStore::open(&self.state_root, &self.device_id, session)
+            .map_err(|error| journal_error(error, 1))
+    }
+
+    fn open_global_store(&self) -> Result<JournalStore, CommandError> {
+        self.open_store(Uuid::nil())
+    }
+}
+
+pub fn unsupported(operation: &str, reason: &str) -> Result<(), CommandError> {
+    emit(&json!({"kind":"unsupported", "operation":operation, "reason":reason}))?;
+    Err(CommandError::new(reason, EXIT_UNSUPPORTED))
+}
+
+fn prepare_outgoing_files(
+    context: &CommandContext,
+    store: &JournalStore,
+    session: Uuid,
+    op_id: Uuid,
+    paths: &[PathBuf],
+    operation: &str,
+    draft: Value,
+) -> Result<PreparedFiles, CommandError> {
+    if paths.is_empty() {
+        return Ok(PreparedFiles {
+            entries: Vec::new(),
+            uploads: Vec::new(),
+        });
+    }
+    let selections = files::inspect(paths).map_err(|reason| CommandError::new(reason, 1))?;
+    let selection_view: Vec<Value> = selections
+        .iter()
+        .map(|file| {
+            json!({
+                "name":file.name,
+                "path":file.path,
+                "size_bytes":file.size_bytes
+            })
+        })
+        .collect();
+    let limits_response = match context.api.post(&json!({"v":1,"type":"file_limits"})) {
+        Ok(response) if response["type"] == "ok" => response,
+        Ok(response) => {
+            let reason = response["reason"]
+                .as_str()
+                .unwrap_or("origin did not provide file limits")
+                .to_owned();
+            emit(&json!({
+                "kind":"file_limits_unavailable",
+                "operation":operation,
+                "sent":false,
+                "reason":reason,
+                "draft":draft,
+                "files":selection_view
+            }))?;
+            return Err(CommandError::new(
+                "origin file limits are unavailable; nothing was submitted",
+                EXIT_UNSUPPORTED,
+            ));
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            emit(&json!({
+                "kind":"file_limits_unavailable",
+                "operation":operation,
+                "sent":false,
+                "reason":reason,
+                "draft":draft,
+                "files":selection_view
+            }))?;
+            return Err(CommandError::new(
+                "could not read origin file limits; nothing was submitted",
+                1,
+            ));
+        }
+    };
+    let limits = match ServerFileLimits::from_response(&limits_response) {
+        Ok(limits) => limits,
+        Err(reason) => {
+            emit(&json!({
+                "kind":"file_limits_unavailable",
+                "operation":operation,
+                "sent":false,
+                "reason":reason,
+                "draft":draft,
+                "files":selection_view
+            }))?;
+            return Err(CommandError::new(
+                "origin returned unusable file limits; nothing was submitted",
+                EXIT_UNSUPPORTED,
+            ));
+        }
+    };
+    let staging_directory = store.upload_staging_directory(session, op_id);
+    match files::prepare_outgoing(paths, &limits, &staging_directory) {
+        Ok(prepared) => Ok(prepared),
+        Err(reason) => {
+            emit(&json!({
+                "kind":"file_preparation_refused",
+                "operation":operation,
+                "sent":false,
+                "reason":reason,
+                "inline_decoded_bytes_per_entry":limits.inline_decoded_bytes_per_entry,
+                "upload_cap_bytes_per_file":limits.upload_cap_json(),
+                "draft":draft,
+                "files":selection_view
+            }))?;
+            Err(CommandError::new(reason, EXIT_REFUSED))
+        }
+    }
+}
+
+fn validate_request_size(request: &Value) -> Result<(), CommandError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|error| CommandError::new(format!("could not encode request: {error}"), 1))?;
+    if body.len() as u64 > files::MAX_ORIGIN_REQUEST_BYTES {
+        return Err(CommandError::new(
+            "origin request exceeds its existing 2 MiB body bound; nothing was submitted",
+            EXIT_UNSUPPORTED,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_request_pre_upload(request: &Value) -> Result<(), CommandError> {
+    let mut projected = request.clone();
+    if let Some(files) = projected.get_mut("files").and_then(Value::as_array_mut) {
+        for file in files {
+            let Some(object) = file.as_object_mut() else {
+                continue;
+            };
+            if object.remove("upload_pending") == Some(Value::Bool(true)) {
+                object.insert(
+                    "upload_id".into(),
+                    Value::String("00000000-0000-4000-8000-000000000000".into()),
+                );
+            }
+        }
+    }
+    validate_request_size(&projected)
+}
+
+fn validate_send_route(
+    session_arg: &str,
+    route: Option<OriginHarness>,
+) -> Result<Option<OriginHarness>, CommandError> {
+    if session_arg == "new" && route.is_none() {
+        return Err(CommandError::new(
+            "--route is required when minting a new session handle",
+            EXIT_REFUSED,
+        ));
+    }
+    if session_arg != "new" && route.is_some() {
+        return Err(CommandError::new(
+            "--route is only accepted when minting a new session handle",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(route)
+}
+
+pub fn send(
+    context: &CommandContext,
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    files: &[PathBuf],
+) -> Result<(), CommandError> {
+    let route = validate_send_route(session_arg, route)?;
+    let file_draft = json!({
+        "session":session_arg,
+        "sender_id":sender_id,
+        "title":title,
+        "body":body,
+        "choices":choices,
+        "vendor_session_id":vendor_session_id,
+        "route":route.map(OriginHarness::as_str)
+    });
+    let session = if session_arg == "new" {
+        Uuid::new_v4()
+    } else {
+        parse_session(session_arg)?
+    };
+    let message_id = Uuid::new_v4().to_string();
+    let op_id = Uuid::new_v4();
+    let mut store = context.open_store(session)?;
+    let prepared_files =
+        prepare_outgoing_files(context, &store, session, op_id, files, "send", file_draft)?;
+    let mut message = json!({
+        "sender_id": sender_id,
+        "message_id": message_id,
+        "created_at": now_ms(),
+        "title": title
+    });
+    if let Some(body) = body {
+        message["body"] = Value::String(body.to_owned());
+    }
+    if !choices.is_empty() {
+        message["choices"] = json!(choices);
+    }
+
+    let mut request = json!({
+        "v": 1,
+        "type": "send",
+        "op_id": op_id.to_string(),
+        "session_handle": session.to_string(),
+        "message": message
+    });
+    if let Some(route) = route {
+        request["route"] = Value::String(route.as_str().to_owned());
+        request["cli_version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
+        request["unsupported_reason"] = route.unsupported_reason();
+    }
+    if let Some(vendor_session_id) = vendor_session_id {
+        request["vendor_session_id"] = Value::String(vendor_session_id.to_owned());
+    }
+    if !prepared_files.entries.is_empty() {
+        request["files"] = Value::Array(prepared_files.entries.clone());
+    }
+    if let Err(error) = validate_request_pre_upload(&request) {
+        files::cleanup_staged_uploads(&prepared_files.uploads);
+        return Err(error);
+    }
+    let expected_session = session.to_string();
+    let operation = prepare_with_uploads(
+        &mut store,
+        session,
+        op_id,
+        "send",
+        request,
+        prepared_files.uploads,
+    )?;
+    let response = submit_operation(context, &mut store, operation)?;
+    let response_session = response["session_handle"]
+        .as_str()
+        .unwrap_or(&expected_session);
+    if response_session != expected_session {
+        return Err(CommandError::new(
+            "server send response named a different origin session",
+            1,
+        ));
+    }
+    emit(&json!({
+        "request": message_id,
+        "sender_id": sender_id,
+        "session": session,
+        "revision": response["revision"].as_u64().unwrap_or(1),
+        "listening_support": response.get("listening_support").cloned().unwrap_or(Value::Null)
+    }))
+}
+
+pub fn ack(context: &CommandContext, session: Uuid, event_id: &str) -> Result<(), CommandError> {
+    validate_event_id(event_id)?;
+    let mut store = context.open_global_store()?;
+    let entry = store
+        .entry_by_event(event_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "event is not in the durable journal; run listen --next first",
+                1,
+            )
+        })?;
+    if entry.session_handle != session {
+        return Err(CommandError::new(
+            "event belongs to a different origin session",
+            EXIT_REFUSED,
+        ));
+    }
+    if !entry.actionable || entry.own_entry() {
+        return Err(CommandError::new(
+            "only a person or server actionable event can be acknowledged",
+            EXIT_REFUSED,
+        ));
+    }
+    if entry.delivered_at_ms.is_some() && server_file_transfers_complete(&entry.raw) {
+        return emit(&json!({
+            "kind":"acknowledged",
+            "event_id":event_id,
+            "status":"already_delivered",
+            "acted":entry.acted_at_ms.is_some() || entry.raw["acted"] == true
+        }));
+    }
+    let response = acknowledge_event(context, &mut store, event_id, true)?;
+    let status = response["status"].as_str().unwrap_or_default();
+    let acted = response["acted"] == true;
+    emit(&json!({
+        "kind":"acknowledged",
+        "event_id":event_id,
+        "status":status,
+        "acted":acted,
+        "file_transfers":response.get("file_transfers").cloned().unwrap_or(Value::Null)
+    }))
+}
+
+pub fn file_use(
+    context: &CommandContext,
+    session: Uuid,
+    event_id: &str,
+    file_name: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<(), CommandError> {
+    validate_event_id(event_id)?;
+    let outcome = match (status, reason) {
+        ("used", None) => json!({"status":"used"}),
+        ("used", Some(_)) => {
+            return Err(CommandError::new(
+                "--reason is only valid with --unusable",
+                EXIT_REFUSED,
+            ));
+        }
+        ("unusable", Some(reason)) if !reason.trim().is_empty() => {
+            json!({"status":"unusable","reason":reason})
+        }
+        ("unusable", _) => {
+            return Err(CommandError::new(
+                "--unusable requires a nonempty --reason",
+                EXIT_REFUSED,
+            ));
+        }
+        _ => return Err(CommandError::new("invalid file-use outcome", EXIT_REFUSED)),
+    };
+
+    let mut store = context.open_global_store()?;
+    let entry = store
+        .entry_by_event(event_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "event is not in the durable journal; listen for it before reporting file use",
+                EXIT_REFUSED,
+            )
+        })?;
+    if entry.session_handle != session || !entry.actionable || entry.own_entry() {
+        return Err(CommandError::new(
+            "file-use event does not belong to this origin session",
+            EXIT_REFUSED,
+        ));
+    }
+    if entry.delivered_at_ms.is_none() {
+        return Err(CommandError::new(
+            "ack the event before reporting file use",
+            EXIT_REFUSED,
+        ));
+    }
+    let file_present = entry.raw["files"]
+        .as_array()
+        .is_some_and(|files| files.iter().any(|file| file["name"] == file_name));
+    if !file_present {
+        return Err(CommandError::new(
+            "file name is not attached to this event",
+            EXIT_REFUSED,
+        ));
+    }
+    if !entry
+        .file_transfers
+        .get(file_name)
+        .is_some_and(|transfer| transfer.transferred)
+    {
+        return Err(CommandError::new(
+            "the file was not transferred to this session; file use was not reported",
+            EXIT_REFUSED,
+        ));
+    }
+    if entry.raw["file_transfers"][file_name]["status"].as_str() != Some("transferred") {
+        return Err(CommandError::new(
+            "the server has not confirmed this file as transferred; file use was not reported",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let op_id = Uuid::new_v4();
+    let mut request = json!({
+        "v":1,
+        "type":"file_use",
+        "op_id":op_id,
+        "event_id":event_id,
+        "file":file_name,
+        "status":status
+    });
+    if let Some(reason) = reason {
+        request["reason"] = Value::String(reason.to_owned());
+    }
+    let operation = prepare(&mut store, session, op_id, "file_use", request)?;
+    let response = submit_operation(context, &mut store, operation)?;
+    if response["status"].as_str() != Some(status) {
+        return Err(CommandError::new(
+            "origin file-use response did not confirm the requested outcome",
+            EXIT_REFUSED,
+        ));
+    }
+    store
+        .record_server_file_use(event_id, file_name, outcome)
+        .map_err(|error| journal_error(error, 1))?;
+    emit_committed("file_use", op_id, response)
+}
+
+pub fn reply(
+    context: &CommandContext,
+    session: Uuid,
+    request_id: &str,
+    in_reply_to: &str,
+    text: &str,
+    files: &[PathBuf],
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    let file_draft = json!({
+        "request":request_id,
+        "in_reply_to":in_reply_to,
+        "text":text
+    });
+    validate_event_id(in_reply_to)?;
+    let mut store = context.open_store(session)?;
+    let snapshot = store
+        .request_snapshot(session, request_id, Some(in_reply_to))
+        .map_err(|error| journal_error(error, 1))?;
+    let request = request_context(&snapshot, session, request_id)?;
+    ensure_request_open(&snapshot, session, &request)?;
+    let event = delivered_event(
+        &snapshot,
+        session,
+        &request,
+        in_reply_to,
+        "discussion",
+        false,
+    )?;
+    ensure_current_revision(request.revision, event.request_revision)?;
+    let revision = request.revision;
+    let op_id = op_id.unwrap_or_else(Uuid::new_v4);
+    let prepared_files =
+        prepare_outgoing_files(context, &store, session, op_id, files, "reply", file_draft)?;
+    let mut body = json!({
+        "v": 1,
+        "type": "reply",
+        "op_id": op_id.to_string(),
+        "sender_id": request.sender_id,
+        "message_id": request.message_id,
+        "request_revision": revision,
+        "in_reply_to": in_reply_to,
+        "text": text
+    });
+    if !prepared_files.entries.is_empty() {
+        body["files"] = Value::Array(prepared_files.entries.clone());
+    }
+    if let Err(error) = validate_request_pre_upload(&body) {
+        files::cleanup_staged_uploads(&prepared_files.uploads);
+        return Err(error);
+    }
+    let operation = prepare_with_uploads(
+        &mut store,
+        session,
+        op_id,
+        "reply",
+        std::mem::take(&mut body),
+        prepared_files.uploads,
+    )?;
+    let response = submit_operation(context, &mut store, operation)?;
+    emit_committed("reply", op_id, response)
+}
+
+pub fn revise(
+    context: &CommandContext,
+    session: Uuid,
+    request_id: &str,
+    base_revision: u64,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    clear_choices: bool,
+    in_reply_to: Option<&str>,
+    files: &[PathBuf],
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    if clear_choices && !choices.is_empty() {
+        return Err(CommandError::new(
+            "use either --choice or --clear-choices, not both",
+            1,
+        ));
+    }
+    let file_draft = json!({
+        "request":request_id,
+        "base_revision":base_revision,
+        "title":title,
+        "body":body,
+        "choices":choices,
+        "clear_choices":clear_choices,
+        "in_reply_to":in_reply_to
+    });
+    let mut store = context.open_store(session)?;
+    let snapshot = store
+        .request_snapshot(session, request_id, in_reply_to)
+        .map_err(|error| journal_error(error, 1))?;
+    let request = request_context(&snapshot, session, request_id)?;
+    ensure_request_open(&snapshot, session, &request)?;
+    if base_revision != request.revision {
+        return Err(CommandError::new(
+            format!(
+                "request is at revision {}; revise from that base revision",
+                request.revision
+            ),
+            EXIT_REFUSED,
+        ));
+    }
+    if let Some(event_id) = in_reply_to {
+        validate_event_id(event_id)?;
+        let event = delivered_event(&snapshot, session, &request, event_id, "discussion", false)?;
+        ensure_current_revision(request.revision, event.request_revision)?;
+    }
+    let mut message = request.message.clone();
+    message["title"] = Value::String(title.to_owned());
+    message["created_at"] = Value::from(now_ms());
+    if let Some(body) = body {
+        message["body"] = Value::String(body.to_owned());
+    }
+    if !choices.is_empty() {
+        message["choices"] = json!(choices);
+    }
+    if clear_choices {
+        if let Some(object) = message.as_object_mut() {
+            object.remove("choices");
+        }
+    }
+    message["sender_id"] = Value::String(request.sender_id.clone());
+    message["message_id"] = Value::String(request.message_id.clone());
+    let op_id = op_id.unwrap_or_else(Uuid::new_v4);
+    let prepared_files =
+        prepare_outgoing_files(context, &store, session, op_id, files, "revise", file_draft)?;
+    let mut command = json!({
+        "v":1,
+        "type":"revise",
+        "op_id":op_id.to_string(),
+        "sender_id":request.sender_id,
+        "message_id":request.message_id,
+        "base_revision":base_revision,
+        "message":message
+    });
+    if let Some(event_id) = in_reply_to {
+        command["in_reply_to"] = Value::String(event_id.to_owned());
+    }
+    if !prepared_files.entries.is_empty() {
+        command["files"] = Value::Array(prepared_files.entries.clone());
+    }
+    if let Err(error) = validate_request_pre_upload(&command) {
+        files::cleanup_staged_uploads(&prepared_files.uploads);
+        return Err(error);
+    }
+    let operation = prepare_with_uploads(
+        &mut store,
+        session,
+        op_id,
+        "revise",
+        std::mem::take(&mut command),
+        prepared_files.uploads,
+    )?;
+    let response = submit_operation(context, &mut store, operation)?;
+    emit_committed("revise", op_id, response)
+}
+
+pub fn withdraw(
+    context: &CommandContext,
+    session: Uuid,
+    request_id: &str,
+    in_reply_to: Option<&str>,
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    let mut store = context.open_store(session)?;
+    let snapshot = store
+        .request_snapshot(session, request_id, in_reply_to)
+        .map_err(|error| journal_error(error, 1))?;
+    let request = request_context(&snapshot, session, request_id)?;
+    ensure_request_open(&snapshot, session, &request)?;
+    if let Some(event_id) = in_reply_to {
+        validate_event_id(event_id)?;
+        let event = delivered_event(&snapshot, session, &request, event_id, "discussion", false)?;
+        ensure_current_revision(request.revision, event.request_revision)?;
+    }
+    let mut command = json!({
+        "v":1,
+        "type":"withdraw",
+        "op_id":op_id.unwrap_or_else(Uuid::new_v4).to_string(),
+        "sender_id":request.sender_id,
+        "message_id":request.message_id
+    });
+    if let Some(event_id) = in_reply_to {
+        command["in_reply_to"] = Value::String(event_id.to_owned());
+    }
+    let op_id = parse_uuid_field(&command, "op_id")?;
+    let operation = prepare(&mut store, session, op_id, "withdraw", command)?;
+    let response = submit_operation(context, &mut store, operation)?;
+    emit_committed("withdraw", op_id, response)
+}
+
+/// Retract a sender-authored request using its durable journal identity.
+/// This is the same v1 withdraw operation as the legacy command, without an
+/// in_reply_to discussion-turn reference.
+pub fn retract(
+    context: &CommandContext,
+    session: Uuid,
+    request_id: &str,
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    withdraw(context, session, request_id, None, op_id)
+}
+
+fn discard_uploads_request(
+    op_id: Uuid,
+    sender_id: &str,
+    message_id: &str,
+    revision: u64,
+) -> Result<Value, CommandError> {
+    if op_id.get_version_num() != 4 {
+        return Err(CommandError::new(
+            "cleanup operation key must be UUIDv4",
+            EXIT_REFUSED,
+        ));
+    }
+    if sender_id.trim().is_empty() || message_id.trim().is_empty() || revision == 0 {
+        return Err(CommandError::new(
+            "cleanup requires a sender, message identity and positive revision",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(json!({
+        "v":1,
+        "type":"discard_uploads",
+        "op_id":op_id.to_string(),
+        "sender_id":sender_id,
+        "message_id":message_id,
+        "revision":revision
+    }))
+}
+
+fn valid_discard_uploads_response(response: &Value) -> bool {
+    response["type"] == "ok"
+        && matches!(response["state"].as_str(), Some("discarded" | "committed"))
+        && response["discarded"].as_u64().is_some()
+}
+
+fn emit_discard_uploads_committed(
+    op_id: Uuid,
+    request: &Value,
+    response: &Value,
+) -> Result<(), CommandError> {
+    emit(&json!({
+        "kind":"committed",
+        "operation":"discard_uploads",
+        "op_id":op_id,
+        "sender_id":request["sender_id"],
+        "message_id":request["message_id"],
+        "revision":request["revision"],
+        "state":response["state"],
+        "discarded":response["discarded"],
+        "response":response
+    }))
+}
+
+/// Perform cleanup only when the caller has observed explicit navigation
+/// away from a message. The local journal makes the exact scope and op key
+/// recoverable if the response is lost.
+pub fn discard_uploads(
+    context: &CommandContext,
+    sender_id: &str,
+    message_id: &str,
+    revision: u64,
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    let op_id = op_id.unwrap_or_else(Uuid::new_v4);
+    let request = discard_uploads_request(op_id, sender_id, message_id, revision)?;
+    let mut store = context.open_global_store()?;
+    let operation = prepare(
+        &mut store,
+        Uuid::nil(),
+        op_id,
+        "discard_uploads",
+        request.clone(),
+    )?;
+    let response = submit_operation(context, &mut store, operation)?;
+    emit_discard_uploads_committed(op_id, &request, &response)
+}
+
+pub fn result(
+    context: &CommandContext,
+    session: Uuid,
+    request_id: &str,
+    in_reply_to: &str,
+    status: &str,
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    validate_event_id(in_reply_to)?;
+    let mut store = context.open_store(session)?;
+    let snapshot = store
+        .request_snapshot(session, request_id, Some(in_reply_to))
+        .map_err(|error| journal_error(error, 1))?;
+    let request = request_context(&snapshot, session, request_id)?;
+    let prior_received = snapshot.entries.values().any(|entry| {
+        entry.session_handle == session
+            && entry.sender_id.as_deref() == Some(request.sender_id.as_str())
+            && entry.request_id.as_deref() == Some(request.message_id.as_str())
+            && entry.kind == "result"
+            && entry.raw["in_reply_to"].as_str() == Some(in_reply_to)
+            && entry.raw["status"] == "received"
+    });
+    let may_update_received = prior_received && matches!(status, "applied" | "refused");
+    let event = delivered_event(
+        &snapshot,
+        session,
+        &request,
+        in_reply_to,
+        "terminal",
+        may_update_received,
+    )?;
+    if event.raw["terminal_state"] != "answered" {
+        return Err(CommandError::new(
+            "result is valid only for an answered terminal event",
+            EXIT_REFUSED,
+        ));
+    }
+    if event.acted_at_ms.is_some() && !may_update_received {
+        return Err(CommandError::new(
+            "answered event is already acted; only a prior received result can be updated",
+            EXIT_REFUSED,
+        ));
+    }
+    let command = json!({
+        "v":1,
+        "type":"result",
+        "op_id":op_id.unwrap_or_else(Uuid::new_v4).to_string(),
+        "sender_id":request.sender_id,
+        "message_id":request.message_id,
+        "in_reply_to":in_reply_to,
+        "status":status
+    });
+    let op_id = parse_uuid_field(&command, "op_id")?;
+    let operation = prepare(&mut store, session, op_id, "result", command)?;
+    let response = submit_operation(context, &mut store, operation)?;
+    emit_committed("result", op_id, response)
+}
+
+pub fn status(context: &CommandContext, session: Uuid) -> Result<(), CommandError> {
+    let response = read_status(context, session)?;
+    emit(&response)
+}
+
+pub fn session_end(context: &CommandContext, session: Uuid) -> Result<(), CommandError> {
+    let request = json!({
+        "v":1,
+        "type":"session_end",
+        "session_handle":session.to_string(),
+        "gone":true
+    });
+    let response = match context.api.post(&request) {
+        Ok(response) => response,
+        Err(error) if error.outcome_unknown() => {
+            emit(&json!({"kind":"outcome_unknown","operation":"session-end","session":session}))?;
+            return Err(CommandError::new(error.to_string(), EXIT_OUTCOME_UNKNOWN));
+        }
+        Err(error) => return Err(api_error(error, 1)),
+    };
+    if response["type"] == "error" {
+        return refused("session-end", None, response);
+    }
+    emit(&response)
+}
+
+pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> {
+    let mut store = context.open_global_store()?;
+    let operation = store
+        .operation(op_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| CommandError::new(format!("no recorded operation with key {op_id}"), 1))?;
+    match operation.state {
+        OperationState::Committed => {
+            let response = operation
+                .response
+                .clone()
+                .ok_or_else(|| CommandError::new("committed operation has no saved response", 1))?;
+            persist_file_use_response(&mut store, &operation, &response)?;
+            if operation.kind == "discard_uploads" {
+                emit_discard_uploads_committed(op_id, &operation.request, &response)
+            } else {
+                emit_committed(&operation.kind, op_id, response)
+            }
+        }
+        OperationState::Rejected => refused(
+            &operation.kind,
+            Some(op_id),
+            operation.response.unwrap_or(Value::Null),
+        ),
+        OperationState::Prepared | OperationState::Unknown => {
+            let mut scoped = context.open_store(operation.session_handle)?;
+            let response = submit_operation(context, &mut scoped, operation.clone())?;
+            persist_file_use_response(&mut scoped, &operation, &response)?;
+            if operation.kind == "discard_uploads" {
+                emit_discard_uploads_committed(op_id, &operation.request, &response)
+            } else {
+                emit_committed("retry", op_id, response)
+            }
+        }
+    }
+}
+
+fn persist_file_use_response(
+    store: &mut JournalStore,
+    operation: &OperationRecord,
+    response: &Value,
+) -> Result<(), CommandError> {
+    if operation.kind != "file_use"
+        || response["type"] != "ok"
+        || response["status"] != operation.request["status"]
+    {
+        return Ok(());
+    }
+    let event_id = operation.request["event_id"]
+        .as_str()
+        .ok_or_else(|| CommandError::new("file-use operation has no event id", 1))?;
+    let file_name = operation.request["file"]
+        .as_str()
+        .ok_or_else(|| CommandError::new("file-use operation has no file name", 1))?;
+    let mut outcome = json!({"status":operation.request["status"]});
+    if let Some(reason) = operation.request["reason"].as_str() {
+        outcome["reason"] = Value::String(reason.to_owned());
+    }
+    store
+        .record_server_file_use(event_id, file_name, outcome)
+        .map_err(|error| journal_error(error, 1))
+}
+
+pub fn listen(
+    context: &CommandContext,
+    session: Uuid,
+    session_context: Option<SessionContext>,
+    claude_code_version: Option<&str>,
+    background_tasks_enabled: bool,
+    follow: bool,
+) -> Result<(), CommandError> {
+    let mut store = context.open_store(session)?;
+    store.acquire_listener().map_err(|error| {
+        let code = if matches!(
+            error,
+            JournalError::ListenerActive(_) | JournalError::ListenerActiveUnknown
+        ) {
+            EXIT_LISTENER_ACTIVE
+        } else {
+            1
+        };
+        journal_error(error, code)
+    })?;
+
+    let current_status = read_status(context, session)?;
+    let support = current_status["listening_support"]
+        .as_object()
+        .ok_or_else(|| {
+            let reason = "this handle has no listening support record; route cannot be inferred";
+            let _ = emit(&json!({
+                "kind":"unsupported",
+                "operation":"listen",
+                "session_handle":session,
+                "reason":reason,
+                "listening_support":null
+            }));
+            CommandError::new(reason, EXIT_UNSUPPORTED)
+        })?;
+    let route = match support.get("route").and_then(Value::as_str) {
+        Some("claude-code") => OriginHarness::ClaudeCode,
+        Some("codex") => OriginHarness::Codex,
+        Some("other") => OriginHarness::Other,
+        _ => {
+            return unsupported(
+                "listen",
+                "the server support record has no recognized route; no stream was attached",
+            );
+        }
+    };
+    let unsupported_reason = listener_unsupported_reason(
+        route,
+        session_context,
+        claude_code_version,
+        background_tasks_enabled,
+    );
+    let arm = json!({
+        "v":1,
+        "type":"support",
+        "op_id":Uuid::new_v4().to_string(),
+        "session_handle":session.to_string(),
+        "route":route.as_str(),
+        "cli_version":env!("CARGO_PKG_VERSION"),
+        "unsupported_reason":unsupported_reason.clone()
+    });
+    let arm_op_id = parse_uuid_field(&arm, "op_id")?;
+    let operation = prepare(&mut store, session, arm_op_id, "support", arm)?;
+    let arm_response = submit_operation(context, &mut store, operation)?;
+    if let Some(reason) = unsupported_reason.as_str() {
+        emit(&json!({
+            "kind":"unsupported",
+            "operation":"listen",
+            "session_handle":session,
+            "route":route.as_str(),
+            "reason":reason,
+            "listening_support":arm_response.get("listening_support").cloned().unwrap_or(Value::Null)
+        }))?;
+        return Err(CommandError::new(reason, EXIT_UNSUPPORTED));
+    }
+    let armed_status = read_status(context, session)?;
+    if armed_status["listening_support"]["route"].as_str() != Some(route.as_str())
+        || armed_status["listening_support"]["cli_version"].as_str()
+            != Some(env!("CARGO_PKG_VERSION"))
+        || !armed_status["listening_support"]["unsupported_reason"].is_null()
+    {
+        let reason = "origin did not confirm the supported arm-time record; no stream was attached";
+        emit(&json!({
+            "kind":"unsupported",
+            "operation":"listen",
+            "session_handle":session,
+            "route":route.as_str(),
+            "reason":reason,
+            "listening_support":armed_status.get("listening_support").cloned().unwrap_or(Value::Null)
+        }))?;
+        return Err(CommandError::new(reason, EXIT_UNSUPPORTED));
+    }
+
+    let mut offered = BTreeSet::new();
+    let mut reconnect_delay = Duration::from_millis(250);
+    let max_reconnect_delay = Duration::from_secs(30);
+    loop {
+        let mut stream = match context.api.connect_stream(session) {
+            Ok(stream) => {
+                // A reconnect is an interruption boundary. Re-offer all
+                // still-pending entries from the durable journal, preserving
+                // their delivered/acted facts in each line.
+                offered.clear();
+                reconnect_delay = Duration::from_millis(250);
+                stream
+            }
+            Err(error) if stream_should_reconnect(&error) => {
+                eprintln!(
+                    "Harklight origin stream unavailable; retrying after disconnect: {error}"
+                );
+                thread::sleep(reconnect_delay);
+                reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+                continue;
+            }
+            Err(ApiError::Refused(reason)) if reason.contains("already_listening") => {
+                return Err(CommandError::new(
+                    "origin session already has a server listener attached",
+                    EXIT_LISTENER_ACTIVE,
+                ));
+            }
+            Err(error) => return Err(api_error(error, EXIT_LISTENER_ACTIVE)),
+        };
+
+        reconcile_session(context, &mut store, session)?;
+        fetch_feed(context, &mut store)?;
+        let status = read_status(context, session)?;
+        if emit_pending(&mut store, session, follow, &mut offered)? {
+            return Ok(());
+        }
+        if session_idle(&status)? {
+            emit(&json!({"kind":"idle","open_requests":0}))?;
+            return Ok(());
+        }
+
+        loop {
+            match stream.next_change() {
+                Ok(notice_cursor) => {
+                    let journal_cursor = store.cursor().map_err(|error| journal_error(error, 1))?;
+                    if notice_cursor <= journal_cursor {
+                        continue;
+                    }
+                    fetch_feed(context, &mut store)?;
+                    let status = read_status(context, session)?;
+                    if emit_pending(&mut store, session, follow, &mut offered)? {
+                        return Ok(());
+                    }
+                    if session_idle(&status)? {
+                        emit(&json!({"kind":"idle","open_requests":0}))?;
+                        return Ok(());
+                    }
+                }
+                Err(ApiError::StreamEnded | ApiError::StreamIo(_)) => break,
+                Err(error) => return Err(api_error(error, 1)),
+            }
+        }
+        eprintln!("Harklight origin stream disconnected; reconnecting");
+        thread::sleep(reconnect_delay);
+        reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+    }
+}
+
+fn listener_unsupported_reason(
+    route: OriginHarness,
+    session_context: Option<SessionContext>,
+    claude_code_version: Option<&str>,
+    background_tasks_enabled: bool,
+) -> Value {
+    let reason = match route {
+        OriginHarness::ClaudeCode if session_context != Some(SessionContext::Interactive) => {
+            Some("Claude Code listening requires an interactive terminal session")
+        }
+        OriginHarness::ClaudeCode if !background_tasks_enabled => {
+            Some("Claude Code background tasks are not enabled for this session")
+        }
+        OriginHarness::ClaudeCode
+            if !claude_code_version
+                .is_some_and(|version| version_at_least(version, [2, 1, 234])) =>
+        {
+            Some("Claude Code 2.1.234 or later is required for between-turn notifications")
+        }
+        OriginHarness::ClaudeCode => None,
+        OriginHarness::Codex => {
+            Some("Codex listening is unsupported until AE-CX1 is authorized and passes")
+        }
+        OriginHarness::Other => {
+            Some("this CLI build does not implement listening for the other route")
+        }
+    };
+    reason
+        .map(|reason| Value::String(reason.into()))
+        .unwrap_or(Value::Null)
+}
+
+fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
+    version
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .filter_map(|token| {
+            let components: Vec<u64> = token
+                .split('.')
+                .take(3)
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            (components.len() == 3).then_some([components[0], components[1], components[2]])
+        })
+        .any(|version| version >= minimum)
+}
+
+fn reconcile_session(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    session: Uuid,
+) -> Result<(), CommandError> {
+    let ack_ids: Vec<String> = store
+        .pending_acknowledgements_for(session)
+        .map_err(|error| journal_error(error, 1))?
+        .into_iter()
+        .map(|entry| entry.event_id.clone())
+        .collect();
+    for event_id in ack_ids {
+        acknowledge_event(context, store, &event_id, false)?;
+    }
+
+    let mut operations = store
+        .unknown_operations_for(session)
+        .map_err(|error| journal_error(error, 1))?;
+    operations.sort_by_key(|operation| (operation.created_at_ms, operation.op_id));
+    for operation in operations {
+        match submit_operation(context, store, operation) {
+            Ok(_) => {}
+            Err(error) if error.exit_code == EXIT_REFUSED => {
+                // A definite refusal resolves the old submission. The
+                // authoritative feed below will determine remaining work.
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn acknowledge_event(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    event_id: &str,
+    announce: bool,
+) -> Result<Value, CommandError> {
+    let entry = store
+        .entry_by_event(event_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| CommandError::new("event is not in the durable journal", EXIT_REFUSED))?;
+    let mut request = json!({"v":1,"type":"ack","event_id":event_id});
+    if let Some(files) = entry.raw["files"]
+        .as_array()
+        .filter(|files| !files.is_empty())
+    {
+        if entry.file_transfers.len() != files.len() {
+            return Err(CommandError::new(
+                "not every received file has a recorded transfer outcome",
+                EXIT_REFUSED,
+            ));
+        }
+        let mut reports = Vec::with_capacity(files.len());
+        for file in files {
+            let name = file["name"]
+                .as_str()
+                .ok_or_else(|| CommandError::new("received file has no name", EXIT_REFUSED))?;
+            let transfer = entry.file_transfers.get(name).ok_or_else(|| {
+                CommandError::new(
+                    format!("received file {name} has no recorded transfer outcome"),
+                    EXIT_REFUSED,
+                )
+            })?;
+            if transfer.transferred {
+                if transfer.path.is_none() {
+                    return Err(CommandError::new(
+                        format!("received file {name} has no saved path"),
+                        EXIT_REFUSED,
+                    ));
+                }
+                reports.push(json!({"name":name,"status":"transferred"}));
+            } else {
+                let reason = transfer
+                    .reason
+                    .as_deref()
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or("local file write failed");
+                reports.push(json!({
+                    "name":name,
+                    "status":"not_transferred",
+                    "reason":reason
+                }));
+            }
+        }
+        request["file_transfers"] = Value::Array(reports);
+    }
+    store
+        .mark_ack_pending(event_id)
+        .map_err(|error| journal_error(error, 1))?;
+    let response = match context.api.post(&request) {
+        Ok(response) => response,
+        Err(error) if error.outcome_unknown() => {
+            if announce {
+                emit(
+                    &json!({"kind":"outcome_unknown","operation":"ack","event_id":event_id,"retry":"run the same ack --event command"}),
+                )?;
+            }
+            return Err(CommandError::new(error.to_string(), EXIT_OUTCOME_UNKNOWN));
+        }
+        Err(error) => return Err(api_error(error, 1)),
+    };
+    if response["type"] == "error" {
+        let reason = response["reason"].as_str().unwrap_or("refused");
+        if announce {
+            emit(
+                &json!({"kind":"refused","operation":"ack","event_id":event_id,"reason":reason,"response":response}),
+            )?;
+        }
+        return Err(CommandError::new(
+            format!("ack refused: {reason}"),
+            EXIT_REFUSED,
+        ));
+    }
+    let status = response["status"].as_str().unwrap_or_default();
+    if !matches!(status, "delivered" | "already_delivered") {
+        return Err(CommandError::new(
+            "ack response did not contain a delivery status",
+            1,
+        ));
+    }
+    let transfers = response
+        .get("file_transfers")
+        .filter(|transfers| transfers.is_object())
+        .cloned()
+        .or_else(|| ack_file_transfer_map(&request));
+    if let Some(transfers) = transfers {
+        store
+            .record_server_file_transfers(event_id, transfers)
+            .map_err(|error| journal_error(error, 1))?;
+    }
+    store
+        .mark_delivered(event_id)
+        .map_err(|error| journal_error(error, 1))?;
+    if response["acted"] == true {
+        store
+            .mark_acted(event_id)
+            .map_err(|error| journal_error(error, 1))?;
+    }
+    Ok(response)
+}
+
+fn server_file_transfers_complete(entry: &Value) -> bool {
+    let Some(files) = entry.get("files").and_then(Value::as_array) else {
+        return true;
+    };
+    files.iter().all(|file| {
+        file.get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| entry["file_transfers"][name]["status"].as_str())
+            .is_some_and(|status| matches!(status, "transferred" | "not_transferred"))
+    })
+}
+
+/// The server returns the accepted per-file ACK facts keyed by file name. A
+/// repeated ACK may return only `already_delivered`; in that case, the exact
+/// report we just retried is authoritative because a conflicting report is
+/// refused by the server.
+fn ack_file_transfer_map(request: &Value) -> Option<Value> {
+    let reports = request.get("file_transfers")?.as_array()?;
+    let mut transfers = serde_json::Map::new();
+    for report in reports {
+        let name = report.get("name")?.as_str()?;
+        let status = report.get("status")?.as_str()?;
+        let mut outcome = serde_json::Map::new();
+        outcome.insert("status".into(), Value::String(status.into()));
+        if let Some(reason) = report.get("reason").and_then(Value::as_str) {
+            outcome.insert("reason".into(), Value::String(reason.into()));
+        }
+        transfers.insert(name.into(), Value::Object(outcome));
+    }
+    Some(Value::Object(transfers))
+}
+
+fn submit_operation(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    operation: OperationRecord,
+) -> Result<Value, CommandError> {
+    let op_id = operation.op_id;
+    let staged_paths: Vec<PathBuf> = operation
+        .uploads
+        .iter()
+        .filter_map(|upload| upload.staged_path.clone())
+        .collect();
+    let result = match upload_pending_files(context, store, operation) {
+        Ok(operation) => submit_operation_inner(context, store, operation, true),
+        Err(error) => Err(error),
+    };
+    let settled = store
+        .operation(op_id)
+        .ok()
+        .flatten()
+        .is_some_and(|operation| {
+            matches!(
+                operation.state,
+                OperationState::Committed | OperationState::Rejected
+            )
+        });
+    if settled {
+        for path in staged_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+fn upload_pending_files(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    operation: OperationRecord,
+) -> Result<OperationRecord, CommandError> {
+    if operation.uploads.is_empty()
+        || matches!(
+            operation.state,
+            OperationState::Committed | OperationState::Rejected
+        )
+    {
+        return Ok(operation);
+    }
+    let (sender_id, message_id, request_revision) = upload_binding(&operation.request)?;
+    let mut current = operation;
+    for upload in current.uploads.clone() {
+        if upload.upload_id.is_some() {
+            continue;
+        }
+        let path = upload.staged_path.as_deref().ok_or_else(|| {
+            CommandError::new(
+                format!(
+                    "staged bytes for file {} are unavailable; the entry was not submitted",
+                    upload.name
+                ),
+                EXIT_OUTCOME_UNKNOWN,
+            )
+        })?;
+        store
+            .mark_operation_unknown(current.op_id)
+            .map_err(|error| journal_error(error, 1))?;
+        let response = match context.api.upload_file(
+            current.op_id,
+            &sender_id,
+            &message_id,
+            request_revision,
+            &upload.name,
+            path,
+            upload.size_bytes,
+        ) {
+            Ok(response) if response["type"] == "ok" => response,
+            Ok(response) => {
+                let reason = response["reason"]
+                    .as_str()
+                    .unwrap_or("origin refused the upload")
+                    .to_owned();
+                store
+                    .reject_operation(current.op_id, response.clone())
+                    .map_err(|error| journal_error(error, 1))?;
+                emit(&json!({
+                    "kind":"upload_refused",
+                    "file":upload.name,
+                    "op_id":current.op_id,
+                    "sent":false,
+                    "reason":reason,
+                    "cap_bytes_per_file":upload.upload_cap_bytes_per_file,
+                    "response":response
+                }))?;
+                return Err(CommandError::new(
+                    format!(
+                        "file {} upload refused: {reason}; no entry was submitted",
+                        upload.name
+                    ),
+                    EXIT_REFUSED,
+                ));
+            }
+            Err(error) => {
+                if let Some(reason) = known_upload_refusal(&error) {
+                    store
+                        .reject_operation(
+                            current.op_id,
+                            json!({"kind":"upload_refused","file":upload.name,"reason":reason}),
+                        )
+                        .map_err(|error| journal_error(error, 1))?;
+                    emit(&json!({
+                        "kind":"upload_refused",
+                        "file":upload.name,
+                        "op_id":current.op_id,
+                        "sent":false,
+                        "reason":reason,
+                        "cap_bytes_per_file":upload.upload_cap_bytes_per_file
+                    }))?;
+                    return Err(CommandError::new(
+                        format!(
+                            "file {} upload failed: {reason}; no entry was submitted",
+                            upload.name
+                        ),
+                        EXIT_REFUSED,
+                    ));
+                }
+                if error.outcome_unknown() {
+                    emit(&json!({
+                        "kind":"outcome_unknown",
+                        "operation":"upload",
+                        "file":upload.name,
+                        "op_id":current.op_id,
+                        "session_handle":current.session_handle,
+                        "retry":"run harklight-agent retry --op-id with this exact key"
+                    }))?;
+                    return Err(CommandError::new(
+                        format!("upload outcome for {} is unknown: {error}", upload.name),
+                        EXIT_OUTCOME_UNKNOWN,
+                    ));
+                }
+                let reason = error.to_string();
+                store
+                    .reject_operation(
+                        current.op_id,
+                        json!({"kind":"upload_refused","file":upload.name,"reason":reason}),
+                    )
+                    .map_err(|error| journal_error(error, 1))?;
+                emit(&json!({
+                    "kind":"upload_refused",
+                    "file":upload.name,
+                    "op_id":current.op_id,
+                    "sent":false,
+                    "reason":reason,
+                    "cap_bytes_per_file":upload.upload_cap_bytes_per_file
+                }))?;
+                return Err(CommandError::new(
+                    format!(
+                        "file {} upload failed: {reason}; no entry was submitted",
+                        upload.name
+                    ),
+                    EXIT_REFUSED,
+                ));
+            }
+        };
+        let upload_id = response["upload_id"]
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|value| value.get_version_num() == 4)
+            .ok_or_else(|| {
+                CommandError::new(
+                    "upload response identity is invalid; retry the exact operation key",
+                    EXIT_OUTCOME_UNKNOWN,
+                )
+            })?;
+        if response["name"].as_str() != Some(upload.name.as_str())
+            || response["size"].as_u64() != Some(upload.size_bytes)
+            || response["sha256"].as_str() != Some(upload.sha256.as_str())
+        {
+            return Err(CommandError::new(
+                format!(
+                    "upload response for {} does not match the staged bytes; retry the exact operation key",
+                    upload.name
+                ),
+                EXIT_OUTCOME_UNKNOWN,
+            ));
+        }
+        store
+            .record_operation_upload(current.op_id, &upload.name, upload_id.to_string())
+            .map_err(|error| journal_error(error, 1))?;
+        current = store
+            .operation(current.op_id)
+            .map_err(|error| journal_error(error, 1))?
+            .ok_or_else(|| CommandError::new("operation disappeared after upload", 1))?;
+    }
+    if let Err(error) = validate_request_size(&current.request) {
+        store
+            .reject_operation(
+                current.op_id,
+                json!({"kind":"request_too_large","reason":error.message}),
+            )
+            .map_err(|error| journal_error(error, 1))?;
+        return Err(error);
+    }
+    Ok(current)
+}
+
+fn known_upload_refusal(error: &ApiError) -> Option<String> {
+    match error {
+        ApiError::Local(_) | ApiError::Config(_) => Some(error.to_string()),
+        ApiError::Http { status, body } if (400..500).contains(status) => Some(
+            serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|response| response["reason"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("HTTP {status}: {body}")),
+        ),
+        ApiError::Http { status: 503, body }
+            if serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|response| response["reason"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("storage_unavailable") =>
+        {
+            Some("storage_unavailable".into())
+        }
+        _ => None,
+    }
+}
+
+fn upload_binding(request: &Value) -> Result<(String, String, u64), CommandError> {
+    let sender_id = request["message"]["sender_id"]
+        .as_str()
+        .or_else(|| request["sender_id"].as_str())
+        .ok_or_else(|| CommandError::new("file upload operation has no sender_id", 1))?
+        .to_owned();
+    let message_id = request["message"]["message_id"]
+        .as_str()
+        .or_else(|| request["message_id"].as_str())
+        .ok_or_else(|| CommandError::new("file upload operation has no message_id", 1))?
+        .to_owned();
+    let request_revision = match request["type"].as_str() {
+        Some("send") => 1,
+        Some("reply") => request["request_revision"]
+            .as_u64()
+            .ok_or_else(|| CommandError::new("reply has no request revision", 1))?,
+        Some("revise") => request["base_revision"]
+            .as_u64()
+            .and_then(|revision| revision.checked_add(1))
+            .ok_or_else(|| CommandError::new("revision has no valid next revision", 1))?,
+        _ => {
+            return Err(CommandError::new(
+                "operation cannot carry uploaded files",
+                1,
+            ));
+        }
+    };
+    Ok((sender_id, message_id, request_revision))
+}
+
+fn submit_operation_inner(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    operation: OperationRecord,
+    announce: bool,
+) -> Result<Value, CommandError> {
+    match operation.state {
+        OperationState::Committed => {
+            return operation
+                .response
+                .ok_or_else(|| CommandError::new("committed operation has no saved response", 1));
+        }
+        OperationState::Rejected => {
+            return Err(CommandError::new(
+                "operation was previously refused",
+                EXIT_REFUSED,
+            ));
+        }
+        OperationState::Prepared | OperationState::Unknown => {}
+    }
+    store
+        .mark_operation_unknown(operation.op_id)
+        .map_err(|error| journal_error(error, 1))?;
+
+    let response = match context.api.post(&operation.request) {
+        Ok(response) if response["type"] == "ok" => response,
+        Ok(response) if response["type"] == "error" => {
+            store
+                .reject_operation(operation.op_id, response.clone())
+                .map_err(|error| journal_error(error, 1))?;
+            let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+            if announce {
+                refused(&operation.kind, Some(operation.op_id), response)?;
+            }
+            return Err(CommandError::new(
+                format!("{} refused: {reason}", operation.kind),
+                EXIT_REFUSED,
+            ));
+        }
+        Ok(response) => {
+            store
+                .reject_operation(operation.op_id, response.clone())
+                .map_err(|error| journal_error(error, 1))?;
+            let message = "origin returned an unexpected application envelope";
+            if announce {
+                emit(
+                    &json!({"kind":"refused","operation":operation.kind,"op_id":operation.op_id,"response":response}),
+                )?;
+            }
+            return Err(CommandError::new(message, EXIT_REFUSED));
+        }
+        Err(error) if error.outcome_unknown() => {
+            if announce {
+                let mut line = json!({
+                    "kind":"outcome_unknown",
+                    "operation":operation.kind,
+                    "op_id":operation.op_id,
+                    "retry":"run harklight-agent retry --op-id with this exact key"
+                });
+                if operation.session_handle != Uuid::nil() {
+                    line["session_handle"] = Value::String(operation.session_handle.to_string());
+                }
+                if let Some(request_id) = operation.request["message"]["message_id"]
+                    .as_str()
+                    .or_else(|| operation.request["message_id"].as_str())
+                {
+                    line["request_id"] = Value::String(request_id.to_owned());
+                }
+                if let Some(sender_id) = operation.request["message"]["sender_id"]
+                    .as_str()
+                    .or_else(|| operation.request["sender_id"].as_str())
+                {
+                    line["sender_id"] = Value::String(sender_id.to_owned());
+                }
+                emit(&line)?;
+            }
+            return Err(CommandError::new(error.to_string(), EXIT_OUTCOME_UNKNOWN));
+        }
+        Err(error) => {
+            let saved = json!({"kind":"transport_refusal","message":error.to_string()});
+            store
+                .reject_operation(operation.op_id, saved)
+                .map_err(|error| journal_error(error, 1))?;
+            return Err(api_error(error, 1));
+        }
+    };
+
+    if operation.kind == "discard_uploads" && !valid_discard_uploads_response(&response) {
+        if announce {
+            emit(&json!({
+                "kind":"outcome_unknown",
+                "operation":"discard_uploads",
+                "op_id":operation.op_id,
+                "sender_id":operation.request["sender_id"],
+                "message_id":operation.request["message_id"],
+                "revision":operation.request["revision"],
+                "response":response,
+                "retry":"run harklight-agent retry --op-id with this exact key"
+            }))?;
+        }
+        return Err(CommandError::new(
+            "origin accepted cleanup without a valid state and deleted-count result; retry the same operation key",
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
+
+    let acted_event = operation.request["in_reply_to"].as_str();
+    store
+        .settle_operation(operation.op_id, response.clone(), acted_event)
+        .map_err(|error| journal_error(error, 1))?;
+    Ok(response)
+}
+
+fn prepare(
+    store: &mut JournalStore,
+    session: Uuid,
+    op_id: Uuid,
+    kind: &str,
+    request: Value,
+) -> Result<OperationRecord, CommandError> {
+    store
+        .prepare_operation(op_id, session, kind.to_owned(), request)
+        .map_err(|error| journal_error(error, 1))
+}
+
+fn prepare_with_uploads(
+    store: &mut JournalStore,
+    session: Uuid,
+    op_id: Uuid,
+    kind: &str,
+    request: Value,
+    uploads: Vec<crate::journal::UploadSource>,
+) -> Result<OperationRecord, CommandError> {
+    store
+        .prepare_operation_with_uploads(op_id, session, kind.to_owned(), request, uploads)
+        .map_err(|error| journal_error(error, 1))
+}
+
+fn fetch_feed(context: &CommandContext, store: &mut JournalStore) -> Result<(), CommandError> {
+    let since = store.cursor().map_err(|error| journal_error(error, 1))?;
+    let response = post_read(context, &json!({"v":1,"type":"feed","since":since}))?;
+    let high_water = response["cursor"]
+        .as_u64()
+        .ok_or_else(|| CommandError::new("feed response has no integer cursor", 1))?;
+    if high_water < since {
+        return Err(CommandError::new(
+            format!("feed cursor regressed from {since} to {high_water}"),
+            1,
+        ));
+    }
+    let entries = response["entries"]
+        .as_array()
+        .ok_or_else(|| CommandError::new("feed response has no entries array", 1))?;
+
+    for raw in entries {
+        let event_id = raw["event_id"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("feed entry has no event_id", 1))?;
+        let feed_seq = validate_event_id(event_id)?;
+        let session_handle = raw["session_handle"]
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|value| value.get_version_num() == 4)
+            .ok_or_else(|| CommandError::new("feed entry has an invalid session_handle", 1))?;
+        let kind = raw["kind"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("feed entry has no kind", 1))?
+            .to_owned();
+        let author = raw["author"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("feed entry has no author", 1))?
+            .to_owned();
+        let actionable = matches!(kind.as_str(), "discussion" | "terminal") && author != "origin";
+        let sender_id = raw["sender_id"].as_str().map(str::to_owned);
+        let request_id = raw["message_id"].as_str().map(str::to_owned);
+        let request_revision = raw["request_revision"].as_u64();
+        let mut raw = raw.clone();
+        let file_transfers = if actionable {
+            let directory = store.event_file_directory(session_handle, event_id);
+            files::materialize_incoming(&mut raw, &directory, &context.api)
+                .map_err(|error| CommandError::new(error, 1))?
+        } else {
+            files::strip_file_payloads(&mut raw);
+            BTreeMap::new()
+        };
+        let mut entry = JournalEntry::fetched(
+            feed_seq,
+            event_id.to_owned(),
+            session_handle,
+            kind,
+            author,
+            actionable,
+            sender_id,
+            request_id,
+            request_revision,
+            raw,
+        );
+        entry.file_transfers = file_transfers;
+        store
+            .record_entry(entry)
+            .map_err(|error| journal_error(error, 1))?;
+    }
+
+    let cursor = store.cursor().map_err(|error| journal_error(error, 1))?;
+    if cursor < high_water {
+        return Err(CommandError::new(
+            format!("feed returned cursor {high_water} but journal reached only {cursor}"),
+            1,
+        ));
+    }
+    Ok(())
+}
+
+fn emit_pending(
+    store: &mut JournalStore,
+    session: Uuid,
+    follow: bool,
+    offered: &mut BTreeSet<String>,
+) -> Result<bool, CommandError> {
+    let pending = store
+        .pending_for(session)
+        .map_err(|error| journal_error(error, 1))?;
+    let mut candidates = Vec::new();
+    for (index, entry) in pending.iter().enumerate() {
+        if !offered.contains(&entry.event_id) {
+            candidates.push((entry.event_id.clone(), index, entry.clone()));
+            if !follow {
+                break;
+            }
+        }
+    }
+    let printed = !candidates.is_empty();
+    for (event_id, index, entry) in candidates {
+        let line = event_line(&entry, pending.len().saturating_sub(index + 1));
+        emit(&line)?;
+        store
+            .mark_emitted(&event_id)
+            .map_err(|error| journal_error(error, 1))?;
+        offered.insert(event_id);
+    }
+    Ok(!follow && printed)
+}
+
+fn event_line(entry: &JournalEntry, pending_remaining: usize) -> Value {
+    let raw = files::file_event_view(&entry.raw, &entry.file_transfers);
+    json!({
+        "kind":"event",
+        "session_handle":entry.session_handle,
+        "event_id":entry.event_id,
+        "feed_cursor":entry.feed_seq,
+        "request":{
+            "sender_id":entry.sender_id,
+            "message_id":entry.request_id
+        },
+        "request_revision":entry.request_revision,
+        "delivered":entry.delivered_at_ms.is_some() || entry.raw["delivered"] == true,
+        "acted":entry.acted_at_ms.is_some() || entry.raw["acted"] == true,
+        "pending_remaining":pending_remaining,
+        "entry":raw
+    })
+}
+
+fn read_status(context: &CommandContext, session: Uuid) -> Result<Value, CommandError> {
+    post_read(
+        context,
+        &json!({"v":1,"type":"status","session_handle":session.to_string()}),
+    )
+}
+
+fn post_read(context: &CommandContext, request: &Value) -> Result<Value, CommandError> {
+    let response = context
+        .api
+        .post(request)
+        .map_err(|error| api_error(error, 1))?;
+    if response["type"] == "error" {
+        let reason = response["reason"].as_str().unwrap_or("refused");
+        return Err(CommandError::new(
+            format!("origin refused the request: {reason}"),
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(response)
+}
+
+fn session_idle(status: &Value) -> Result<bool, CommandError> {
+    let open_requests = status["open_requests"]
+        .as_u64()
+        .ok_or_else(|| CommandError::new("status response has no open_requests count", 1))?;
+    let pending_undelivered = status["pending_undelivered"]
+        .as_u64()
+        .ok_or_else(|| CommandError::new("status response has no pending_undelivered count", 1))?;
+    let pending_delivered_unacted =
+        status["pending_delivered_unacted"]
+            .as_u64()
+            .ok_or_else(|| {
+                CommandError::new("status response has no pending_delivered_unacted count", 1)
+            })?;
+    Ok(open_requests == 0 && pending_undelivered == 0 && pending_delivered_unacted == 0)
+}
+
+fn stream_should_reconnect(error: &ApiError) -> bool {
+    matches!(error, ApiError::Transport(_) | ApiError::StreamIo(_))
+        || matches!(error, ApiError::Http { status, .. } if *status >= 500)
+}
+
+struct RequestContext {
+    sender_id: String,
+    message_id: String,
+    message: Value,
+    revision: u64,
+}
+
+fn request_context(
+    journal: &Journal,
+    session: Uuid,
+    message_id: &str,
+) -> Result<RequestContext, CommandError> {
+    let mut best: Option<(u64, Value)> = None;
+    for entry in journal.entries.values().rev().filter(|entry| {
+        entry.session_handle == session
+            && entry.kind == "revision"
+            && entry.request_id.as_deref() == Some(message_id)
+    }) {
+        if let (Some(revision), Some(message)) = (entry.request_revision, entry.raw.get("message"))
+        {
+            best = Some((revision, message.clone()));
+            break;
+        }
+    }
+
+    for operation in journal.operations.values() {
+        if operation.session_handle != session
+            || !matches!(
+                operation.kind.as_str(),
+                "send" | "revise" | "reply" | "withdraw" | "result"
+            )
+            || operation.state == OperationState::Rejected
+            || operation.request["message"]["message_id"]
+                .as_str()
+                .or_else(|| operation.request["message_id"].as_str())
+                != Some(message_id)
+        {
+            continue;
+        }
+        if operation.state != OperationState::Committed {
+            return Err(CommandError::new(
+                format!(
+                    "request has unresolved operation {}; retry it before continuing",
+                    operation.op_id
+                ),
+                EXIT_OUTCOME_UNKNOWN,
+            ));
+        }
+        if !matches!(operation.kind.as_str(), "send" | "revise") {
+            continue;
+        }
+        let revision = operation
+            .response
+            .as_ref()
+            .and_then(|response| response["revision"].as_u64())
+            .unwrap_or_else(|| {
+                operation.request["base_revision"]
+                    .as_u64()
+                    .map(|revision| revision + 1)
+                    .unwrap_or(1)
+            });
+        if best.as_ref().is_none_or(|(prior, _)| revision > *prior) {
+            best = Some((revision, operation.request["message"].clone()));
+        }
+    }
+    let (revision, message) = best.ok_or_else(|| {
+        CommandError::new(
+            format!("request {message_id} is not in session {session}'s journal"),
+            1,
+        )
+    })?;
+    let sender_id = message["sender_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| CommandError::new("recorded request has no sender_id", 1))?;
+    Ok(RequestContext {
+        sender_id,
+        message_id: message_id.to_owned(),
+        message,
+        revision,
+    })
+}
+
+fn ensure_request_open(
+    journal: &Journal,
+    session: Uuid,
+    request: &RequestContext,
+) -> Result<(), CommandError> {
+    let closed_by = journal.entries.values().find(|entry| {
+        entry.session_handle == session
+            && entry.kind == "terminal"
+            && entry.sender_id.as_deref() == Some(request.sender_id.as_str())
+            && entry.request_id.as_deref() == Some(request.message_id.as_str())
+    });
+    if let Some(terminal) = closed_by {
+        return Err(CommandError::new(
+            format!(
+                "request is closed by terminal event {}; no further reply, revision or withdrawal is allowed",
+                terminal.event_id
+            ),
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_current_revision(
+    request_revision: u64,
+    event_revision: Option<u64>,
+) -> Result<(), CommandError> {
+    if event_revision != Some(request_revision) {
+        return Err(CommandError::new(
+            "event belongs to an older request revision; refresh the current request before acting",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(())
+}
+
+fn delivered_event<'a>(
+    journal: &'a Journal,
+    session: Uuid,
+    request: &RequestContext,
+    event_id: &str,
+    expected_kind: &str,
+    allow_acted: bool,
+) -> Result<&'a JournalEntry, CommandError> {
+    let entry = journal.entry_by_event(event_id).ok_or_else(|| {
+        CommandError::new(format!("event {event_id} is not in the durable journal"), 1)
+    })?;
+    if entry.session_handle != session
+        || entry.sender_id.as_deref() != Some(request.sender_id.as_str())
+        || entry.request_id.as_deref() != Some(request.message_id.as_str())
+        || entry.kind != expected_kind
+        || entry.author == "origin"
+        || !entry.actionable
+    {
+        return Err(CommandError::new(
+            "event does not belong to this origin session and request",
+            EXIT_REFUSED,
+        ));
+    }
+    if entry.delivered_at_ms.is_none() {
+        return Err(CommandError::new(
+            "ack this event first; delivery is recorded only after server confirmation",
+            EXIT_REFUSED,
+        ));
+    }
+    if entry.acted_at_ms.is_some() && !allow_acted {
+        return Err(CommandError::new(
+            "event is already acted; do not submit another operation for it",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(entry)
+}
+
+fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), CommandError> {
+    emit(&json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response}))
+}
+
+fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), CommandError> {
+    let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+    let mut output = Map::new();
+    output.insert("kind".into(), Value::String("refused".into()));
+    output.insert("operation".into(), Value::String(operation.into()));
+    if let Some(op_id) = op_id {
+        output.insert("op_id".into(), Value::String(op_id.to_string()));
+    }
+    output.insert("reason".into(), Value::String(reason.clone()));
+    output.insert("response".into(), response);
+    emit(&Value::Object(output))?;
+    Err(CommandError::new(
+        format!("{operation} refused: {reason}"),
+        EXIT_REFUSED,
+    ))
+}
+
+fn emit(value: &Value) -> Result<(), CommandError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| CommandError::new(format!("could not encode output: {error}"), 1))?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    output
+        .write_all(&bytes)
+        .and_then(|()| output.write_all(b"\n"))
+        .and_then(|()| output.flush())
+        .map_err(|error| CommandError::new(format!("stdout write failed: {error}"), 1))
+}
+
+fn api_error(error: ApiError, exit_code: i32) -> CommandError {
+    CommandError::new(error.to_string(), exit_code)
+}
+
+fn journal_error(error: JournalError, fallback_code: i32) -> CommandError {
+    let code = if matches!(
+        error,
+        JournalError::ListenerActive(_) | JournalError::ListenerActiveUnknown
+    ) {
+        EXIT_LISTENER_ACTIVE
+    } else {
+        fallback_code
+    };
+    CommandError::new(error.to_string(), code)
+}
+
+fn parse_session(value: &str) -> Result<Uuid, CommandError> {
+    let session = Uuid::parse_str(value)
+        .map_err(|_| CommandError::new("session must be a UUIDv4 or the word new", 1))?;
+    if session.get_version_num() != 4 {
+        return Err(CommandError::new("session handle must be UUIDv4", 1));
+    }
+    Ok(session)
+}
+
+fn validate_event_id(event_id: &str) -> Result<u64, CommandError> {
+    let sequence = event_id.parse::<u64>().map_err(|_| {
+        CommandError::new("event ID must be a canonical positive decimal string", 1)
+    })?;
+    if sequence == 0 || sequence.to_string() != event_id {
+        return Err(CommandError::new(
+            "event ID must be a canonical positive decimal string",
+            1,
+        ));
+    }
+    Ok(sequence)
+}
+
+fn parse_uuid_field(request: &Value, field: &str) -> Result<Uuid, CommandError> {
+    let value = request[field]
+        .as_str()
+        .ok_or_else(|| CommandError::new(format!("operation request has no {field}"), 1))?;
+    let id = Uuid::parse_str(value)
+        .map_err(|_| CommandError::new(format!("operation {field} is not UUIDv4"), 1))?;
+    if id.get_version_num() != 4 {
+        return Err(CommandError::new(
+            format!("operation {field} is not UUIDv4"),
+            1,
+        ));
+    }
+    Ok(id)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name).map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("harklight-agent-command-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn route_is_required_only_when_minting_a_session_handle() {
+        assert!(matches!(
+            validate_send_route("new", None),
+            Err(error) if error.exit_code == EXIT_REFUSED
+        ));
+        assert_eq!(
+            validate_send_route("new", Some(OriginHarness::ClaudeCode)).unwrap(),
+            Some(OriginHarness::ClaudeCode)
+        );
+        assert_eq!(
+            validate_send_route(&Uuid::new_v4().to_string(), None).unwrap(),
+            None
+        );
+        assert!(matches!(
+            validate_send_route("existing", Some(OriginHarness::ClaudeCode)),
+            Err(error) if error.exit_code == EXIT_REFUSED
+        ));
+    }
+
+    #[test]
+    fn navigation_cleanup_request_keeps_exact_scope_and_recovers_the_same_operation() {
+        let scratch = Scratch::new();
+        let op_id = Uuid::new_v4();
+        let request = discard_uploads_request(op_id, "app:example", "message-1", 3).unwrap();
+        assert_eq!(
+            request,
+            json!({
+                "v":1,
+                "type":"discard_uploads",
+                "op_id":op_id.to_string(),
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "revision":3
+            })
+        );
+        assert!(discard_uploads_request(op_id, " ", "message-1", 3).is_err());
+        assert!(discard_uploads_request(op_id, "app:example", "message-1", 0).is_err());
+
+        {
+            let mut store = JournalStore::open(&scratch.0, "device", Uuid::nil()).unwrap();
+            store
+                .prepare_operation(
+                    op_id,
+                    Uuid::nil(),
+                    "discard_uploads".into(),
+                    request.clone(),
+                )
+                .unwrap();
+            store.mark_operation_unknown(op_id).unwrap();
+        }
+
+        let mut reopened = JournalStore::open(&scratch.0, "device", Uuid::nil()).unwrap();
+        let saved = reopened
+            .snapshot()
+            .unwrap()
+            .operations
+            .get(&op_id)
+            .unwrap()
+            .clone();
+        assert_eq!(saved.state, OperationState::Unknown);
+        assert_eq!(saved.request, request);
+        assert_eq!(
+            reopened
+                .prepare_operation(
+                    op_id,
+                    Uuid::nil(),
+                    "discard_uploads".into(),
+                    request.clone(),
+                )
+                .unwrap()
+                .request,
+            request
+        );
+    }
+
+    #[test]
+    fn cleanup_response_requires_authoritative_state_and_count() {
+        assert!(valid_discard_uploads_response(&json!({
+            "type":"ok",
+            "state":"discarded",
+            "discarded":0
+        })));
+        assert!(valid_discard_uploads_response(&json!({
+            "type":"ok",
+            "state":"committed",
+            "discarded":2
+        })));
+        assert!(!valid_discard_uploads_response(&json!({
+            "type":"ok",
+            "state":"deleted",
+            "discarded":2
+        })));
+        assert!(!valid_discard_uploads_response(&json!({
+            "type":"ok",
+            "state":"discarded"
+        })));
+    }
+
+    #[test]
+    fn current_request_revision_and_terminal_state_gate_stale_actions() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let initial = JournalEntry::fetched(
+            1,
+            "1".into(),
+            session,
+            "revision".into(),
+            "origin".into(),
+            false,
+            Some("app:example".into()),
+            Some("message-1".into()),
+            Some(1),
+            json!({
+                "event_id":"1",
+                "session_handle":session.to_string(),
+                "kind":"revision",
+                "author":"origin",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "message":{"sender_id":"app:example","message_id":"message-1","title":"old"}
+            }),
+        );
+        let old_turn = JournalEntry::fetched(
+            2,
+            "2".into(),
+            session,
+            "discussion".into(),
+            "person".into(),
+            true,
+            Some("app:example".into()),
+            Some("message-1".into()),
+            Some(1),
+            json!({
+                "event_id":"2",
+                "session_handle":session.to_string(),
+                "kind":"discussion",
+                "author":"person",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "text":"old turn"
+            }),
+        );
+        let updated_request = JournalEntry::fetched(
+            3,
+            "3".into(),
+            session,
+            "revision".into(),
+            "person".into(),
+            false,
+            Some("app:example".into()),
+            Some("message-1".into()),
+            Some(2),
+            json!({
+                "event_id":"3",
+                "session_handle":session.to_string(),
+                "kind":"revision",
+                "author":"person",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":2,
+                "message":{"sender_id":"app:example","message_id":"message-1","title":"new"}
+            }),
+        );
+        let retracted = JournalEntry::fetched(
+            4,
+            "4".into(),
+            session,
+            "terminal".into(),
+            "origin".into(),
+            false,
+            Some("app:example".into()),
+            Some("message-1".into()),
+            Some(2),
+            json!({
+                "event_id":"4",
+                "session_handle":session.to_string(),
+                "kind":"terminal",
+                "author":"origin",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":2,
+                "terminal_state":"retracted"
+            }),
+        );
+        for entry in [initial, old_turn, updated_request, retracted] {
+            store.record_entry(entry).unwrap();
+        }
+
+        let snapshot = store.snapshot().unwrap();
+        let request = request_context(&snapshot, session, "message-1").unwrap();
+        assert_eq!(request.revision, 2);
+        assert_eq!(request.message["title"], "new");
+        assert!(ensure_current_revision(request.revision, Some(1)).is_err());
+        assert!(ensure_current_revision(request.revision, Some(2)).is_ok());
+        assert!(ensure_request_open(&snapshot, session, &request).is_err());
+    }
+
+    #[test]
+    fn claude_listener_support_requires_interactive_background_prerequisites() {
+        assert!(
+            listener_unsupported_reason(
+                OriginHarness::ClaudeCode,
+                Some(SessionContext::Interactive),
+                Some("2.1.234 (Claude Code)"),
+                true,
+            )
+            .is_null()
+        );
+        assert!(
+            listener_unsupported_reason(
+                OriginHarness::ClaudeCode,
+                Some(SessionContext::Bare),
+                Some("2.1.234"),
+                true,
+            )
+            .as_str()
+            .unwrap()
+            .contains("interactive")
+        );
+        assert!(
+            listener_unsupported_reason(
+                OriginHarness::ClaudeCode,
+                Some(SessionContext::Interactive),
+                Some("2.1.234"),
+                false,
+            )
+            .as_str()
+            .unwrap()
+            .contains("background tasks")
+        );
+        assert!(
+            listener_unsupported_reason(
+                OriginHarness::ClaudeCode,
+                Some(SessionContext::Interactive),
+                Some("2.1.233"),
+                true,
+            )
+            .as_str()
+            .unwrap()
+            .contains("2.1.234")
+        );
+        assert!(
+            listener_unsupported_reason(
+                OriginHarness::Codex,
+                Some(SessionContext::Interactive),
+                Some("2.1.234"),
+                true,
+            )
+            .as_str()
+            .unwrap()
+            .contains("AE-CX1")
+        );
+    }
+
+    #[test]
+    fn request_preflight_accounts_for_the_server_assigned_upload_identity() {
+        let mut request = json!({
+            "v":1,
+            "type":"send",
+            "files":[{
+                "name":"file.bin",
+                "upload_pending":true,
+                "size":1,
+                "sha256":"0000000000000000000000000000000000000000000000000000000000000000"
+            }]
+        });
+        request["body"] = Value::String(String::new());
+        let base_len = serde_json::to_vec(&request).unwrap().len() as u64;
+        let body_len = files::MAX_ORIGIN_REQUEST_BYTES - 4 - base_len;
+        request["body"] = Value::String("x".repeat(body_len as usize));
+
+        assert!(validate_request_size(&request).is_ok());
+        assert!(validate_request_pre_upload(&request).is_err());
+    }
+
+    #[test]
+    fn upload_binding_uses_the_entry_revision_and_reports_storage_refusal() {
+        assert_eq!(
+            upload_binding(&json!({
+                "type":"send",
+                "message":{"sender_id":"app:test","message_id":"m1"}
+            }))
+            .unwrap(),
+            ("app:test".into(), "m1".into(), 1)
+        );
+        assert_eq!(
+            upload_binding(&json!({
+                "type":"reply",
+                "sender_id":"app:test",
+                "message_id":"m1",
+                "request_revision":4
+            }))
+            .unwrap(),
+            ("app:test".into(), "m1".into(), 4)
+        );
+        assert_eq!(
+            upload_binding(&json!({
+                "type":"revise",
+                "sender_id":"app:test",
+                "message_id":"m1",
+                "base_revision":4
+            }))
+            .unwrap(),
+            ("app:test".into(), "m1".into(), 5)
+        );
+        assert_eq!(
+            known_upload_refusal(&ApiError::Http {
+                status: 503,
+                body: json!({"reason":"storage_unavailable"}).to_string()
+            })
+            .as_deref(),
+            Some("storage_unavailable")
+        );
+        assert!(
+            known_upload_refusal(&ApiError::Http {
+                status: 503,
+                body: json!({"reason":"unexpected"}).to_string()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_ack_recovers_server_file_outcomes_from_the_same_report() {
+        let request = json!({
+            "file_transfers":[
+                {"name":"a.txt","status":"transferred"},
+                {"name":"b.txt","status":"not_transferred","reason":"disk full"}
+            ]
+        });
+        let expected = json!({
+            "a.txt":{"status":"transferred"},
+            "b.txt":{"status":"not_transferred","reason":"disk full"}
+        });
+        assert_eq!(ack_file_transfer_map(&request), Some(expected.clone()));
+
+        let entry = json!({
+            "files":[{"name":"a.txt"},{"name":"b.txt"}],
+            "file_transfers":expected
+        });
+        assert!(server_file_transfers_complete(&entry));
+        assert!(!server_file_transfers_complete(&json!({
+            "files":[{"name":"a.txt"}],
+            "file_transfers":{}
+        })));
+    }
+
+    #[test]
+    fn unresolved_request_operation_requires_same_key_retry_before_new_action() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .prepare_operation(
+                op_id,
+                session,
+                "reply".into(),
+                json!({
+                    "v":1,
+                    "type":"reply",
+                    "op_id":op_id,
+                    "sender_id":"app:example",
+                    "message_id":"request-1",
+                    "in_reply_to":"9",
+                    "text":"done"
+                }),
+            )
+            .unwrap();
+        store.mark_operation_unknown(op_id).unwrap();
+        let snapshot = store.snapshot().unwrap();
+
+        assert!(matches!(
+            request_context(&snapshot, session, "request-1"),
+            Err(error)
+                if error.exit_code == EXIT_OUTCOME_UNKNOWN
+                    && error.message.contains(&op_id.to_string())
+        ));
+    }
+}

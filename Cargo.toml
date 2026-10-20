@@ -1,0 +1,23 @@
+[package]
+name = "harklight-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Host CLI for request-bound Harklight conversations"
+
+[dependencies]
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+fs2 = "0.4.3"
+hex = "0.4.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.9"
+thiserror = "2.0"
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+
+[profile.release]
+lto = true
+strip = true
