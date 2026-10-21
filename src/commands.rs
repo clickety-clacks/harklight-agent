@@ -55,15 +55,14 @@ impl OriginHarness {
         }
     }
 
-    fn unsupported_reason(self) -> Value {
+    fn unsupported_reason(self, controller: bool) -> Value {
         match self {
             Self::ClaudeCode => Value::Null,
             Self::Codex => Value::String(
                 "Codex listening is unsupported until AE-CX1 is authorized and passes".into(),
             ),
-            Self::Other => Value::String(
-                "this CLI build does not implement listening for the other route".into(),
-            ),
+            Self::Other if controller => Value::Null,
+            Self::Other => Value::String("no controller declared for the other route".into()),
         }
     }
 }
@@ -262,7 +261,14 @@ fn validate_request_pre_upload(request: &Value) -> Result<(), CommandError> {
 fn validate_send_route(
     session_arg: &str,
     route: Option<OriginHarness>,
+    controller: bool,
 ) -> Result<Option<OriginHarness>, CommandError> {
+    if controller && (session_arg != "new" || route != Some(OriginHarness::Other)) {
+        return Err(CommandError::new(
+            "--controller requires --session new --route other",
+            EXIT_REFUSED,
+        ));
+    }
     if session_arg == "new" && route.is_none() {
         return Err(CommandError::new(
             "--route is required when minting a new session handle",
@@ -287,9 +293,10 @@ pub fn send(
     choices: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
+    controller: bool,
     files: &[PathBuf],
 ) -> Result<(), CommandError> {
-    let route = validate_send_route(session_arg, route)?;
+    let route = validate_send_route(session_arg, route, controller)?;
     let file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
@@ -332,7 +339,7 @@ pub fn send(
     if let Some(route) = route {
         request["route"] = Value::String(route.as_str().to_owned());
         request["cli_version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
-        request["unsupported_reason"] = route.unsupported_reason();
+        request["unsupported_reason"] = route.unsupported_reason(controller);
     }
     if let Some(vendor_session_id) = vendor_session_id {
         request["vendor_session_id"] = Value::String(vendor_session_id.to_owned());
@@ -956,7 +963,14 @@ pub fn listen(
     claude_code_version: Option<&str>,
     background_tasks_enabled: bool,
     follow: bool,
+    controller: bool,
 ) -> Result<(), CommandError> {
+    if controller && !follow {
+        return Err(CommandError::new(
+            "--controller requires listen --follow",
+            EXIT_REFUSED,
+        ));
+    }
     let mut store = context.open_store(session)?;
     store.acquire_listener().map_err(|error| {
         let code = if matches!(
@@ -995,11 +1009,18 @@ pub fn listen(
             );
         }
     };
+    if controller && route != OriginHarness::Other {
+        return Err(CommandError::new(
+            "--controller requires a session declared with route other",
+            EXIT_REFUSED,
+        ));
+    }
     let unsupported_reason = listener_unsupported_reason(
         route,
         session_context,
         claude_code_version,
         background_tasks_enabled,
+        controller,
     );
     let arm = json!({
         "v":1,
@@ -1115,6 +1136,7 @@ fn listener_unsupported_reason(
     session_context: Option<SessionContext>,
     claude_code_version: Option<&str>,
     background_tasks_enabled: bool,
+    controller: bool,
 ) -> Value {
     let reason = match route {
         OriginHarness::ClaudeCode if session_context != Some(SessionContext::Interactive) => {
@@ -1133,9 +1155,8 @@ fn listener_unsupported_reason(
         OriginHarness::Codex => {
             Some("Codex listening is unsupported until AE-CX1 is authorized and passes")
         }
-        OriginHarness::Other => {
-            Some("this CLI build does not implement listening for the other route")
-        }
+        OriginHarness::Other if controller => None,
+        OriginHarness::Other => Some("no controller declared for the other route"),
     };
     reason
         .map(|reason| Value::String(reason.into()))
@@ -2180,19 +2201,31 @@ mod tests {
     #[test]
     fn route_is_required_only_when_minting_a_session_handle() {
         assert!(matches!(
-            validate_send_route("new", None),
+            validate_send_route("new", None, false),
             Err(error) if error.exit_code == EXIT_REFUSED
         ));
         assert_eq!(
-            validate_send_route("new", Some(OriginHarness::ClaudeCode)).unwrap(),
+            validate_send_route("new", Some(OriginHarness::ClaudeCode), false).unwrap(),
             Some(OriginHarness::ClaudeCode)
         );
         assert_eq!(
-            validate_send_route(&Uuid::new_v4().to_string(), None).unwrap(),
+            validate_send_route(&Uuid::new_v4().to_string(), None, false).unwrap(),
             None
         );
         assert!(matches!(
-            validate_send_route("existing", Some(OriginHarness::ClaudeCode)),
+            validate_send_route("existing", Some(OriginHarness::ClaudeCode), false),
+            Err(error) if error.exit_code == EXIT_REFUSED
+        ));
+        assert_eq!(
+            validate_send_route("new", Some(OriginHarness::Other), true).unwrap(),
+            Some(OriginHarness::Other)
+        );
+        assert!(matches!(
+            validate_send_route("new", Some(OriginHarness::ClaudeCode), true),
+            Err(error) if error.exit_code == EXIT_REFUSED
+        ));
+        assert!(matches!(
+            validate_send_route("existing", Some(OriginHarness::Other), true),
             Err(error) if error.exit_code == EXIT_REFUSED
         ));
     }
@@ -2386,6 +2419,7 @@ mod tests {
                 Some(SessionContext::Interactive),
                 Some("2.1.234 (Claude Code)"),
                 true,
+                false,
             )
             .is_null()
         );
@@ -2395,6 +2429,7 @@ mod tests {
                 Some(SessionContext::Bare),
                 Some("2.1.234"),
                 true,
+                false,
             )
             .as_str()
             .unwrap()
@@ -2405,6 +2440,7 @@ mod tests {
                 OriginHarness::ClaudeCode,
                 Some(SessionContext::Interactive),
                 Some("2.1.234"),
+                false,
                 false,
             )
             .as_str()
@@ -2417,6 +2453,7 @@ mod tests {
                 Some(SessionContext::Interactive),
                 Some("2.1.233"),
                 true,
+                false,
             )
             .as_str()
             .unwrap()
@@ -2428,10 +2465,20 @@ mod tests {
                 Some(SessionContext::Interactive),
                 Some("2.1.234"),
                 true,
+                false,
             )
             .as_str()
             .unwrap()
             .contains("AE-CX1")
+        );
+        assert!(
+            listener_unsupported_reason(OriginHarness::Other, None, None, false, true).is_null()
+        );
+        assert!(
+            listener_unsupported_reason(OriginHarness::Other, None, None, false, false)
+                .as_str()
+                .unwrap()
+                .contains("no controller declared")
         );
     }
 

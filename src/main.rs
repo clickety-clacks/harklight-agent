@@ -41,6 +41,8 @@ enum Command {
         vendor_session_id: Option<String>,
         #[arg(long, value_enum)]
         route: Option<Route>,
+        #[arg(long)]
+        controller: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
     },
@@ -176,6 +178,8 @@ struct ListenArgs {
     follow: bool,
     #[arg(long, group = "mode")]
     next: bool,
+    #[arg(long)]
+    controller: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,6 +245,7 @@ fn main() {
             choices,
             vendor_session_id,
             route,
+            controller,
             files,
         } => commands::send(
             &context,
@@ -251,6 +256,7 @@ fn main() {
             &choices,
             vendor_session_id.as_deref(),
             route.map(Into::into),
+            controller,
             &files,
         ),
         Command::Listen(args) => commands::listen(
@@ -260,6 +266,7 @@ fn main() {
             args.claude_code_version.as_deref(),
             args.background_tasks_enabled,
             args.follow,
+            args.controller,
         ),
         Command::Ack { session, event } => commands::ack(&context, session, &event),
         Command::Reply {
