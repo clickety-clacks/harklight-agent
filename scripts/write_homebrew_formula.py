@@ -47,6 +47,7 @@ formula = f'''class HarklightAgent < Formula
   desc "Send request-bound Harklight conversations and listen for replies"
   homepage "https://github.com/clickety-clacks/harklight-agent"
   version "{version}"
+  license "MIT"
 
   on_macos do
     on_arm do
