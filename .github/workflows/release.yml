@@ -78,16 +78,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME=/home"
+          # rustc applies the last matching prefix, so list the broadest first.
+          export RUSTFLAGS="--remap-path-prefix=$HOME=/home --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$GITHUB_WORKSPACE=/build"
           cargo build --locked --release --target "$TARGET"
       - name: Check the binary carries no build paths
         shell: bash
         run: |
           set -euo pipefail
+          export LC_ALL=C
           bin="target/$TARGET/release/harklight-agent"
-          if grep -a -q -E "$HOME|$GITHUB_WORKSPACE|/Users/runner|/home/runner|\.cargo/registry" "$bin"; then
+          pattern="$HOME|$GITHUB_WORKSPACE|/Users/runner|/home/runner|\.cargo/registry"
+          if grep -a -q -E "$pattern" "$bin"; then
             echo "binary embeds a build path:" >&2
-            grep -a -o -E "($HOME|$GITHUB_WORKSPACE|/Users/runner|/home/runner|[^ ]*\.cargo/registry)[^ \"]*" "$bin" | sort -u | head >&2
+            { grep -a -o -E "($pattern)[^ \"]*" "$bin" | tr -d '\0' | sort -u | head -n 20 >&2; } || true
             exit 1
           fi
       - name: Check the binary reports its version
