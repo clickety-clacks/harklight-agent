@@ -99,7 +99,9 @@ harklight-agent send --session new --sender-id app:example \
 The route is required when creating the session handle and is stored with the
 CLI version in the server's listening-support record. When sending another
 request through an existing handle, omit `--route`; the route stays attached to
-that handle. Codex and `other` are recorded as unsupported by this build.
+that handle. Codex is recorded as unsupported by this build. `other` is
+recorded as unsupported unless the same `send --session new` command also
+passes `--controller`; see "Other-route listening" below.
 
 Use the same session handle for every later command. For an interactive Claude
 Code session, pass the context and version that the current session reports,
@@ -167,6 +169,27 @@ include the displayed `request_revision` when sending the action (use `1` for
 an ordinary request). App build11 omits that field and needs a client update
 before this action works; missing or stale revisions do not complete the
 request. This CLI does not install or update the native app.
+
+## Other-route listening
+
+A harness that is neither Claude Code nor Codex can declare its own continuous
+listener instead of using the Claude Code one-shot waiter pattern:
+
+```sh
+harklight-agent send --session new --sender-id app:example \
+  --route other --controller \
+  --title "Choose the next step" --body "Pick one option or write a note."
+harklight-agent listen --follow --controller --session "$HARKLIGHT_SESSION"
+```
+
+`--controller` on `send` requires `--session new --route other` together; it
+refuses before any network call otherwise. `--controller` on `listen` requires
+`--follow` (not `--next`) and requires that the same handle was minted with
+`--route other`; it refuses otherwise. Declaring `--controller` is this
+harness's own statement that it runs and supervises that `--follow` process;
+the CLI records the arm as supported on that basis alone. It still has no
+built-in knowledge of this harness's delivery contract and makes no stronger
+claim than for Claude Code or Codex.
 
 ## Conversation files
 
