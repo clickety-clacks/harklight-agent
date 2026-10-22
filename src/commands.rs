@@ -284,6 +284,70 @@ fn validate_send_route(
     Ok(route)
 }
 
+/// The client's existing answer descriptor schema. Choices are written as one
+/// `value` action each; the server stores the message as supplied and the
+/// client renders the descriptor with its existing controls.
+const ANSWER_UI_SCHEMA: &str = "attention-client.actions/1";
+
+fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
+    let mut seen = BTreeSet::new();
+    let mut actions = Vec::with_capacity(choices.len());
+    for (index, choice) in choices.iter().enumerate() {
+        if choice.trim().is_empty() {
+            return Err(CommandError::new(
+                format!("--choice {} is empty", index + 1),
+                EXIT_REFUSED,
+            ));
+        }
+        if !seen.insert(choice.as_str()) {
+            return Err(CommandError::new(
+                format!("--choice {choice:?} is given more than once"),
+                EXIT_REFUSED,
+            ));
+        }
+        actions.push(json!({
+            "id": format!("choice-{}", index + 1),
+            "label": choice,
+            "kind": "value",
+            "value": choice
+        }));
+    }
+    Ok(json!({ "schema": ANSWER_UI_SCHEMA, "actions": actions }))
+}
+
+/// Builds the revised message from the current one: `--choice` replaces the
+/// answer descriptor, `--clear-choices` removes it, neither keeps it. A legacy
+/// `choices` member written by an earlier build is never carried forward.
+fn revised_message(
+    current: &Value,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    clear_choices: bool,
+) -> Result<Value, CommandError> {
+    let answer_ui = if choices.is_empty() {
+        None
+    } else {
+        Some(choices_answer_ui(choices)?)
+    };
+    let mut message = current.clone();
+    message["title"] = Value::String(title.to_owned());
+    message["created_at"] = Value::from(now_ms());
+    if let Some(body) = body {
+        message["body"] = Value::String(body.to_owned());
+    }
+    if let Some(object) = message.as_object_mut() {
+        object.remove("choices");
+        if clear_choices {
+            object.remove("answer_ui");
+        }
+    }
+    if let Some(answer_ui) = answer_ui {
+        message["answer_ui"] = answer_ui;
+    }
+    Ok(message)
+}
+
 pub fn send(
     context: &CommandContext,
     session_arg: &str,
@@ -297,6 +361,11 @@ pub fn send(
     files: &[PathBuf],
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
+    let answer_ui = if choices.is_empty() {
+        None
+    } else {
+        Some(choices_answer_ui(choices)?)
+    };
     let file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
@@ -325,8 +394,8 @@ pub fn send(
     if let Some(body) = body {
         message["body"] = Value::String(body.to_owned());
     }
-    if !choices.is_empty() {
-        message["choices"] = json!(choices);
+    if let Some(answer_ui) = answer_ui {
+        message["answer_ui"] = answer_ui;
     }
 
     let mut request = json!({
@@ -637,20 +706,7 @@ pub fn revise(
         let event = delivered_event(&snapshot, session, &request, event_id, "discussion", false)?;
         ensure_current_revision(request.revision, event.request_revision)?;
     }
-    let mut message = request.message.clone();
-    message["title"] = Value::String(title.to_owned());
-    message["created_at"] = Value::from(now_ms());
-    if let Some(body) = body {
-        message["body"] = Value::String(body.to_owned());
-    }
-    if !choices.is_empty() {
-        message["choices"] = json!(choices);
-    }
-    if clear_choices {
-        if let Some(object) = message.as_object_mut() {
-            object.remove("choices");
-        }
-    }
+    let mut message = revised_message(&request.message, title, body, choices, clear_choices)?;
     message["sender_id"] = Value::String(request.sender_id.clone());
     message["message_id"] = Value::String(request.message_id.clone());
     let op_id = op_id.unwrap_or_else(Uuid::new_v4);
@@ -2196,6 +2252,83 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn choices_become_value_actions_in_the_order_given() {
+        let choices = vec!["Approve".to_string(), "Hold".to_string()];
+        assert_eq!(
+            choices_answer_ui(&choices).unwrap(),
+            json!({
+                "schema":"attention-client.actions/1",
+                "actions":[
+                    {"id":"choice-1","label":"Approve","kind":"value","value":"Approve"},
+                    {"id":"choice-2","label":"Hold","kind":"value","value":"Hold"}
+                ]
+            })
+        );
+        let descriptor = choices_answer_ui(&["Hold until Monday".to_string()]).unwrap();
+        let action = &descriptor["actions"][0];
+        assert_eq!(action["label"], action["value"]);
+        assert_eq!(action.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn empty_and_duplicate_choices_are_refused_by_name() {
+        let empty = choices_answer_ui(&["Approve".to_string(), "  ".to_string()]).unwrap_err();
+        assert_eq!(empty.exit_code, EXIT_REFUSED);
+        assert_eq!(empty.message, "--choice 2 is empty");
+        let duplicate = choices_answer_ui(&["Approve".to_string(), "Approve".to_string()])
+            .unwrap_err();
+        assert_eq!(duplicate.exit_code, EXIT_REFUSED);
+        assert_eq!(duplicate.message, "--choice \"Approve\" is given more than once");
+        assert_eq!(
+            revised_message(&json!({}), "t", None, &["".to_string()], false)
+                .unwrap_err()
+                .message,
+            "--choice 1 is empty"
+        );
+    }
+
+    #[test]
+    fn revise_replaces_removes_or_keeps_the_answer_descriptor() {
+        let original = choices_answer_ui(&["Approve".to_string(), "Hold".to_string()]).unwrap();
+        let current = json!({
+            "sender_id":"app:example",
+            "message_id":"message-1",
+            "title":"Deploy the fix?",
+            "body":"first wording",
+            "answer_ui":original,
+            "choices":["Approve","Hold"]
+        });
+
+        let replaced = revised_message(
+            &current,
+            "Deploy the fix?",
+            None,
+            &["Approve".to_string(), "Hold until Monday".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            replaced["answer_ui"],
+            choices_answer_ui(&["Approve".to_string(), "Hold until Monday".to_string()]).unwrap()
+        );
+        assert!(replaced.get("choices").is_none());
+        assert_eq!(replaced["body"], "first wording");
+
+        let cleared = revised_message(&current, "Deploy the fix?", Some("new"), &[], true).unwrap();
+        assert!(cleared.get("answer_ui").is_none());
+        assert!(cleared.get("choices").is_none());
+        assert_eq!(cleared["body"], "new");
+
+        let kept = revised_message(&current, "Retitled", None, &[], false).unwrap();
+        assert_eq!(kept["answer_ui"], original);
+        assert!(kept.get("choices").is_none());
+        assert_eq!(kept["title"], "Retitled");
+
+        let plain = revised_message(&json!({"title":"t"}), "t", None, &[], false).unwrap();
+        assert!(plain.get("answer_ui").is_none());
     }
 
     #[test]
