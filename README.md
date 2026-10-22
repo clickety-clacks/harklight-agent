@@ -1,17 +1,31 @@
 # Harklight agent conversation CLI
 
 `harklight-agent` sends request-bound Harklight messages and listens to the
-origin feed for the same session. It is source-only and is not included in the
-server package or published as an installable CLI release.
+origin feed for the same session. It is built and released from this
+repository on its own cycle and installs through Homebrew on macOS and Linux.
 
-Build the executable with Rust on macOS or Linux:
+## Install
 
 ```sh
-cargo build --locked --release --manifest-path agent-cli/Cargo.toml
+brew install clickety-clacks/tap/harklight-agent
 ```
 
-The binary is `agent-cli/target/release/harklight-agent`. Build it in a
-checkout or worktree you control; this command does not install it.
+Each release also publishes tarballs and a `SHA256SUMS` file on the
+[releases page](https://github.com/clickety-clacks/harklight-agent/releases)
+for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64). A tarball
+holds the `harklight-agent` binary, this README and the third-party license
+notices; verify its checksum against `SHA256SUMS` before unpacking.
+
+To build from source with Rust 1.89 or later:
+
+```sh
+cargo build --locked --release
+```
+
+The binary is `target/release/harklight-agent`. The build does not install it.
+
+`harklight-agent --version` prints the release version, which the server
+records with each session handle.
 
 ## Existing identity and endpoint
 
@@ -196,11 +210,12 @@ upload group.
 
 ## Disposable server fixture
 
-After building the CLI, run its focused integration fixture from the repository
-root with the documented Mix test runner:
+The Harklight server repository carries an integration fixture that drives
+this binary against a temporary TLS server. From that repository's root, point
+it at a built or installed binary:
 
 ```sh
-HARKLIGHT_AGENT_BIN=agent-cli/target/release/harklight-agent \
+HARKLIGHT_AGENT_BIN="$(command -v harklight-agent)" \
   mix test test/interop/conversation_agent_cli_fixture_test.exs
 ```
 

@@ -1,9 +1,11 @@
 [package]
 name = "harklight-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Host CLI for request-bound Harklight conversations"
+repository = "https://github.com/clickety-clacks/harklight-agent"
+readme = "README.md"
 
 [dependencies]
 base64 = "0.23.1"

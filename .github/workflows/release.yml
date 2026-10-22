@@ -1,0 +1,238 @@
+name: Release
+
+# A vX.Y.Z tag builds, tests and publishes the CLI for macOS and Linux, then
+# generates the Homebrew formula and opens a pull request on the tap.
+# workflow_dispatch runs the same build as a dry run: artifacts only, no
+# release, no tap pull request.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TAP_REPO: clickety-clacks/homebrew-tap
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            case "$tag" in
+              v*.*.*) ;;
+              *) echo "Release tag must look like vX.Y.Z, got: $tag" >&2; exit 1 ;;
+            esac
+            if [ "${tag#v}" != "$cargo_version" ]; then
+              echo "Cargo.toml version $cargo_version does not match tag $tag" >&2
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+      - name: Build release binary
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Check the binary reports its version
+        shell: bash
+        run: |
+          set -euo pipefail
+          reported=$("target/$TARGET/release/harklight-agent" --version)
+          echo "$reported"
+          [ "$reported" = "harklight-agent $VERSION" ]
+      - name: Collect third-party notices
+        run: python3 scripts/third_party_notices.py "$TARGET" THIRD_PARTY_NOTICES.txt
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="harklight-agent-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/harklight-agent" "dist/$name/"
+          cp README.md THIRD_PARTY_NOTICES.txt "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -r "dist/$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harklight-agent-${{ needs.validate.outputs.version }}-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  formula:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums and formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mv artifacts/*.tar.gz dist/
+          (cd dist && sha256sum harklight-agent-*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          sum() { sha256sum "dist/harklight-agent-$VERSION-$1.tar.gz" | awk '{print $1}'; }
+          export SHA_AARCH64_APPLE_DARWIN=$(sum aarch64-apple-darwin)
+          export SHA_X86_64_APPLE_DARWIN=$(sum x86_64-apple-darwin)
+          export SHA_X86_64_UNKNOWN_LINUX_GNU=$(sum x86_64-unknown-linux-gnu)
+          export SHA_AARCH64_UNKNOWN_LINUX_GNU=$(sum aarch64-unknown-linux-gnu)
+          OUT=dist/harklight-agent.rb python3 scripts/write_homebrew_formula.py
+          cat dist/harklight-agent.rb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: dist/*
+          if-no-files-found: error
+
+  # Install the just-built tarballs through the formula on the platforms that
+  # have Homebrew, before anything is published.
+  install-check:
+    needs: [validate, build, formula]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - name: Install from the local tarballs through the formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          sum() { sha256sum "dist/harklight-agent-$VERSION-$1.tar.gz" | awk '{print $1}'; }
+          export SHA_AARCH64_APPLE_DARWIN=$(sum aarch64-apple-darwin)
+          export SHA_X86_64_APPLE_DARWIN=$(sum x86_64-apple-darwin)
+          export SHA_X86_64_UNKNOWN_LINUX_GNU=$(sum x86_64-unknown-linux-gnu)
+          export SHA_AARCH64_UNKNOWN_LINUX_GNU=$(sum aarch64-unknown-linux-gnu)
+          BASE_URL="file://$PWD/dist" OUT="$PWD/harklight-agent.rb" python3 scripts/write_homebrew_formula.py
+          brew install --formula "$PWD/harklight-agent.rb"
+          brew test --formula "$PWD/harklight-agent.rb"
+          installed=$(harklight-agent --version)
+          echo "$installed"
+          [ "$installed" = "harklight-agent $VERSION" ]
+          brew uninstall harklight-agent
+
+  release:
+    if: needs.validate.outputs.publish == 'true'
+    needs: [validate, build, formula, install-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.validate.outputs.version, '-') }}
+          files: |
+            dist/harklight-agent-*.tar.gz
+            dist/SHA256SUMS
+
+  tap-pull-request:
+    if: needs.validate.outputs.publish == 'true'
+    needs: [validate, release]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Check the tap token is configured
+        id: token
+        shell: bash
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; the formula is in the release-files artifact. Open the tap pull request by hand." >&2
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          name: release-files
+          path: dist
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          repository: ${{ env.TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Open the tap pull request
+        if: steps.token.outputs.present == 'true'
+        working-directory: homebrew-tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="harklight-agent-v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          mkdir -p Formula
+          cp ../dist/harklight-agent.rb Formula/harklight-agent.rb
+          git add Formula/harklight-agent.rb
+          if git diff --cached --quiet; then
+            echo "Formula already current"
+            exit 0
+          fi
+          git commit -m "harklight-agent v$VERSION"
+          git push -u origin "$branch"
+          gh pr create --repo "$TAP_REPO" --base main --head "$branch" \
+            --title "harklight-agent v$VERSION" \
+            --body "Formula for harklight-agent v$VERSION built and install-checked by https://github.com/clickety-clacks/harklight-agent/actions/runs/${GITHUB_RUN_ID}."
