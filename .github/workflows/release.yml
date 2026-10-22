@@ -75,12 +75,11 @@ jobs:
       - name: Build release binary
         # Remap build paths so the binary carries no home directory or
         # build-host paths in panic messages or debug strings.
-        env:
-          RUSTFLAGS: >-
-            --remap-path-prefix=${{ github.workspace }}=/build
-            --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo
-            --remap-path-prefix=${{ env.HOME }}=/home
-        run: cargo build --locked --release --target "$TARGET"
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME=/home"
+          cargo build --locked --release --target "$TARGET"
       - name: Check the binary carries no build paths
         shell: bash
         run: |
