@@ -282,3 +282,7 @@ is confirmed, report the handoff assumption as unverified; do not replace it
 with timer polling or a different agent. See the
 [background command reference](https://code.claude.com/docs/en/tools-reference#background-commands)
 and [interactive mode reference](https://code.claude.com/docs/en/interactive-mode#background-bash-commands).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

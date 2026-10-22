@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Host CLI for request-bound Harklight conversations"
 repository = "https://github.com/clickety-clacks/harklight-agent"
+license = "MIT"
 readme = "README.md"
 
 [dependencies]
