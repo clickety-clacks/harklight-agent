@@ -73,7 +73,24 @@ jobs:
       - name: Test
         run: cargo test --locked --target "$TARGET"
       - name: Build release binary
+        # Remap build paths so the binary carries no home directory or
+        # build-host paths in panic messages or debug strings.
+        env:
+          RUSTFLAGS: >-
+            --remap-path-prefix=${{ github.workspace }}=/build
+            --remap-path-prefix=${{ env.HOME }}/.cargo=/cargo
+            --remap-path-prefix=${{ env.HOME }}=/home
         run: cargo build --locked --release --target "$TARGET"
+      - name: Check the binary carries no build paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/harklight-agent"
+          if grep -a -q -E "$HOME|$GITHUB_WORKSPACE|/Users/runner|/home/runner|\.cargo/registry" "$bin"; then
+            echo "binary embeds a build path:" >&2
+            grep -a -o -E "($HOME|$GITHUB_WORKSPACE|/Users/runner|/home/runner|[^ ]*\.cargo/registry)[^ \"]*" "$bin" | sort -u | head >&2
+            exit 1
+          fi
       - name: Check the binary reports its version
         shell: bash
         run: |
@@ -148,6 +165,16 @@ jobs:
         with:
           name: release-files
           path: dist
+      - name: Put Homebrew on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v brew >/dev/null; then exit 0; fi
+          if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          fi
+          echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+          echo /home/linuxbrew/.linuxbrew/sbin >> "$GITHUB_PATH"
       - name: Install from the local tarballs through the formula
         shell: bash
         run: |

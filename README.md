@@ -10,11 +10,32 @@ repository on its own cycle and installs through Homebrew on macOS and Linux.
 brew install clickety-clacks/tap/harklight-agent
 ```
 
-Each release also publishes tarballs and a `SHA256SUMS` file on the
-[releases page](https://github.com/clickety-clacks/harklight-agent/releases)
-for macOS (Apple silicon and Intel) and Linux (x86_64 and arm64). A tarball
-holds the `harklight-agent` binary, this README and the third-party license
-notices; verify its checksum against `SHA256SUMS` before unpacking.
+Without Homebrew, download the tarball for your platform and the `SHA256SUMS`
+file from the [releases page](https://github.com/clickety-clacks/harklight-agent/releases),
+verify the checksum, and put the binary on your `PATH`. Substitute the release
+version and your target:
+
+| Platform | Target |
+| --- | --- |
+| macOS, Apple silicon | `aarch64-apple-darwin` |
+| macOS, Intel | `x86_64-apple-darwin` |
+| Linux, x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux, arm64 | `aarch64-unknown-linux-gnu` |
+
+```sh
+v=0.1.1 t=aarch64-apple-darwin
+base="https://github.com/clickety-clacks/harklight-agent/releases/download/v$v"
+curl -fLO "$base/harklight-agent-$v-$t.tar.gz"
+curl -fLO "$base/SHA256SUMS"
+shasum -a 256 --check --ignore-missing SHA256SUMS   # sha256sum on Linux
+tar -xzf "harklight-agent-$v-$t.tar.gz"
+install -m 755 "harklight-agent-$v-$t/harklight-agent" ~/.local/bin/
+```
+
+Each tarball holds the `harklight-agent` binary, this README and the
+third-party license notices. Harklight Server packages from 0.1.10 also carry a
+copy of the CLI at `bin/harklight-agent` inside the package; that copy is the
+version the package was built with, and it adds no `PATH` entry.
 
 To build from source with Rust 1.89 or later:
 
@@ -138,6 +159,15 @@ answer outcome is uncertain, retry the same journaled operation with its
 original UUID; a server refusal with `reason: "retracted"` remains a refusal
 and includes the retained retraction state and time.
 
+## No comment result
+
+The server can complete a request with a payload-free `no_comment` terminal;
+the listener reports it as the final `NoComment` result. A native client must
+include the displayed `request_revision` when sending the action (use `1` for
+an ordinary request). App build11 omits that field and needs a client update
+before this action works; missing or stale revisions do not complete the
+request. This CLI does not install or update the native app.
+
 ## Conversation files
 
 Attach files to a new request, reply or revision with `--file`:
@@ -212,7 +242,7 @@ upload group.
 
 The Harklight server repository carries an integration fixture that drives
 this binary against a temporary TLS server. From that repository's root, point
-it at a built or installed binary:
+it at a built or installed binary with an absolute path:
 
 ```sh
 HARKLIGHT_AGENT_BIN="$(command -v harklight-agent)" \
@@ -229,8 +259,8 @@ Claude Code or Codex session.
 
 ## Support limits
 
-Codex listening is reported as unsupported until real AE-CX1 evidence passes;
-the CLI does not call `codex queue`. A Codex session may still send a request.
+Codex listening is reported as not supported yet; the CLI does not call
+`codex queue`. A Codex session may still send a request.
 The CLI does not infer a harness from a vendor session ID.
 
 The server publishes the active inline allowance and per-file upload cap.
@@ -247,8 +277,8 @@ rearm the same session handle so queued turns keep their identities. Claude
 Code documents that background commands can continue after a final response,
 and documents stops on session exit, a 5 GB output limit, and critical memory
 pressure on macOS and Linux. Its background-completion handoff into the same
-session has not been accepted by a real-session AE-CC1 run in this work. Until
-that evidence exists, report the handoff assumption as unverified; do not
-replace it with timer polling or a different agent. See the
+session has not yet been confirmed in a real interactive session. Until that
+is confirmed, report the handoff assumption as unverified; do not replace it
+with timer polling or a different agent. See the
 [background command reference](https://code.claude.com/docs/en/tools-reference#background-commands)
 and [interactive mode reference](https://code.claude.com/docs/en/interactive-mode#background-bash-commands).

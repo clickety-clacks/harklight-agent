@@ -59,7 +59,7 @@ impl OriginHarness {
         match self {
             Self::ClaudeCode => Value::Null,
             Self::Codex => Value::String(
-                "Codex listening is unsupported until AE-CX1 is authorized and passes".into(),
+                "Codex listening is not supported yet".into(),
             ),
             Self::Other if controller => Value::Null,
             Self::Other => Value::String("no controller declared for the other route".into()),
@@ -1153,7 +1153,7 @@ fn listener_unsupported_reason(
         }
         OriginHarness::ClaudeCode => None,
         OriginHarness::Codex => {
-            Some("Codex listening is unsupported until AE-CX1 is authorized and passes")
+            Some("Codex listening is not supported yet")
         }
         OriginHarness::Other if controller => None,
         OriginHarness::Other => Some("no controller declared for the other route"),
@@ -2469,7 +2469,7 @@ mod tests {
             )
             .as_str()
             .unwrap()
-            .contains("AE-CX1")
+            .contains("not supported yet")
         );
         assert!(
             listener_unsupported_reason(OriginHarness::Other, None, None, false, true).is_null()
