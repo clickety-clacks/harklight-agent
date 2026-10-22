@@ -157,9 +157,13 @@ jobs:
           export SHA_X86_64_APPLE_DARWIN=$(sum x86_64-apple-darwin)
           export SHA_X86_64_UNKNOWN_LINUX_GNU=$(sum x86_64-unknown-linux-gnu)
           export SHA_AARCH64_UNKNOWN_LINUX_GNU=$(sum aarch64-unknown-linux-gnu)
-          BASE_URL="file://$PWD/dist" OUT="$PWD/harklight-agent.rb" python3 scripts/write_homebrew_formula.py
-          brew install --formula "$PWD/harklight-agent.rb"
-          brew test --formula "$PWD/harklight-agent.rb"
+          # Homebrew installs formulae only from a tap, so stage the generated
+          # formula in a throwaway local tap and install through it.
+          brew tap-new --no-git local/check
+          tap_dir=$(brew --repository local/check)
+          BASE_URL="file://$PWD/dist" OUT="$tap_dir/Formula/harklight-agent.rb" python3 scripts/write_homebrew_formula.py
+          brew install local/check/harklight-agent
+          brew test local/check/harklight-agent
           installed=$(harklight-agent --version)
           echo "$installed"
           [ "$installed" = "harklight-agent $VERSION" ]
