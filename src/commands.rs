@@ -2942,12 +2942,7 @@ mod tests {
             &mut store,
             session,
             "attachment_support",
-            attachment_support_request(
-                Uuid::new_v4(),
-                session,
-                OriginHarness::ClaudeCode,
-                false,
-            ),
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::ClaudeCode, false),
             false,
         )
         .unwrap();
@@ -2991,12 +2986,7 @@ mod tests {
             &mut store,
             session,
             "attachment_support",
-            attachment_support_request(
-                Uuid::new_v4(),
-                session,
-                OriginHarness::ClaudeCode,
-                false,
-            ),
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::ClaudeCode, false),
             false,
         )
         .unwrap();
@@ -3021,12 +3011,7 @@ mod tests {
                 "attachment_update" => {
                     attachment_update_request(op_id, session, Some("vendor-thread"))
                 }
-                _ => attachment_support_request(
-                    op_id,
-                    session,
-                    OriginHarness::ClaudeCode,
-                    false,
-                ),
+                _ => attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false),
             };
             store
                 .prepare_operation(op_id, session, kind.into(), request.clone())
@@ -3049,14 +3034,9 @@ mod tests {
 
             let mut retry_request = request;
             retry_request["op_id"] = json!(Uuid::new_v4().to_string());
-            let retry = prepare_or_resume_operation(
-                &mut store,
-                session,
-                kind,
-                retry_request,
-                false,
-            )
-            .unwrap();
+            let retry =
+                prepare_or_resume_operation(&mut store, session, kind, retry_request, false)
+                    .unwrap();
             assert_eq!(retry.op_id, op_id, "{kind}");
             assert_eq!(retry.request, saved.request, "{kind}");
         }
