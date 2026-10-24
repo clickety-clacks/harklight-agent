@@ -557,6 +557,26 @@ impl JournalStore {
         self.with_read(|connection| read_operation(connection, op_id))
     }
 
+    /// Return operations for one origin session in the order they were first
+    /// journaled. This lets multi-step commands resume the exact pending step
+    /// before creating a later operation.
+    pub fn operations_for_session(
+        &self,
+        session_handle: Uuid,
+    ) -> Result<Vec<OperationRecord>, JournalError> {
+        self.with_read(|connection| {
+            let mut statement = connection
+                .prepare("SELECT payload FROM operations WHERE session_handle=?1 ORDER BY rowid")?;
+            let payloads = statement
+                .query_map([session_handle.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            payloads
+                .into_iter()
+                .map(|payload| serde_json::from_str(&payload).map_err(JournalError::from))
+                .collect()
+        })
+    }
+
     pub fn pending_for(&self, session_handle: Uuid) -> Result<Vec<JournalEntry>, JournalError> {
         self.with_read(|connection| read_entry_list(
             connection,

@@ -103,6 +103,32 @@ that handle. Codex is recorded as unsupported by this build. `other` is
 recorded as unsupported unless the same `send --session new` command also
 passes `--controller`; see "Other-route listening" below.
 
+### Reattach an existing handle
+
+After a restart on the same host, update an existing handle's vendor session
+ID with the same enrolled origin and local journal:
+
+```sh
+harklight-agent attach --session "$HARKLIGHT_SESSION" \
+  --vendor-session-id "$HARKLIGHT_VENDOR_SESSION_ID" \
+  --route claude-code
+```
+
+Pass `--vendor-session-id none` when there is no current vendor session ID; the
+origin receives JSON `null`. `attach` requires the local journal to contain the
+committed send that created the handle. It updates only the handle's vendor ID,
+then records the requested route through the existing support operation. It
+does not create a request or change the handle or conversation history. Use the
+same host, enrollment and journal; this command does not migrate an origin to a
+different host or session.
+
+Run a separate `listen` only after `attach` confirms both operations. `listen`
+checks the current route support again before opening the stream and leaves
+pending turns untouched when the route is unsupported. Codex listening remains
+unsupported in this build. If an operation result is unknown, retry the exact
+printed operation ID, then repeat `attach` with the same inputs to resume its
+next step. Do not change the inputs while an operation is unresolved.
+
 Use the same session handle for every later command. For an interactive Claude
 Code session, pass the context and version that the current session reports,
 confirm background tasks are enabled, and start one blocking waiter as a
