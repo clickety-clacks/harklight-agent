@@ -536,6 +536,51 @@ fn prepare_or_resume_operation(
     prepare(store, session, op_id, kind, request)
 }
 
+fn handle_operation_error_response(
+    store: &mut JournalStore,
+    operation: &OperationRecord,
+    response: Value,
+    announce: bool,
+) -> Result<Value, CommandError> {
+    let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+    if reason == "storage_unavailable"
+        && matches!(
+            operation.kind.as_str(),
+            "attachment_update" | "attachment_support" | "support"
+        )
+    {
+        if announce {
+            emit(&json!({
+                "kind":"outcome_unknown",
+                "operation":operation.kind,
+                "op_id":operation.op_id,
+                "session_handle":operation.session_handle,
+                "reason":reason,
+                "response":response,
+                "retry":"run harklight-agent retry --op-id with this exact key"
+            }))?;
+        }
+        return Err(CommandError::new(
+            format!(
+                "{} outcome is unknown: storage_unavailable; retry the identical persisted operation",
+                operation.kind
+            ),
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
+
+    store
+        .reject_operation(operation.op_id, response.clone())
+        .map_err(|error| journal_error(error, 1))?;
+    if announce {
+        refused(&operation.kind, Some(operation.op_id), response)?;
+    }
+    Err(CommandError::new(
+        format!("{} refused: {reason}", operation.kind),
+        EXIT_REFUSED,
+    ))
+}
+
 fn attachment_update_response_matches(request: &Value, response: &Value) -> bool {
     request["v"] == 1
         && request["type"] == "attachment_update"
@@ -693,7 +738,7 @@ pub fn attach(
         session,
         "attachment_support",
         support_request.clone(),
-        true,
+        false,
     )?;
     let support_op_id = support_operation.op_id;
     let _support_response = submit_operation(context, &mut store, support_operation)?;
@@ -2081,17 +2126,7 @@ fn submit_operation_inner(
     let response = match context.api.post(&operation.request) {
         Ok(response) if response["type"] == "ok" => response,
         Ok(response) if response["type"] == "error" => {
-            store
-                .reject_operation(operation.op_id, response.clone())
-                .map_err(|error| journal_error(error, 1))?;
-            let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
-            if announce {
-                refused(&operation.kind, Some(operation.op_id), response)?;
-            }
-            return Err(CommandError::new(
-                format!("{} refused: {reason}", operation.kind),
-                EXIT_REFUSED,
-            ));
+            return handle_operation_error_response(store, &operation, response, announce);
         }
         Ok(response) => {
             store
@@ -2862,6 +2897,169 @@ mod tests {
         .unwrap_err();
         assert_eq!(changed.exit_code, EXIT_OUTCOME_UNKNOWN);
         assert!(changed.message.contains(&op_id.to_string()));
+    }
+
+    #[test]
+    fn reattach_with_a_new_vendor_id_records_new_support_before_listen() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+
+        let send_id = Uuid::new_v4();
+        store
+            .prepare_operation(
+                send_id,
+                session,
+                "send".into(),
+                json!({"v":1,"type":"send","op_id":send_id,"session_handle":session}),
+            )
+            .unwrap();
+        store
+            .settle_operation(send_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+
+        let first_update = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_update",
+            attachment_update_request(Uuid::new_v4(), session, Some("vendor-thread-1")),
+            true,
+        )
+        .unwrap();
+        store
+            .settle_operation(
+                first_update.op_id,
+                json!({
+                    "v":1,
+                    "type":"ok",
+                    "session_handle":session.to_string(),
+                    "vendor_session_id":"vendor-thread-1"
+                }),
+                None,
+            )
+            .unwrap();
+        let first_support = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_support",
+            attachment_support_request(
+                Uuid::new_v4(),
+                session,
+                OriginHarness::ClaudeCode,
+                false,
+            ),
+            false,
+        )
+        .unwrap();
+        store
+            .settle_operation(first_support.op_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session).unwrap(),
+            Some("claude-code".into())
+        );
+
+        let second_update = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_update",
+            attachment_update_request(Uuid::new_v4(), session, Some("vendor-thread-2")),
+            true,
+        )
+        .unwrap();
+        assert_ne!(first_update.op_id, second_update.op_id);
+        store
+            .settle_operation(
+                second_update.op_id,
+                json!({
+                    "v":1,
+                    "type":"ok",
+                    "session_handle":session.to_string(),
+                    "vendor_session_id":"vendor-thread-2"
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session)
+                .unwrap_err()
+                .exit_code,
+            EXIT_REFUSED
+        );
+
+        let second_support = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_support",
+            attachment_support_request(
+                Uuid::new_v4(),
+                session,
+                OriginHarness::ClaudeCode,
+                false,
+            ),
+            false,
+        )
+        .unwrap();
+        assert_ne!(first_support.op_id, second_support.op_id);
+        store
+            .settle_operation(second_support.op_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session).unwrap(),
+            Some("claude-code".into())
+        );
+    }
+
+    #[test]
+    fn storage_unavailable_keeps_attach_and_h5_operations_retryable() {
+        let session = Uuid::new_v4();
+        for kind in ["attachment_update", "attachment_support", "support"] {
+            let scratch = Scratch::new();
+            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+            let op_id = Uuid::new_v4();
+            let request = match kind {
+                "attachment_update" => {
+                    attachment_update_request(op_id, session, Some("vendor-thread"))
+                }
+                _ => attachment_support_request(
+                    op_id,
+                    session,
+                    OriginHarness::ClaudeCode,
+                    false,
+                ),
+            };
+            store
+                .prepare_operation(op_id, session, kind.into(), request.clone())
+                .unwrap();
+            store.mark_operation_unknown(op_id).unwrap();
+            let operation = store.operation(op_id).unwrap().unwrap();
+
+            let error = handle_operation_error_response(
+                &mut store,
+                &operation,
+                json!({"v":1,"type":"error","reason":"storage_unavailable"}),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN, "{kind}");
+
+            let saved = store.operation(op_id).unwrap().unwrap();
+            assert_eq!(saved.state, OperationState::Unknown, "{kind}");
+            assert_eq!(saved.request, request, "{kind}");
+
+            let mut retry_request = request;
+            retry_request["op_id"] = json!(Uuid::new_v4().to_string());
+            let retry = prepare_or_resume_operation(
+                &mut store,
+                session,
+                kind,
+                retry_request,
+                false,
+            )
+            .unwrap();
+            assert_eq!(retry.op_id, op_id, "{kind}");
+            assert_eq!(retry.request, saved.request, "{kind}");
+        }
     }
 
     #[test]
