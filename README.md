@@ -98,7 +98,7 @@ harklight-agent send --session new --sender-id app:example \
 
 The successful JSON result includes `message_url`, a `harklight://message/…`
 link built from the sender ID and message ID. Each ID is percent-encoded as its
-own path segment.
+own path segment. A committed send returned by `retry` includes the same field.
 
 The route is required when creating the session handle and is stored with the
 CLI version in the server's listening-support record. When sending another

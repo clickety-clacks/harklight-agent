@@ -1410,7 +1410,13 @@ pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> 
             if operation.kind == "discard_uploads" {
                 emit_discard_uploads_committed(op_id, &operation.request, &response)
             } else {
-                emit_committed(&operation.kind, op_id, response)
+                emit(&retry_committed_result(
+                    &operation.kind,
+                    op_id,
+                    &operation.kind,
+                    &operation.request,
+                    response,
+                )?)
             }
         }
         OperationState::Rejected => refused(
@@ -1425,7 +1431,13 @@ pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> 
             if operation.kind == "discard_uploads" {
                 emit_discard_uploads_committed(op_id, &operation.request, &response)
             } else {
-                emit_committed("retry", op_id, response)
+                emit(&retry_committed_result(
+                    "retry",
+                    op_id,
+                    &operation.kind,
+                    &operation.request,
+                    response,
+                )?)
             }
         }
     }
@@ -2614,6 +2626,31 @@ fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), Comman
     emit(&json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response}))
 }
 
+fn retry_committed_result(
+    output_operation: &str,
+    op_id: Uuid,
+    operation_kind: &str,
+    request: &Value,
+    response: Value,
+) -> Result<Value, CommandError> {
+    let mut output = json!({
+        "kind":"committed",
+        "operation":output_operation,
+        "op_id":op_id,
+        "response":response
+    });
+    if operation_kind == "send" {
+        let sender_id = request["message"]["sender_id"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("saved send operation has no sender ID", 1))?;
+        let message_id = request["message"]["message_id"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("saved send operation has no message ID", 1))?;
+        output["message_url"] = Value::String(message_url(sender_id, message_id));
+    }
+    Ok(output)
+}
+
 fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
     let mut output = Map::new();
@@ -2767,6 +2804,30 @@ mod tests {
                 "listening_support":{"route":"claude-code"}
             })
         );
+    }
+
+    #[test]
+    fn committed_send_retry_result_includes_the_message_url() {
+        let op_id = Uuid::new_v4();
+        let request = json!({"message":{"sender_id":"app:example","message_id":"message-1"}});
+        let response = json!({"type":"ok","revision":1});
+
+        for output_operation in ["send", "retry"] {
+            let result = retry_committed_result(
+                output_operation,
+                op_id,
+                "send",
+                &request,
+                response.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                result["message_url"],
+                "harklight://message/app%3Aexample/message-1"
+            );
+            assert_eq!(result["operation"], output_operation);
+            assert_eq!(result["response"], response);
+        }
     }
 
     #[test]
