@@ -107,6 +107,28 @@ that handle. Codex is recorded as unsupported by this build. `other` is
 recorded as unsupported unless the same `send --session new` command also
 passes `--controller`; see "Other-route listening" below.
 
+### Prepare a send before executing it
+
+A calling runtime can persist its own authenticated sender record and the exact
+prepared operation before it lets the CLI submit the message:
+
+```sh
+OP_ID=123e4567-e89b-42d3-a456-426614174000
+harklight-agent send --prepare --op-id "$OP_ID" \
+  --session new --sender-id app:example --route other --controller \
+  --title "Choose the next step" --body "Pick one option."
+harklight-agent send --execute --op-id "$OP_ID"
+```
+
+`--prepare` stores the operation, exact request and stable file manifest in the
+local journal and retains any staged file bytes. It may read the server's
+read-only file limits, but it does not upload files or submit the message. The
+caller should durably save the returned `op_id`, `request`, and `files` with its
+authenticated sending-session record before calling `--execute`. Execute
+accepts only the saved operation ID; it does not take replacement send inputs.
+It reports the existing `committed`, `refused` or `outcome_unknown` result. For
+an uncertain result, use `retry --op-id` with the same operation key.
+
 ### Reattach an existing handle
 
 After a restart on the same host, update an existing handle's vendor session

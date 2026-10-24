@@ -223,6 +223,19 @@ pub struct OperationRecord {
     pub response: Option<Value>,
     #[serde(default)]
     pub uploads: Vec<UploadSource>,
+    #[serde(default)]
+    pub prepared_send: Option<PreparedSend>,
+}
+
+/// The caller-visible immutable portion of a two-phase send. `request` is the
+/// exact v1 request returned by `send --prepare`; the operation's live request
+/// may later replace upload placeholders with the server-assigned identities
+/// before the first send POST, then remains stable for retries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreparedSend {
+    pub inputs: Value,
+    pub request: Value,
+    pub files: Vec<crate::files::FileManifestEntry>,
 }
 
 /// Private local bytes and the server identity for one upload associated with
@@ -826,6 +839,56 @@ impl JournalStore {
                 updated_at_ms: now,
                 response: None,
                 uploads,
+                prepared_send: None,
+            };
+            write_operation(tx, &operation)?;
+            Ok(operation)
+        })
+    }
+
+    pub fn prepare_send_operation(
+        &mut self,
+        op_id: Uuid,
+        session_handle: Uuid,
+        request: Value,
+        uploads: Vec<UploadSource>,
+        prepared_send: PreparedSend,
+    ) -> Result<OperationRecord, JournalError> {
+        self.with_transaction(|tx| {
+            if let Some(existing) = read_operation(tx, op_id)? {
+                let conflicts = existing.kind != "send"
+                    || existing.prepared_send.as_ref().is_none_or(|saved| {
+                        let same_inputs = saved.inputs == prepared_send.inputs
+                            && saved.files == prepared_send.files;
+                        let same_session = saved.inputs["session"] == "new"
+                            || existing.session_handle == session_handle;
+                        !same_inputs || !same_session
+                    });
+                if conflicts {
+                    return Err(JournalError::OperationConflict(op_id));
+                }
+                return Ok(existing);
+            }
+
+            if prepared_send.request != request
+                || request["op_id"].as_str() != Some(op_id.to_string().as_str())
+                || request["session_handle"].as_str() != Some(session_handle.to_string().as_str())
+            {
+                return Err(JournalError::OperationConflict(op_id));
+            }
+
+            let now = now_ms();
+            let operation = OperationRecord {
+                op_id,
+                session_handle,
+                kind: "send".into(),
+                request,
+                state: OperationState::Prepared,
+                created_at_ms: now,
+                updated_at_ms: now,
+                response: None,
+                uploads,
+                prepared_send: Some(prepared_send),
             };
             write_operation(tx, &operation)?;
             Ok(operation)
@@ -915,6 +978,7 @@ impl JournalStore {
             operation.state = OperationState::Committed;
             operation.updated_at_ms = now_ms();
             operation.request = redact_file_payloads(&operation.request);
+            redact_prepared_send(&mut operation);
             operation.response = Some(redact_file_payloads(&response));
             for upload in &mut operation.uploads {
                 upload.staged_path = None;
@@ -941,6 +1005,7 @@ impl JournalStore {
             operation.state = OperationState::Rejected;
             operation.updated_at_ms = now_ms();
             operation.request = redact_file_payloads(&operation.request);
+            redact_prepared_send(operation);
             operation.response = Some(redact_file_payloads(&response));
             for upload in &mut operation.uploads {
                 upload.staged_path = None;
@@ -1306,6 +1371,12 @@ fn redact_file_payloads(value: &Value) -> Value {
     redacted
 }
 
+fn redact_prepared_send(operation: &mut OperationRecord) {
+    if let Some(prepared_send) = operation.prepared_send.as_mut() {
+        prepared_send.request = redact_file_payloads(&prepared_send.request);
+    }
+}
+
 fn operation_requests_equivalent(left: &Value, right: &Value) -> bool {
     redact_file_payloads(left) == redact_file_payloads(right)
 }
@@ -1367,6 +1438,7 @@ fn reconcile_own_entry(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<boo
         operation.state = OperationState::Committed;
         operation.updated_at_ms = now_ms();
         operation.request = redact_file_payloads(&operation.request);
+        redact_prepared_send(&mut operation);
         operation.response = Some(serde_json::json!({
             "v":1,
             "type":"ok",
