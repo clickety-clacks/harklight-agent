@@ -27,12 +27,12 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Send {
-        #[arg(long, value_name = "UUID|new")]
-        session: String,
-        #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        title: String,
+        #[arg(long, value_name = "UUID|new", required_unless_present = "execute")]
+        session: Option<String>,
+        #[arg(long, required_unless_present = "execute")]
+        sender_id: Option<String>,
+        #[arg(long, required_unless_present = "execute")]
+        title: Option<String>,
         #[arg(long)]
         body: Option<String>,
         #[arg(long = "choice", action = clap::ArgAction::Append)]
@@ -45,6 +45,12 @@ enum Command {
         controller: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
+        #[arg(long, conflicts_with = "execute")]
+        prepare: bool,
+        #[arg(long, conflicts_with = "prepare")]
+        execute: bool,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
     Attach {
         #[arg(long)]
@@ -257,17 +263,23 @@ fn main() {
             route,
             controller,
             files,
-        } => commands::send(
+            prepare,
+            execute,
+            op_id,
+        } => commands::send_command(
             &context,
-            &session,
-            &sender_id,
-            &title,
+            session.as_deref(),
+            sender_id.as_deref(),
+            title.as_deref(),
             body.as_deref(),
             &choices,
             vendor_session_id.as_deref(),
             route.map(Into::into),
             controller,
             &files,
+            prepare,
+            execute,
+            op_id,
         ),
         Command::Attach {
             session,
@@ -417,4 +429,77 @@ impl From<SessionContext> for commands::SessionContext {
 fn fail(message: String, exit_code: i32) -> ! {
     eprintln!("{message}");
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_prepare_accepts_existing_inputs_and_required_operation_id() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--prepare",
+            "--op-id",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--title",
+            "A title",
+            "--route",
+            "claude-code",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                prepare: true,
+                execute: false,
+                op_id: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn send_execute_needs_only_the_saved_operation_id() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--execute",
+            "--op-id",
+            "123e4567-e89b-42d3-a456-426614174000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                prepare: false,
+                execute: true,
+                session: None,
+                sender_id: None,
+                title: None,
+                op_id: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn send_prepare_and_execute_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "send",
+                "--prepare",
+                "--execute",
+                "--op-id",
+                "123e4567-e89b-42d3-a456-426614174000",
+            ])
+            .is_err()
+        );
+    }
 }

@@ -15,7 +15,10 @@ use crate::{
     api::{ApiError, OriginClient},
     config::{EnrolledIdentity, default_state_root},
     files::{self, PreparedFiles, ServerFileLimits},
-    journal::{Journal, JournalEntry, JournalError, JournalStore, OperationRecord, OperationState},
+    journal::{
+        Journal, JournalEntry, JournalError, JournalStore, OperationRecord, OperationState,
+        PreparedSend,
+    },
 };
 
 pub const EXIT_REFUSED: i32 = 2;
@@ -137,10 +140,25 @@ fn prepare_outgoing_files(
     operation: &str,
     draft: Value,
 ) -> Result<PreparedFiles, CommandError> {
+    prepare_outgoing_files_with_lookup(store, session, op_id, paths, operation, draft, || {
+        context.api.post(&json!({"v":1,"type":"file_limits"}))
+    })
+}
+
+fn prepare_outgoing_files_with_lookup(
+    store: &JournalStore,
+    session: Uuid,
+    op_id: Uuid,
+    paths: &[PathBuf],
+    operation: &str,
+    draft: Value,
+    lookup_limits: impl FnOnce() -> Result<Value, ApiError>,
+) -> Result<PreparedFiles, CommandError> {
     if paths.is_empty() {
         return Ok(PreparedFiles {
             entries: Vec::new(),
             uploads: Vec::new(),
+            manifest: Vec::new(),
         });
     }
     let selections = files::inspect(paths).map_err(|reason| CommandError::new(reason, 1))?;
@@ -154,7 +172,7 @@ fn prepare_outgoing_files(
             })
         })
         .collect();
-    let limits_response = match context.api.post(&json!({"v":1,"type":"file_limits"})) {
+    let limits_response = match lookup_limits() {
         Ok(response) if response["type"] == "ok" => response,
         Ok(response) => {
             let reason = response["reason"]
@@ -346,6 +364,89 @@ fn revised_message(
     Ok(message)
 }
 
+pub fn send_command(
+    context: &CommandContext,
+    session: Option<&str>,
+    sender_id: Option<&str>,
+    title: Option<&str>,
+    body: Option<&str>,
+    choices: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[PathBuf],
+    prepare: bool,
+    execute: bool,
+    op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    if prepare && execute {
+        return Err(CommandError::new(
+            "choose only one of --prepare or --execute",
+            EXIT_REFUSED,
+        ));
+    }
+    if execute {
+        let op_id =
+            op_id.ok_or_else(|| CommandError::new("--execute requires --op-id", EXIT_REFUSED))?;
+        if session.is_some()
+            || sender_id.is_some()
+            || title.is_some()
+            || body.is_some()
+            || !choices.is_empty()
+            || vendor_session_id.is_some()
+            || route.is_some()
+            || controller
+            || !files.is_empty()
+        {
+            return Err(CommandError::new(
+                "--execute accepts only --op-id; it uses the saved send inputs",
+                EXIT_REFUSED,
+            ));
+        }
+        return execute_send(context, op_id);
+    }
+    if op_id.is_some() && !prepare {
+        return Err(CommandError::new(
+            "--op-id requires --prepare or --execute",
+            EXIT_REFUSED,
+        ));
+    }
+    let session =
+        session.ok_or_else(|| CommandError::new("send requires --session", EXIT_REFUSED))?;
+    let sender_id =
+        sender_id.ok_or_else(|| CommandError::new("send requires --sender-id", EXIT_REFUSED))?;
+    let title = title.ok_or_else(|| CommandError::new("send requires --title", EXIT_REFUSED))?;
+    if prepare {
+        let op_id =
+            op_id.ok_or_else(|| CommandError::new("--prepare requires --op-id", EXIT_REFUSED))?;
+        return prepare_send(
+            context,
+            session,
+            sender_id,
+            title,
+            body,
+            choices,
+            vendor_session_id,
+            route,
+            controller,
+            files,
+            op_id,
+        );
+    }
+    send(
+        context,
+        session,
+        sender_id,
+        title,
+        body,
+        choices,
+        vendor_session_id,
+        route,
+        controller,
+        files,
+    )
+}
+
 pub fn send(
     context: &CommandContext,
     session_arg: &str,
@@ -359,11 +460,7 @@ pub fn send(
     files: &[PathBuf],
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
-    let answer_ui = if choices.is_empty() {
-        None
-    } else {
-        Some(choices_answer_ui(choices)?)
-    };
+    choices_answer_ui(choices)?;
     let file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
@@ -383,6 +480,71 @@ pub fn send(
     let mut store = context.open_store(session)?;
     let prepared_files =
         prepare_outgoing_files(context, &store, session, op_id, files, "send", file_draft)?;
+    let request = build_send_request(
+        op_id,
+        session,
+        &message_id,
+        sender_id,
+        title,
+        body,
+        choices,
+        vendor_session_id,
+        route,
+        controller,
+        &prepared_files.entries,
+    )?;
+    if let Err(error) = validate_request_pre_upload(&request) {
+        files::cleanup_staged_uploads(&prepared_files.uploads);
+        return Err(error);
+    }
+    let expected_session = session.to_string();
+    let operation = prepare_with_uploads(
+        &mut store,
+        session,
+        op_id,
+        "send",
+        request,
+        prepared_files.uploads,
+    )?;
+    let response = submit_operation(context, &mut store, operation)?;
+    validate_send_response_session(&response, &expected_session)?;
+    emit(&send_result(sender_id, &message_id, session, &response))
+}
+
+fn validate_send_response_session(
+    response: &Value,
+    expected_session: &str,
+) -> Result<(), CommandError> {
+    let response_session = response["session_handle"]
+        .as_str()
+        .unwrap_or(expected_session);
+    if response_session != expected_session {
+        return Err(CommandError::new(
+            "server send response named a different origin session",
+            1,
+        ));
+    }
+    Ok(())
+}
+
+fn build_send_request(
+    op_id: Uuid,
+    session: Uuid,
+    message_id: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    file_entries: &[Value],
+) -> Result<Value, CommandError> {
+    let answer_ui = if choices.is_empty() {
+        None
+    } else {
+        Some(choices_answer_ui(choices)?)
+    };
     let mut message = json!({
         "sender_id": sender_id,
         "message_id": message_id,
@@ -411,33 +573,253 @@ pub fn send(
     if let Some(vendor_session_id) = vendor_session_id {
         request["vendor_session_id"] = Value::String(vendor_session_id.to_owned());
     }
-    if !prepared_files.entries.is_empty() {
-        request["files"] = Value::Array(prepared_files.entries.clone());
+    if !file_entries.is_empty() {
+        request["files"] = Value::Array(file_entries.to_vec());
     }
+    Ok(request)
+}
+
+fn send_input_identity(
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[files::FileManifestEntry],
+) -> Value {
+    json!({
+        "session":session_arg,
+        "sender_id":sender_id,
+        "title":title,
+        "body":body,
+        "choices":choices,
+        "vendor_session_id":vendor_session_id,
+        "route":route.map(OriginHarness::as_str),
+        "controller":controller,
+        "files":files
+    })
+}
+
+pub fn prepare_send(
+    context: &CommandContext,
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[PathBuf],
+    op_id: Uuid,
+) -> Result<(), CommandError> {
+    if op_id.get_version_num() != 4 {
+        return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
+    }
+    choices_answer_ui(choices)?;
+    let route = validate_send_route(session_arg, route, controller)?;
+    let global = context.open_global_store()?;
+
+    if let Some(existing) = global
+        .operation(op_id)
+        .map_err(|error| journal_error(error, 1))?
+    {
+        let saved = existing
+            .prepared_send
+            .as_ref()
+            .ok_or_else(|| journal_error(JournalError::OperationConflict(op_id), EXIT_REFUSED))?;
+        let manifest = files::identify(files).map_err(|reason| CommandError::new(reason, 1))?;
+        let inputs = send_input_identity(
+            session_arg,
+            sender_id,
+            title,
+            body,
+            choices,
+            vendor_session_id,
+            route,
+            controller,
+            &manifest,
+        );
+        if saved.inputs != inputs || saved.files != manifest {
+            return Err(journal_error(
+                JournalError::OperationConflict(op_id),
+                EXIT_REFUSED,
+            ));
+        }
+        return emit_prepared_or_saved_result(&existing, op_id);
+    }
+
+    let session = if session_arg == "new" {
+        Uuid::new_v4()
+    } else {
+        parse_session(session_arg)?
+    };
+    let mut store = context.open_store(session)?;
+    let draft = send_draft(
+        session_arg,
+        sender_id,
+        title,
+        body,
+        choices,
+        vendor_session_id,
+        route,
+    );
+    let prepared_files =
+        prepare_outgoing_files(context, &store, session, op_id, files, "send", draft)?;
+    let message_id = Uuid::new_v4().to_string();
+    let request = match build_send_request(
+        op_id,
+        session,
+        &message_id,
+        sender_id,
+        title,
+        body,
+        choices,
+        vendor_session_id,
+        route,
+        controller,
+        &prepared_files.entries,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            files::cleanup_staged_uploads(&prepared_files.uploads);
+            return Err(error);
+        }
+    };
     if let Err(error) = validate_request_pre_upload(&request) {
         files::cleanup_staged_uploads(&prepared_files.uploads);
         return Err(error);
     }
-    let expected_session = session.to_string();
-    let operation = prepare_with_uploads(
-        &mut store,
-        session,
-        op_id,
-        "send",
-        request,
-        prepared_files.uploads,
-    )?;
-    let response = submit_operation(context, &mut store, operation)?;
-    let response_session = response["session_handle"]
-        .as_str()
-        .unwrap_or(&expected_session);
-    if response_session != expected_session {
-        return Err(CommandError::new(
-            "server send response named a different origin session",
-            1,
+    let inputs = send_input_identity(
+        session_arg,
+        sender_id,
+        title,
+        body,
+        choices,
+        vendor_session_id,
+        route,
+        controller,
+        &prepared_files.manifest,
+    );
+    let prepared_send = PreparedSend {
+        inputs,
+        request: request.clone(),
+        files: prepared_files.manifest,
+    };
+    let operation = store
+        .prepare_send_operation(
+            op_id,
+            session,
+            request,
+            prepared_files.uploads.clone(),
+            prepared_send,
+        )
+        .map_err(|error| journal_error(error, EXIT_REFUSED))?;
+    if operation.session_handle != session {
+        files::cleanup_staged_uploads(&prepared_files.uploads);
+    }
+    emit_prepared_or_saved_result(&operation, op_id)
+}
+
+fn send_draft(
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+) -> Value {
+    json!({
+        "session":session_arg,
+        "sender_id":sender_id,
+        "title":title,
+        "body":body,
+        "choices":choices,
+        "vendor_session_id":vendor_session_id,
+        "route":route.map(OriginHarness::as_str)
+    })
+}
+
+fn emit_prepared_or_saved_result(
+    operation: &OperationRecord,
+    op_id: Uuid,
+) -> Result<(), CommandError> {
+    let prepared = operation
+        .prepared_send
+        .as_ref()
+        .ok_or_else(|| journal_error(JournalError::OperationConflict(op_id), EXIT_REFUSED))?;
+    match operation.state {
+        OperationState::Committed => {
+            let response = operation
+                .response
+                .clone()
+                .ok_or_else(|| CommandError::new("committed operation has no saved response", 1))?;
+            emit(&retry_committed_result(
+                "send",
+                op_id,
+                "send",
+                &prepared.request,
+                response,
+            )?)
+        }
+        OperationState::Rejected => refused(
+            "send",
+            Some(op_id),
+            operation.response.clone().unwrap_or(Value::Null),
+        ),
+        OperationState::Prepared | OperationState::Unknown => emit(&json!({
+            "kind":"prepared",
+            "op_id":op_id,
+            "request":prepared.request,
+            "files":prepared.files
+        })),
+    }
+}
+
+pub fn execute_send(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> {
+    if op_id.get_version_num() != 4 {
+        return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
+    }
+    let global = context.open_global_store()?;
+    let existing = global
+        .operation(op_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| CommandError::new(format!("no recorded operation with key {op_id}"), 1))?;
+    if existing.kind != "send" || existing.prepared_send.is_none() {
+        return Err(journal_error(
+            JournalError::OperationConflict(op_id),
+            EXIT_REFUSED,
         ));
     }
-    emit(&send_result(sender_id, &message_id, session, &response))
+    let mut store = context.open_store(existing.session_handle)?;
+    let operation = store
+        .operation(op_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| CommandError::new(format!("no recorded operation with key {op_id}"), 1))?;
+    match operation.state {
+        OperationState::Committed => {
+            let response = operation
+                .response
+                .clone()
+                .ok_or_else(|| CommandError::new("committed operation has no saved response", 1))?;
+            validate_send_response_session(&response, &operation.session_handle.to_string())?;
+            emit_committed("send", op_id, response)
+        }
+        OperationState::Rejected => refused(
+            "send",
+            Some(op_id),
+            operation.response.clone().unwrap_or(Value::Null),
+        ),
+        OperationState::Prepared | OperationState::Unknown => {
+            let response = submit_operation(context, &mut store, operation.clone())?;
+            validate_send_response_session(&response, &operation.session_handle.to_string())?;
+            emit_committed("send", op_id, response)
+        }
+    }
 }
 
 fn send_result(sender_id: &str, message_id: &str, session: Uuid, response: &Value) -> Value {
@@ -1885,19 +2267,76 @@ fn ack_file_transfer_map(request: &Value) -> Option<Value> {
     Some(Value::Object(transfers))
 }
 
+trait OperationTransport {
+    fn post(&self, request: &Value) -> Result<Value, ApiError>;
+
+    fn upload_file(
+        &self,
+        op_id: Uuid,
+        sender_id: &str,
+        message_id: &str,
+        request_revision: u64,
+        name: &str,
+        path: &Path,
+        size: u64,
+    ) -> Result<Value, ApiError>;
+}
+
+impl OperationTransport for OriginClient {
+    fn post(&self, request: &Value) -> Result<Value, ApiError> {
+        OriginClient::post(self, request)
+    }
+
+    fn upload_file(
+        &self,
+        op_id: Uuid,
+        sender_id: &str,
+        message_id: &str,
+        request_revision: u64,
+        name: &str,
+        path: &Path,
+        size: u64,
+    ) -> Result<Value, ApiError> {
+        OriginClient::upload_file(
+            self,
+            op_id,
+            sender_id,
+            message_id,
+            request_revision,
+            name,
+            path,
+            size,
+        )
+    }
+}
+
 fn submit_operation(
     context: &CommandContext,
     store: &mut JournalStore,
     operation: OperationRecord,
 ) -> Result<Value, CommandError> {
+    submit_operation_with_transport(&context.api, store, operation)
+}
+
+fn submit_operation_with_transport(
+    transport: &impl OperationTransport,
+    store: &mut JournalStore,
+    operation: OperationRecord,
+) -> Result<Value, CommandError> {
+    if operation.prepared_send.is_some() && !prepared_send_request_matches(&operation) {
+        return Err(journal_error(
+            JournalError::OperationConflict(operation.op_id),
+            EXIT_REFUSED,
+        ));
+    }
     let op_id = operation.op_id;
     let staged_paths: Vec<PathBuf> = operation
         .uploads
         .iter()
         .filter_map(|upload| upload.staged_path.clone())
         .collect();
-    let result = match upload_pending_files(context, store, operation) {
-        Ok(operation) => submit_operation_inner(context, store, operation, true),
+    let result = match upload_pending_files(transport, store, operation) {
+        Ok(operation) => submit_operation_inner(transport, store, operation, true),
         Err(error) => Err(error),
     };
     let settled = store
@@ -1918,8 +2357,38 @@ fn submit_operation(
     result
 }
 
+fn prepared_send_request_matches(operation: &OperationRecord) -> bool {
+    let Some(prepared_send) = operation.prepared_send.as_ref() else {
+        return false;
+    };
+    let mut expected = prepared_send.request.clone();
+    for upload in &operation.uploads {
+        let Some(upload_id) = upload.upload_id.as_deref() else {
+            continue;
+        };
+        let Some(files) = expected.get_mut("files").and_then(Value::as_array_mut) else {
+            return false;
+        };
+        let Some(slot) = files.iter_mut().find(|file| {
+            file["name"].as_str() == Some(upload.name.as_str())
+                && file["upload_pending"] == true
+                && file["size"].as_u64() == Some(upload.size_bytes)
+                && file["sha256"].as_str() == Some(upload.sha256.as_str())
+        }) else {
+            return false;
+        };
+        *slot = json!({
+            "name":upload.name,
+            "upload_id":upload_id,
+            "size":upload.size_bytes,
+            "sha256":upload.sha256
+        });
+    }
+    expected == operation.request
+}
+
 fn upload_pending_files(
-    context: &CommandContext,
+    transport: &impl OperationTransport,
     store: &mut JournalStore,
     operation: OperationRecord,
 ) -> Result<OperationRecord, CommandError> {
@@ -1949,7 +2418,7 @@ fn upload_pending_files(
         store
             .mark_operation_unknown(current.op_id)
             .map_err(|error| journal_error(error, 1))?;
-        let response = match context.api.upload_file(
+        let response = match transport.upload_file(
             current.op_id,
             &sender_id,
             &message_id,
@@ -2141,11 +2610,17 @@ fn upload_binding(request: &Value) -> Result<(String, String, u64), CommandError
 }
 
 fn submit_operation_inner(
-    context: &CommandContext,
+    transport: &impl OperationTransport,
     store: &mut JournalStore,
     operation: OperationRecord,
     announce: bool,
 ) -> Result<Value, CommandError> {
+    if operation.prepared_send.is_some() && !prepared_send_request_matches(&operation) {
+        return Err(journal_error(
+            JournalError::OperationConflict(operation.op_id),
+            EXIT_REFUSED,
+        ));
+    }
     match operation.state {
         OperationState::Committed => {
             return operation
@@ -2164,7 +2639,7 @@ fn submit_operation_inner(
         .mark_operation_unknown(operation.op_id)
         .map_err(|error| journal_error(error, 1))?;
 
-    let response = match context.api.post(&operation.request) {
+    let response = match transport.post(&operation.request) {
         Ok(response) if response["type"] == "ok" => response,
         Ok(response) if response["type"] == "error" => {
             return handle_operation_error_response(store, &operation, response, announce);
@@ -2747,6 +3222,8 @@ fn env_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
+    use std::{cell::Cell, collections::VecDeque, sync::Mutex};
 
     struct Scratch(PathBuf);
 
@@ -2763,6 +3240,371 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    struct MockTransport {
+        posts: Mutex<Vec<Value>>,
+        uploads: Mutex<Vec<(Uuid, String, u64)>>,
+        post_results: Mutex<VecDeque<Result<Value, ApiError>>>,
+        upload_id: Uuid,
+    }
+
+    impl MockTransport {
+        fn new(post_results: impl IntoIterator<Item = Result<Value, ApiError>>) -> Self {
+            Self {
+                posts: Mutex::new(Vec::new()),
+                uploads: Mutex::new(Vec::new()),
+                post_results: Mutex::new(post_results.into_iter().collect()),
+                upload_id: Uuid::new_v4(),
+            }
+        }
+    }
+
+    impl OperationTransport for MockTransport {
+        fn post(&self, request: &Value) -> Result<Value, ApiError> {
+            self.posts.lock().unwrap().push(request.clone());
+            self.post_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(json!({"type":"ok","revision":1})))
+        }
+
+        fn upload_file(
+            &self,
+            op_id: Uuid,
+            _sender_id: &str,
+            _message_id: &str,
+            _request_revision: u64,
+            name: &str,
+            path: &Path,
+            size: u64,
+        ) -> Result<Value, ApiError> {
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((op_id, name.to_owned(), size));
+            let bytes = std::fs::read(path).map_err(|error| ApiError::Local(error.to_string()))?;
+            Ok(json!({
+                "type":"ok",
+                "upload_id":self.upload_id,
+                "name":name,
+                "size":size,
+                "sha256":hex::encode(sha2::Sha256::digest(bytes))
+            }))
+        }
+    }
+
+    fn prepared_send_record(
+        store: &mut JournalStore,
+        op_id: Uuid,
+        session: Uuid,
+        request: Value,
+        uploads: Vec<crate::journal::UploadSource>,
+        manifest: Vec<files::FileManifestEntry>,
+        inputs: Value,
+    ) -> OperationRecord {
+        store
+            .prepare_send_operation(
+                op_id,
+                session,
+                request.clone(),
+                uploads,
+                PreparedSend {
+                    request,
+                    files: manifest,
+                    inputs,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn prepared_send_persists_exact_request_and_stable_file_manifest_without_uploading() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let path = scratch.0.join("attachment.txt");
+        std::fs::write(&path, b"stable staged bytes").unwrap();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let file_limits_calls = Cell::new(0);
+        let prepared_files = prepare_outgoing_files_with_lookup(
+            &store,
+            session,
+            op_id,
+            std::slice::from_ref(&path),
+            "send",
+            json!({}),
+            || {
+                file_limits_calls.set(file_limits_calls.get() + 1);
+                Ok(json!({
+                    "type":"ok",
+                    "inline_decoded_bytes_per_entry":1,
+                    "upload_cap_bytes_per_file":"none"
+                }))
+            },
+        )
+        .unwrap();
+        let request = build_send_request(
+            op_id,
+            session,
+            "message-1",
+            "app:example",
+            "A title",
+            Some("A body"),
+            &[],
+            None,
+            None,
+            false,
+            &prepared_files.entries,
+        )
+        .unwrap();
+        let manifest = prepared_files.manifest.clone();
+        let inputs = send_input_identity(
+            "new",
+            "app:example",
+            "A title",
+            Some("A body"),
+            &[],
+            None,
+            None,
+            false,
+            &manifest,
+        );
+        let operation = prepared_send_record(
+            &mut store,
+            op_id,
+            session,
+            request.clone(),
+            prepared_files.uploads.clone(),
+            manifest.clone(),
+            inputs.clone(),
+        );
+
+        assert_eq!(file_limits_calls.get(), 1);
+        assert_eq!(operation.state, OperationState::Prepared);
+        assert_eq!(operation.prepared_send.as_ref().unwrap().request, request);
+        assert_eq!(operation.prepared_send.as_ref().unwrap().files, manifest);
+        assert_eq!(operation.request["files"][0]["upload_pending"], true);
+        assert_eq!(operation.uploads.len(), 1);
+        assert_eq!(
+            std::fs::read(operation.uploads[0].staged_path.as_ref().unwrap()).unwrap(),
+            b"stable staged bytes"
+        );
+
+        let resumed_request = build_send_request(
+            op_id,
+            Uuid::new_v4(),
+            "a-new-generated-message-id",
+            "app:example",
+            "A title",
+            Some("A body"),
+            &[],
+            None,
+            None,
+            false,
+            &prepared_files.entries,
+        )
+        .unwrap();
+        let resumed = prepared_send_record(
+            &mut store,
+            op_id,
+            Uuid::new_v4(),
+            resumed_request,
+            prepared_files.uploads,
+            manifest.clone(),
+            inputs,
+        );
+        assert_eq!(resumed.session_handle, session);
+        assert_eq!(resumed.prepared_send.as_ref().unwrap().request, request);
+        assert_eq!(resumed.prepared_send.as_ref().unwrap().files, manifest);
+        assert!(MockTransport::new([]).posts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prepared_send_conflicts_when_reused_with_changed_inputs() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let request = build_send_request(
+            op_id,
+            session,
+            "message-1",
+            "app:example",
+            "Original",
+            None,
+            &[],
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        let inputs = send_input_identity(
+            &session.to_string(),
+            "app:example",
+            "Original",
+            None,
+            &[],
+            None,
+            None,
+            false,
+            &[],
+        );
+        prepared_send_record(
+            &mut store,
+            op_id,
+            session,
+            request,
+            Vec::new(),
+            Vec::new(),
+            inputs,
+        );
+
+        let changed_request = build_send_request(
+            op_id,
+            session,
+            "message-2",
+            "app:example",
+            "Changed",
+            None,
+            &[],
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        let changed_inputs = send_input_identity(
+            &session.to_string(),
+            "app:example",
+            "Changed",
+            None,
+            &[],
+            None,
+            None,
+            false,
+            &[],
+        );
+        assert!(matches!(
+            store.prepare_send_operation(
+                op_id,
+                session,
+                changed_request.clone(),
+                Vec::new(),
+                PreparedSend {
+                    request: changed_request,
+                    files: Vec::new(),
+                    inputs: changed_inputs,
+                }
+            ),
+            Err(JournalError::OperationConflict(id)) if id == op_id
+        ));
+    }
+
+    #[test]
+    fn send_response_session_must_match_the_prepared_handle() {
+        let expected = Uuid::new_v4().to_string();
+        assert!(
+            validate_send_response_session(
+                &json!({"type":"ok","session_handle":expected}),
+                &expected
+            )
+            .is_ok()
+        );
+        assert!(validate_send_response_session(&json!({"type":"ok"}), &expected).is_ok());
+        assert!(
+            validate_send_response_session(
+                &json!({"type":"ok","session_handle":Uuid::new_v4().to_string()}),
+                &expected
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn uploaded_send_retries_the_same_final_payload_and_original_operation_id() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let path = scratch.0.join("large.txt");
+        std::fs::write(&path, b"larger than inline").unwrap();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let prepared_files = prepare_outgoing_files_with_lookup(
+            &store,
+            session,
+            op_id,
+            std::slice::from_ref(&path),
+            "send",
+            json!({}),
+            || {
+                Ok(json!({
+                    "type":"ok",
+                    "inline_decoded_bytes_per_entry":1,
+                    "upload_cap_bytes_per_file":"none"
+                }))
+            },
+        )
+        .unwrap();
+        let request = build_send_request(
+            op_id,
+            session,
+            "message-1",
+            "app:example",
+            "A title",
+            Some("A body"),
+            &[],
+            None,
+            None,
+            false,
+            &prepared_files.entries,
+        )
+        .unwrap();
+        let inputs = send_input_identity(
+            &session.to_string(),
+            "app:example",
+            "A title",
+            Some("A body"),
+            &[],
+            None,
+            None,
+            false,
+            &prepared_files.manifest,
+        );
+        let operation = prepared_send_record(
+            &mut store,
+            op_id,
+            session,
+            request.clone(),
+            prepared_files.uploads,
+            prepared_files.manifest,
+            inputs,
+        );
+        let first = MockTransport::new([Err(ApiError::InvalidResponse("lost response".into()))]);
+
+        assert!(matches!(
+            submit_operation_with_transport(&first, &mut store, operation),
+            Err(error) if error.exit_code == EXIT_OUTCOME_UNKNOWN
+        ));
+        assert_eq!(first.uploads.lock().unwrap().len(), 1);
+        let first_post = first.posts.lock().unwrap()[0].clone();
+        assert_eq!(first_post["op_id"], op_id.to_string());
+        assert_ne!(first_post, request);
+        assert!(first_post["files"][0]["upload_id"].is_string());
+
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Unknown);
+        assert_eq!(saved.prepared_send.as_ref().unwrap().request, request);
+        let second = MockTransport::new([Ok(json!({"type":"ok","revision":1}))]);
+        submit_operation_with_transport(&second, &mut store, saved).unwrap();
+
+        assert!(second.uploads.lock().unwrap().is_empty());
+        assert_eq!(second.posts.lock().unwrap().as_slice(), &[first_post]);
+        assert_eq!(
+            store.operation(op_id).unwrap().unwrap().state,
+            OperationState::Committed
+        );
     }
 
     #[test]

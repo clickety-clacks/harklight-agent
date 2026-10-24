@@ -10,7 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -67,10 +67,19 @@ pub struct FileSelection {
     pub size_bytes: u64,
 }
 
+/// Stable, path-free identity for the exact bytes supplied to one operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileManifestEntry {
+    pub name: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedFiles {
     pub entries: Vec<Value>,
     pub uploads: Vec<UploadSource>,
+    pub manifest: Vec<FileManifestEntry>,
 }
 
 struct DownloadedBody {
@@ -87,6 +96,7 @@ pub fn prepare_outgoing(
     let selections = inspect(paths)?;
     let mut entries = Vec::with_capacity(selections.len());
     let mut uploads = Vec::new();
+    let mut manifest = Vec::with_capacity(selections.len());
     let mut inline_total = 0u64;
     let prepare_result = (|| -> Result<(), String> {
         for (index, selected) in selections.iter().enumerate() {
@@ -99,13 +109,20 @@ pub fn prepare_outgoing(
                 None
             };
             if let Some(bytes) = inline_bytes {
+                let size_bytes = bytes.len() as u64;
+                let sha256 = hex::encode(Sha256::digest(&bytes));
                 inline_total = inline_total
-                    .checked_add(bytes.len() as u64)
+                    .checked_add(size_bytes)
                     .ok_or_else(|| "selected file sizes exceed the supported range".to_owned())?;
                 entries.push(json!({
                     "name":selected.name,
                     "data_base64":STANDARD.encode(bytes)
                 }));
+                manifest.push(FileManifestEntry {
+                    name: selected.name.clone(),
+                    size_bytes,
+                    sha256,
+                });
                 continue;
             }
 
@@ -117,6 +134,11 @@ pub fn prepare_outgoing(
                 "size":upload.size_bytes,
                 "sha256":upload.sha256
             }));
+            manifest.push(FileManifestEntry {
+                name: upload.name.clone(),
+                size_bytes: upload.size_bytes,
+                sha256: upload.sha256.clone(),
+            });
             uploads.push(upload);
         }
         Ok(())
@@ -129,7 +151,48 @@ pub fn prepare_outgoing(
         }
         return Err(reason);
     }
-    Ok(PreparedFiles { entries, uploads })
+    Ok(PreparedFiles {
+        entries,
+        uploads,
+        manifest,
+    })
+}
+
+/// Identify file inputs without staging or performing any network operation.
+/// This lets an idempotent prepare call compare its inputs with the durable
+/// operation before consulting current server limits or changing local files.
+pub fn identify(paths: &[PathBuf]) -> Result<Vec<FileManifestEntry>, String> {
+    inspect(paths)?
+        .into_iter()
+        .map(|selected| {
+            let mut file = File::open(&selected.path).map_err(|error| {
+                format!(
+                    "could not open selected file {}: {error}",
+                    selected.path.display()
+                )
+            })?;
+            let mut size_bytes = 0u64;
+            let mut digest = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer).map_err(|error| {
+                    format!("could not read selected file {}: {error}", selected.name)
+                })?;
+                if count == 0 {
+                    break;
+                }
+                size_bytes = size_bytes.checked_add(count as u64).ok_or_else(|| {
+                    format!("file {} exceeds the supported size range", selected.name)
+                })?;
+                digest.update(&buffer[..count]);
+            }
+            Ok(FileManifestEntry {
+                name: selected.name,
+                size_bytes,
+                sha256: hex::encode(digest.finalize()),
+            })
+        })
+        .collect()
 }
 
 fn read_inline_candidate(
