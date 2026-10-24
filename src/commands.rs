@@ -437,13 +437,42 @@ pub fn send(
             1,
         ));
     }
-    emit(&json!({
+    emit(&send_result(sender_id, &message_id, session, &response))
+}
+
+fn send_result(sender_id: &str, message_id: &str, session: Uuid, response: &Value) -> Value {
+    json!({
         "request": message_id,
         "sender_id": sender_id,
+        "message_url": message_url(sender_id, message_id),
         "session": session,
         "revision": response["revision"].as_u64().unwrap_or(1),
         "listening_support": response.get("listening_support").cloned().unwrap_or(Value::Null)
-    }))
+    })
+}
+
+fn message_url(sender_id: &str, message_id: &str) -> String {
+    format!(
+        "harklight://message/{}/{}",
+        encode_path_segment(sender_id),
+        encode_path_segment(message_id)
+    )
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 fn attachment_update_request(op_id: Uuid, session: Uuid, vendor_session_id: Option<&str>) -> Value {
@@ -2716,6 +2745,28 @@ mod tests {
         let action = &descriptor["actions"][0];
         assert_eq!(action["label"], action["value"]);
         assert_eq!(action.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn message_url_percent_encodes_sender_and_message_as_separate_segments() {
+        let session = Uuid::new_v4();
+        let result = send_result(
+            "app:example/µ",
+            "message id%/1",
+            session,
+            &json!({"revision":2,"listening_support":{"route":"claude-code"}}),
+        );
+        assert_eq!(
+            result,
+            json!({
+                "request":"message id%/1",
+                "sender_id":"app:example/µ",
+                "message_url":"harklight://message/app%3Aexample%2F%C2%B5/message%20id%25%2F1",
+                "session":session,
+                "revision":2,
+                "listening_support":{"route":"claude-code"}
+            })
+        );
     }
 
     #[test]
