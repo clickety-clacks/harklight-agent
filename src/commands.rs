@@ -437,13 +437,42 @@ pub fn send(
             1,
         ));
     }
-    emit(&json!({
+    emit(&send_result(sender_id, &message_id, session, &response))
+}
+
+fn send_result(sender_id: &str, message_id: &str, session: Uuid, response: &Value) -> Value {
+    json!({
         "request": message_id,
         "sender_id": sender_id,
+        "message_url": message_url(sender_id, message_id),
         "session": session,
         "revision": response["revision"].as_u64().unwrap_or(1),
         "listening_support": response.get("listening_support").cloned().unwrap_or(Value::Null)
-    }))
+    })
+}
+
+fn message_url(sender_id: &str, message_id: &str) -> String {
+    format!(
+        "harklight://message/{}/{}",
+        encode_path_segment(sender_id),
+        encode_path_segment(message_id)
+    )
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 fn attachment_update_request(op_id: Uuid, session: Uuid, vendor_session_id: Option<&str>) -> Value {
@@ -1381,7 +1410,13 @@ pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> 
             if operation.kind == "discard_uploads" {
                 emit_discard_uploads_committed(op_id, &operation.request, &response)
             } else {
-                emit_committed(&operation.kind, op_id, response)
+                emit(&retry_committed_result(
+                    &operation.kind,
+                    op_id,
+                    &operation.kind,
+                    &operation.request,
+                    response,
+                )?)
             }
         }
         OperationState::Rejected => refused(
@@ -1396,7 +1431,13 @@ pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> 
             if operation.kind == "discard_uploads" {
                 emit_discard_uploads_committed(op_id, &operation.request, &response)
             } else {
-                emit_committed("retry", op_id, response)
+                emit(&retry_committed_result(
+                    "retry",
+                    op_id,
+                    &operation.kind,
+                    &operation.request,
+                    response,
+                )?)
             }
         }
     }
@@ -2585,6 +2626,31 @@ fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), Comman
     emit(&json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response}))
 }
 
+fn retry_committed_result(
+    output_operation: &str,
+    op_id: Uuid,
+    operation_kind: &str,
+    request: &Value,
+    response: Value,
+) -> Result<Value, CommandError> {
+    let mut output = json!({
+        "kind":"committed",
+        "operation":output_operation,
+        "op_id":op_id,
+        "response":response
+    });
+    if operation_kind == "send" {
+        let sender_id = request["message"]["sender_id"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("saved send operation has no sender ID", 1))?;
+        let message_id = request["message"]["message_id"]
+            .as_str()
+            .ok_or_else(|| CommandError::new("saved send operation has no message ID", 1))?;
+        output["message_url"] = Value::String(message_url(sender_id, message_id));
+    }
+    Ok(output)
+}
+
 fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
     let mut output = Map::new();
@@ -2716,6 +2782,47 @@ mod tests {
         let action = &descriptor["actions"][0];
         assert_eq!(action["label"], action["value"]);
         assert_eq!(action.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn message_url_percent_encodes_sender_and_message_as_separate_segments() {
+        let session = Uuid::new_v4();
+        let result = send_result(
+            "app:example/µ",
+            "message id%/1",
+            session,
+            &json!({"revision":2,"listening_support":{"route":"claude-code"}}),
+        );
+        assert_eq!(
+            result,
+            json!({
+                "request":"message id%/1",
+                "sender_id":"app:example/µ",
+                "message_url":"harklight://message/app%3Aexample%2F%C2%B5/message%20id%25%2F1",
+                "session":session,
+                "revision":2,
+                "listening_support":{"route":"claude-code"}
+            })
+        );
+    }
+
+    #[test]
+    fn committed_send_retry_result_includes_the_message_url() {
+        let op_id = Uuid::new_v4();
+        let request = json!({"message":{"sender_id":"app:example","message_id":"message-1"}});
+        let response = json!({"type":"ok","revision":1});
+
+        for output_operation in ["send", "retry"] {
+            let result =
+                retry_committed_result(output_operation, op_id, "send", &request, response.clone())
+                    .unwrap();
+            assert_eq!(
+                result["message_url"],
+                "harklight://message/app%3Aexample/message-1"
+            );
+            assert_eq!(result["operation"], output_operation);
+            assert_eq!(result["response"], response);
+        }
     }
 
     #[test]
