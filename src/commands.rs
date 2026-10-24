@@ -2813,14 +2813,9 @@ mod tests {
         let response = json!({"type":"ok","revision":1});
 
         for output_operation in ["send", "retry"] {
-            let result = retry_committed_result(
-                output_operation,
-                op_id,
-                "send",
-                &request,
-                response.clone(),
-            )
-            .unwrap();
+            let result =
+                retry_committed_result(output_operation, op_id, "send", &request, response.clone())
+                    .unwrap();
             assert_eq!(
                 result["message_url"],
                 "harklight://message/app%3Aexample/message-1"
