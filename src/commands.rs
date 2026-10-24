@@ -9,7 +9,7 @@ use std::{
 
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use uuid::Uuid;
+use uuid::{Uuid, Version};
 
 use crate::{
     api::{ApiError, OriginClient},
@@ -58,9 +58,7 @@ impl OriginHarness {
     fn unsupported_reason(self, controller: bool) -> Value {
         match self {
             Self::ClaudeCode => Value::Null,
-            Self::Codex => Value::String(
-                "Codex listening is not supported yet".into(),
-            ),
+            Self::Codex => Value::String("Codex listening is not supported yet".into()),
             Self::Other if controller => Value::Null,
             Self::Other => Value::String("no controller declared for the other route".into()),
         }
@@ -446,6 +444,424 @@ pub fn send(
         "revision": response["revision"].as_u64().unwrap_or(1),
         "listening_support": response.get("listening_support").cloned().unwrap_or(Value::Null)
     }))
+}
+
+fn attachment_update_request(op_id: Uuid, session: Uuid, vendor_session_id: Option<&str>) -> Value {
+    json!({
+        "v":1,
+        "type":"attachment_update",
+        "op_id":op_id.to_string(),
+        "session_handle":session.to_string(),
+        "vendor_session_id":vendor_session_id
+    })
+}
+
+fn attachment_support_request(
+    op_id: Uuid,
+    session: Uuid,
+    route: OriginHarness,
+    controller: bool,
+) -> Value {
+    json!({
+        "v":1,
+        "type":"support",
+        "op_id":op_id.to_string(),
+        "session_handle":session.to_string(),
+        "route":route.as_str(),
+        "cli_version":env!("CARGO_PKG_VERSION"),
+        "unsupported_reason":route.unsupported_reason(controller)
+    })
+}
+
+fn same_operation_payload(left: &Value, right: &Value) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    if let Some(object) = left.as_object_mut() {
+        object.remove("op_id");
+    }
+    if let Some(object) = right.as_object_mut() {
+        object.remove("op_id");
+    }
+    left == right
+}
+
+/// Reuse an unresolved operation only for the same semantic request. A
+/// confirmed result can also be reused by a multi-step command that is being
+/// resumed after the process stopped between phases.
+fn prepare_or_resume_operation(
+    store: &mut JournalStore,
+    session: Uuid,
+    kind: &str,
+    request: Value,
+    reuse_committed: bool,
+) -> Result<OperationRecord, CommandError> {
+    let operations = store
+        .operations_for_session(session)
+        .map_err(|error| journal_error(error, 1))?;
+    let pending: Vec<_> = operations
+        .iter()
+        .filter(|operation| {
+            operation.kind == kind
+                && matches!(
+                    operation.state,
+                    OperationState::Prepared | OperationState::Unknown
+                )
+        })
+        .collect();
+    if !pending.is_empty() {
+        if pending.len() == 1 && same_operation_payload(&pending[0].request, &request) {
+            return Ok(pending[0].clone());
+        }
+        let operation = pending[0];
+        return Err(CommandError::new(
+            format!(
+                "{} operation {} is unresolved; retry that exact operation before changing its fields",
+                kind, operation.op_id
+            ),
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
+
+    if reuse_committed {
+        if let Some(operation) = operations.iter().rev().find(|operation| {
+            operation.kind == kind && operation.state == OperationState::Committed
+        }) {
+            if same_operation_payload(&operation.request, &request) {
+                return Ok(operation.clone());
+            }
+        }
+    }
+
+    let op_id = parse_uuid_field(&request, "op_id")?;
+    prepare(store, session, op_id, kind, request)
+}
+
+fn handle_operation_error_response(
+    store: &mut JournalStore,
+    operation: &OperationRecord,
+    response: Value,
+    announce: bool,
+) -> Result<Value, CommandError> {
+    let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+    if reason == "storage_unavailable"
+        && matches!(
+            operation.kind.as_str(),
+            "attachment_update" | "attachment_support" | "support"
+        )
+    {
+        if announce {
+            emit(&json!({
+                "kind":"outcome_unknown",
+                "operation":operation.kind,
+                "op_id":operation.op_id,
+                "session_handle":operation.session_handle,
+                "reason":reason,
+                "response":response,
+                "retry":"run harklight-agent retry --op-id with this exact key"
+            }))?;
+        }
+        return Err(CommandError::new(
+            format!(
+                "{} outcome is unknown: storage_unavailable; retry the identical persisted operation",
+                operation.kind
+            ),
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
+
+    store
+        .reject_operation(operation.op_id, response.clone())
+        .map_err(|error| journal_error(error, 1))?;
+    if announce {
+        refused(&operation.kind, Some(operation.op_id), response)?;
+    }
+    Err(CommandError::new(
+        format!("{} refused: {reason}", operation.kind),
+        EXIT_REFUSED,
+    ))
+}
+
+fn attachment_update_response_matches(request: &Value, response: &Value) -> bool {
+    request["v"] == 1
+        && request["type"] == "attachment_update"
+        && response["v"] == 1
+        && response["type"] == "ok"
+        && response.get("session_handle") == request.get("session_handle")
+        && request
+            .get("session_handle")
+            .and_then(Value::as_str)
+            .is_some()
+        && request.get("vendor_session_id").is_some_and(|vendor_id| {
+            (vendor_id.is_null()
+                || vendor_id
+                    .as_str()
+                    .is_some_and(|vendor_id| !vendor_id.is_empty()))
+                && response.get("vendor_session_id") == Some(vendor_id)
+        })
+}
+
+fn local_journal_proves_existing_session(
+    store: &JournalStore,
+    session: Uuid,
+) -> Result<bool, CommandError> {
+    let session_value = session.to_string();
+    let operations = store
+        .operations_for_session(session)
+        .map_err(|error| journal_error(error, 1))?;
+    Ok(operations.iter().any(|operation| {
+        operation.kind == "send"
+            && operation.state == OperationState::Committed
+            && operation.request["session_handle"].as_str() == Some(session_value.as_str())
+    }))
+}
+
+fn ensure_attach_recovery_compatible(
+    store: &JournalStore,
+    session: Uuid,
+    vendor_session_id: Option<&str>,
+    support_request: &Value,
+) -> Result<(), CommandError> {
+    let operations = store
+        .operations_for_session(session)
+        .map_err(|error| journal_error(error, 1))?;
+    if let Some(operation) = operations.iter().find(|operation| {
+        operation.kind == "support"
+            && matches!(
+                operation.state,
+                OperationState::Prepared | OperationState::Unknown
+            )
+    }) {
+        return Err(CommandError::new(
+            format!(
+                "H5 support operation {} is unresolved; retry that exact operation before attaching",
+                operation.op_id
+            ),
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
+
+    if let Some((index, operation)) = operations.iter().enumerate().find(|(_, operation)| {
+        operation.kind == "attachment_support"
+            && matches!(
+                operation.state,
+                OperationState::Prepared | OperationState::Unknown
+            )
+    }) {
+        let update = operations[..index]
+            .iter()
+            .rev()
+            .find(|prior| prior.kind == "attachment_update");
+        let expected_vendor_id = vendor_session_id.map(Value::from).unwrap_or(Value::Null);
+        let same_update = update.is_some_and(|update| {
+            update.state == OperationState::Committed
+                && update.request["vendor_session_id"] == expected_vendor_id
+                && update.response.as_ref().is_some_and(|response| {
+                    attachment_update_response_matches(&update.request, response)
+                })
+        });
+        if !same_update || !same_operation_payload(&operation.request, support_request) {
+            return Err(CommandError::new(
+                format!(
+                    "attachment support operation {} is unresolved; retry the same attach inputs before changing the handle or route",
+                    operation.op_id
+                ),
+                EXIT_OUTCOME_UNKNOWN,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn attach(
+    context: &CommandContext,
+    session: Uuid,
+    vendor_session_arg: &str,
+    route: OriginHarness,
+    controller: bool,
+) -> Result<(), CommandError> {
+    if session.get_version() != Some(Version::Random) {
+        return Err(CommandError::new(
+            "--session must be an existing UUIDv4 Harklight handle",
+            EXIT_REFUSED,
+        ));
+    }
+    if controller && route != OriginHarness::Other {
+        return Err(CommandError::new(
+            "--controller is valid only with --route other",
+            EXIT_REFUSED,
+        ));
+    }
+    let vendor_session_id = match vendor_session_arg {
+        "none" => None,
+        "" => {
+            return Err(CommandError::new(
+                "--vendor-session-id must be a non-empty ID or none",
+                EXIT_REFUSED,
+            ));
+        }
+        value => Some(value),
+    };
+
+    let mut store = context.open_store(session)?;
+    store
+        .acquire_listener()
+        .map_err(|error| journal_error(error, EXIT_LISTENER_ACTIVE))?;
+    if !local_journal_proves_existing_session(&store, session)? {
+        return Err(CommandError::new(
+            "the local origin journal does not prove this existing handle; attach requires the same enrolled origin and host journal",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let support_request = attachment_support_request(Uuid::new_v4(), session, route, controller);
+    ensure_attach_recovery_compatible(&store, session, vendor_session_id, &support_request)?;
+
+    let attachment_request = attachment_update_request(Uuid::new_v4(), session, vendor_session_id);
+    let attachment_operation = prepare_or_resume_operation(
+        &mut store,
+        session,
+        "attachment_update",
+        attachment_request,
+        true,
+    )?;
+    let attachment_op_id = attachment_operation.op_id;
+    let attachment_response = submit_operation(context, &mut store, attachment_operation.clone())?;
+    if !attachment_update_response_matches(&attachment_operation.request, &attachment_response) {
+        return Err(CommandError::new(
+            "the saved attachment result does not confirm the requested handle and vendor ID; do not listen",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let support_operation = prepare_or_resume_operation(
+        &mut store,
+        session,
+        "attachment_support",
+        support_request.clone(),
+        false,
+    )?;
+    let support_op_id = support_operation.op_id;
+    let _support_response = submit_operation(context, &mut store, support_operation)?;
+    let status = read_status(context, session)?;
+    if !support_record_matches(&status, &support_request) {
+        emit(&json!({
+            "kind":"unsupported",
+            "operation":"attach",
+            "session_handle":session,
+            "attachment_op_id":attachment_op_id,
+            "support_op_id":support_op_id,
+            "reason":"origin did not confirm the requested route-support record; no listener was started",
+            "listening_support":status.get("listening_support").cloned().unwrap_or(Value::Null)
+        }))?;
+        return Err(CommandError::new(
+            "origin did not confirm the requested route-support record; no listener was started",
+            EXIT_UNSUPPORTED,
+        ));
+    }
+
+    let unsupported_reason = support_request["unsupported_reason"].as_str();
+    emit(&json!({
+        "kind":"attached",
+        "session_handle":session,
+        "vendor_session_id":vendor_session_id,
+        "attachment_op_id":attachment_op_id,
+        "support_op_id":support_op_id,
+        "ready_for_listen":unsupported_reason.is_none(),
+        "listening_support":status.get("listening_support").cloned().unwrap_or(Value::Null)
+    }))
+}
+
+fn attachment_route_for_listen(
+    store: &JournalStore,
+    session: Uuid,
+) -> Result<Option<String>, CommandError> {
+    let operations = store
+        .operations_for_session(session)
+        .map_err(|error| journal_error(error, 1))?;
+    let Some(attachment_index) = operations
+        .iter()
+        .rposition(|operation| operation.kind == "attachment_update")
+    else {
+        return Ok(None);
+    };
+    let attachment = &operations[attachment_index];
+    if attachment.state != OperationState::Committed {
+        let exit_code = if matches!(
+            attachment.state,
+            OperationState::Prepared | OperationState::Unknown
+        ) {
+            EXIT_OUTCOME_UNKNOWN
+        } else {
+            EXIT_REFUSED
+        };
+        return Err(CommandError::new(
+            format!(
+                "the latest attachment operation {} is not confirmed; reconcile it before listening",
+                attachment.op_id
+            ),
+            exit_code,
+        ));
+    }
+    if !attachment
+        .response
+        .as_ref()
+        .is_some_and(|response| attachment_update_response_matches(&attachment.request, response))
+    {
+        return Err(CommandError::new(
+            "the latest attachment result does not confirm its handle and vendor ID; do not listen",
+            EXIT_REFUSED,
+        ));
+    }
+    if !local_journal_proves_existing_session(store, session)? {
+        return Err(CommandError::new(
+            "the local origin journal no longer proves this existing handle; do not listen",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let support = operations[attachment_index + 1..]
+        .iter()
+        .rev()
+        .find(|operation| operation.kind == "attachment_support")
+        .ok_or_else(|| {
+            CommandError::new(
+                "the confirmed attachment has no confirmed H5 support result; run attach before listening",
+                EXIT_REFUSED,
+            )
+        })?;
+    if support.state != OperationState::Committed {
+        let exit_code = if matches!(
+            support.state,
+            OperationState::Prepared | OperationState::Unknown
+        ) {
+            EXIT_OUTCOME_UNKNOWN
+        } else {
+            EXIT_REFUSED
+        };
+        return Err(CommandError::new(
+            format!(
+                "the H5 support operation {} after attachment is not confirmed; reconcile it before listening",
+                support.op_id
+            ),
+            exit_code,
+        ));
+    }
+    if support.request["type"] != "support" {
+        return Err(CommandError::new(
+            "the journaled H5 support operation has an invalid request; do not listen",
+            EXIT_REFUSED,
+        ));
+    }
+    let route = support.request["route"]
+        .as_str()
+        .filter(|route| matches!(*route, "claude-code" | "codex" | "other"))
+        .ok_or_else(|| {
+            CommandError::new(
+                "the confirmed H5 support operation has no recognized route; do not listen",
+                EXIT_REFUSED,
+            )
+        })?;
+    Ok(Some(route.to_owned()))
 }
 
 pub fn ack(context: &CommandContext, session: Uuid, event_id: &str) -> Result<(), CommandError> {
@@ -1040,6 +1456,8 @@ pub fn listen(
         journal_error(error, code)
     })?;
 
+    let attached_route = attachment_route_for_listen(&store, session)?;
+
     let current_status = read_status(context, session)?;
     let support = current_status["listening_support"]
         .as_object()
@@ -1065,6 +1483,15 @@ pub fn listen(
             );
         }
     };
+    if attached_route
+        .as_deref()
+        .is_some_and(|attached| attached != route.as_str())
+    {
+        return unsupported(
+            "listen",
+            "the current server route differs from the confirmed local attach; run attach again before listening",
+        );
+    }
     if controller && route != OriginHarness::Other {
         return Err(CommandError::new(
             "--controller requires a session declared with route other",
@@ -1087,8 +1514,7 @@ pub fn listen(
         "cli_version":env!("CARGO_PKG_VERSION"),
         "unsupported_reason":unsupported_reason.clone()
     });
-    let arm_op_id = parse_uuid_field(&arm, "op_id")?;
-    let operation = prepare(&mut store, session, arm_op_id, "support", arm)?;
+    let operation = prepare_or_resume_operation(&mut store, session, "support", arm, false)?;
     let arm_response = submit_operation(context, &mut store, operation)?;
     if let Some(reason) = unsupported_reason.as_str() {
         emit(&json!({
@@ -1102,11 +1528,14 @@ pub fn listen(
         return Err(CommandError::new(reason, EXIT_UNSUPPORTED));
     }
     let armed_status = read_status(context, session)?;
-    if armed_status["listening_support"]["route"].as_str() != Some(route.as_str())
-        || armed_status["listening_support"]["cli_version"].as_str()
-            != Some(env!("CARGO_PKG_VERSION"))
-        || !armed_status["listening_support"]["unsupported_reason"].is_null()
-    {
+    if !support_record_matches(
+        &armed_status,
+        &json!({
+            "route":route.as_str(),
+            "cli_version":env!("CARGO_PKG_VERSION"),
+            "unsupported_reason":Value::Null
+        }),
+    ) {
         let reason = "origin did not confirm the supported arm-time record; no stream was attached";
         emit(&json!({
             "kind":"unsupported",
@@ -1208,15 +1637,22 @@ fn listener_unsupported_reason(
             Some("Claude Code 2.1.234 or later is required for between-turn notifications")
         }
         OriginHarness::ClaudeCode => None,
-        OriginHarness::Codex => {
-            Some("Codex listening is not supported yet")
-        }
+        OriginHarness::Codex => Some("Codex listening is not supported yet"),
         OriginHarness::Other if controller => None,
         OriginHarness::Other => Some("no controller declared for the other route"),
     };
     reason
         .map(|reason| Value::String(reason.into()))
         .unwrap_or(Value::Null)
+}
+
+fn support_record_matches(status: &Value, request: &Value) -> bool {
+    let Some(support) = status.get("listening_support") else {
+        return false;
+    };
+    support.get("route") == request.get("route")
+        && support.get("cli_version") == request.get("cli_version")
+        && support.get("unsupported_reason") == request.get("unsupported_reason")
 }
 
 fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
@@ -1690,17 +2126,7 @@ fn submit_operation_inner(
     let response = match context.api.post(&operation.request) {
         Ok(response) if response["type"] == "ok" => response,
         Ok(response) if response["type"] == "error" => {
-            store
-                .reject_operation(operation.op_id, response.clone())
-                .map_err(|error| journal_error(error, 1))?;
-            let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
-            if announce {
-                refused(&operation.kind, Some(operation.op_id), response)?;
-            }
-            return Err(CommandError::new(
-                format!("{} refused: {reason}", operation.kind),
-                EXIT_REFUSED,
-            ));
+            return handle_operation_error_response(store, &operation, response, announce);
         }
         Ok(response) => {
             store
@@ -1749,6 +2175,25 @@ fn submit_operation_inner(
             return Err(api_error(error, 1));
         }
     };
+
+    if operation.kind == "attachment_update"
+        && !attachment_update_response_matches(&operation.request, &response)
+    {
+        if announce {
+            emit(&json!({
+                "kind":"outcome_unknown",
+                "operation":"attachment_update",
+                "op_id":operation.op_id,
+                "session_handle":operation.session_handle,
+                "response":response,
+                "retry":"run harklight-agent retry --op-id with this exact key"
+            }))?;
+        }
+        return Err(CommandError::new(
+            "origin did not confirm the stored handle and vendor ID; retry the identical attachment operation",
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
 
     if operation.kind == "discard_uploads" && !valid_discard_uploads_response(&response) {
         if announce {
@@ -2278,10 +2723,13 @@ mod tests {
         let empty = choices_answer_ui(&["Approve".to_string(), "  ".to_string()]).unwrap_err();
         assert_eq!(empty.exit_code, EXIT_REFUSED);
         assert_eq!(empty.message, "--choice 2 is empty");
-        let duplicate = choices_answer_ui(&["Approve".to_string(), "Approve".to_string()])
-            .unwrap_err();
+        let duplicate =
+            choices_answer_ui(&["Approve".to_string(), "Approve".to_string()]).unwrap_err();
         assert_eq!(duplicate.exit_code, EXIT_REFUSED);
-        assert_eq!(duplicate.message, "--choice \"Approve\" is given more than once");
+        assert_eq!(
+            duplicate.message,
+            "--choice \"Approve\" is given more than once"
+        );
         assert_eq!(
             revised_message(&json!({}), "t", None, &["".to_string()], false)
                 .unwrap_err()
@@ -2360,6 +2808,470 @@ mod tests {
         assert!(matches!(
             validate_send_route("existing", Some(OriginHarness::Other), true),
             Err(error) if error.exit_code == EXIT_REFUSED
+        ));
+    }
+
+    #[test]
+    fn attachment_update_frame_uses_the_proposed_v1_fields_and_null_vendor_id() {
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        assert_eq!(
+            attachment_update_request(op_id, session, None),
+            json!({
+                "v":1,
+                "type":"attachment_update",
+                "op_id":op_id.to_string(),
+                "session_handle":session.to_string(),
+                "vendor_session_id":null
+            })
+        );
+        assert_eq!(
+            attachment_update_request(op_id, session, Some("vendor-thread"))["vendor_session_id"],
+            "vendor-thread"
+        );
+    }
+
+    #[test]
+    fn attachment_result_must_echo_the_exact_handle_and_vendor_id() {
+        let session = Uuid::new_v4();
+        let request = attachment_update_request(Uuid::new_v4(), session, None);
+        let confirmed = json!({
+            "v":1,
+            "type":"ok",
+            "session_handle":session.to_string(),
+            "vendor_session_id":null
+        });
+        assert!(attachment_update_response_matches(&request, &confirmed));
+
+        let wrong_handle = json!({
+            "v":1,
+            "type":"ok",
+            "session_handle":Uuid::new_v4().to_string(),
+            "vendor_session_id":null
+        });
+        assert!(!attachment_update_response_matches(&request, &wrong_handle));
+
+        let wrong_vendor = json!({
+            "v":1,
+            "type":"ok",
+            "session_handle":session.to_string(),
+            "vendor_session_id":"stale-thread"
+        });
+        assert!(!attachment_update_response_matches(&request, &wrong_vendor));
+        assert!(!attachment_update_response_matches(
+            &request,
+            &json!({"v":1,"type":"ok","session_handle":session.to_string()})
+        ));
+    }
+
+    #[test]
+    fn attach_retry_reuses_an_unknown_operation_and_blocks_changed_payloads() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let request = attachment_update_request(op_id, session, Some("thread-a"));
+        store
+            .prepare_operation(op_id, session, "attachment_update".into(), request.clone())
+            .unwrap();
+        store.mark_operation_unknown(op_id).unwrap();
+
+        let resumed = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_update",
+            attachment_update_request(Uuid::new_v4(), session, Some("thread-a")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(resumed.op_id, op_id);
+        assert_eq!(resumed.request, request);
+
+        let changed = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_update",
+            attachment_update_request(Uuid::new_v4(), session, Some("thread-b")),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(changed.exit_code, EXIT_OUTCOME_UNKNOWN);
+        assert!(changed.message.contains(&op_id.to_string()));
+    }
+
+    #[test]
+    fn reattach_with_a_new_vendor_id_records_new_support_before_listen() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+
+        let send_id = Uuid::new_v4();
+        store
+            .prepare_operation(
+                send_id,
+                session,
+                "send".into(),
+                json!({"v":1,"type":"send","op_id":send_id,"session_handle":session}),
+            )
+            .unwrap();
+        store
+            .settle_operation(send_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+
+        let first_update = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_update",
+            attachment_update_request(Uuid::new_v4(), session, Some("vendor-thread-1")),
+            true,
+        )
+        .unwrap();
+        store
+            .settle_operation(
+                first_update.op_id,
+                json!({
+                    "v":1,
+                    "type":"ok",
+                    "session_handle":session.to_string(),
+                    "vendor_session_id":"vendor-thread-1"
+                }),
+                None,
+            )
+            .unwrap();
+        let first_support = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_support",
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::ClaudeCode, false),
+            false,
+        )
+        .unwrap();
+        store
+            .settle_operation(first_support.op_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session).unwrap(),
+            Some("claude-code".into())
+        );
+
+        let second_update = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_update",
+            attachment_update_request(Uuid::new_v4(), session, Some("vendor-thread-2")),
+            true,
+        )
+        .unwrap();
+        assert_ne!(first_update.op_id, second_update.op_id);
+        store
+            .settle_operation(
+                second_update.op_id,
+                json!({
+                    "v":1,
+                    "type":"ok",
+                    "session_handle":session.to_string(),
+                    "vendor_session_id":"vendor-thread-2"
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session)
+                .unwrap_err()
+                .exit_code,
+            EXIT_REFUSED
+        );
+
+        let second_support = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "attachment_support",
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::ClaudeCode, false),
+            false,
+        )
+        .unwrap();
+        assert_ne!(first_support.op_id, second_support.op_id);
+        store
+            .settle_operation(second_support.op_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session).unwrap(),
+            Some("claude-code".into())
+        );
+    }
+
+    #[test]
+    fn storage_unavailable_keeps_attach_and_h5_operations_retryable() {
+        let session = Uuid::new_v4();
+        for kind in ["attachment_update", "attachment_support", "support"] {
+            let scratch = Scratch::new();
+            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+            let op_id = Uuid::new_v4();
+            let request = match kind {
+                "attachment_update" => {
+                    attachment_update_request(op_id, session, Some("vendor-thread"))
+                }
+                _ => attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false),
+            };
+            store
+                .prepare_operation(op_id, session, kind.into(), request.clone())
+                .unwrap();
+            store.mark_operation_unknown(op_id).unwrap();
+            let operation = store.operation(op_id).unwrap().unwrap();
+
+            let error = handle_operation_error_response(
+                &mut store,
+                &operation,
+                json!({"v":1,"type":"error","reason":"storage_unavailable"}),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN, "{kind}");
+
+            let saved = store.operation(op_id).unwrap().unwrap();
+            assert_eq!(saved.state, OperationState::Unknown, "{kind}");
+            assert_eq!(saved.request, request, "{kind}");
+
+            let mut retry_request = request;
+            retry_request["op_id"] = json!(Uuid::new_v4().to_string());
+            let retry =
+                prepare_or_resume_operation(&mut store, session, kind, retry_request, false)
+                    .unwrap();
+            assert_eq!(retry.op_id, op_id, "{kind}");
+            assert_eq!(retry.request, saved.request, "{kind}");
+        }
+    }
+
+    #[test]
+    fn listen_after_attach_requires_confirmed_update_and_h5_support() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        assert_eq!(attachment_route_for_listen(&store, session).unwrap(), None);
+        assert!(!local_journal_proves_existing_session(&store, session).unwrap());
+
+        let send_id = Uuid::new_v4();
+        store
+            .prepare_operation(
+                send_id,
+                session,
+                "send".into(),
+                json!({"v":1,"type":"send","op_id":send_id,"session_handle":session}),
+            )
+            .unwrap();
+        store
+            .settle_operation(send_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        assert!(local_journal_proves_existing_session(&store, session).unwrap());
+
+        let attachment_id = Uuid::new_v4();
+        let attachment_request =
+            attachment_update_request(attachment_id, session, Some("thread-a"));
+        store
+            .prepare_operation(
+                attachment_id,
+                session,
+                "attachment_update".into(),
+                attachment_request.clone(),
+            )
+            .unwrap();
+        store.mark_operation_unknown(attachment_id).unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session)
+                .unwrap_err()
+                .exit_code,
+            EXIT_OUTCOME_UNKNOWN
+        );
+
+        store
+            .settle_operation(
+                attachment_id,
+                json!({
+                    "v":1,
+                    "type":"ok",
+                    "session_handle":session.to_string(),
+                    "vendor_session_id":"thread-a"
+                }),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session)
+                .unwrap_err()
+                .exit_code,
+            EXIT_REFUSED
+        );
+
+        let support_id = Uuid::new_v4();
+        let support_request =
+            attachment_support_request(support_id, session, OriginHarness::ClaudeCode, false);
+        store
+            .prepare_operation(
+                support_id,
+                session,
+                "attachment_support".into(),
+                support_request,
+            )
+            .unwrap();
+        store.mark_operation_unknown(support_id).unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session)
+                .unwrap_err()
+                .exit_code,
+            EXIT_OUTCOME_UNKNOWN
+        );
+        store
+            .settle_operation(support_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        assert_eq!(
+            attachment_route_for_listen(&store, session).unwrap(),
+            Some("claude-code".into())
+        );
+    }
+
+    #[test]
+    fn attachment_operations_preserve_cursor_and_pending_turn_identity() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        for (sequence, event_id, message_id, revision) in
+            [(1, "1", "request-a", 1), (2, "2", "request-b", 3)]
+        {
+            store
+                .record_entry(JournalEntry::fetched(
+                    sequence,
+                    event_id.into(),
+                    session,
+                    "discussion".into(),
+                    "person".into(),
+                    true,
+                    Some("app:example".into()),
+                    Some(message_id.into()),
+                    Some(revision),
+                    json!({
+                        "event_id":event_id,
+                        "session_handle":session.to_string(),
+                        "kind":"discussion",
+                        "author":"person",
+                        "sender_id":"app:example",
+                        "message_id":message_id,
+                        "request_revision":revision,
+                        "text":format!("turn {sequence}")
+                    }),
+                ))
+                .unwrap();
+        }
+
+        let send_id = Uuid::new_v4();
+        store
+            .prepare_operation(
+                send_id,
+                session,
+                "send".into(),
+                json!({"v":1,"type":"send","op_id":send_id,"session_handle":session}),
+            )
+            .unwrap();
+        store
+            .settle_operation(send_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+        let attachment_id = Uuid::new_v4();
+        let attachment_request =
+            attachment_update_request(attachment_id, session, Some("new-thread"));
+        store
+            .prepare_operation(
+                attachment_id,
+                session,
+                "attachment_update".into(),
+                attachment_request.clone(),
+            )
+            .unwrap();
+        store
+            .settle_operation(
+                attachment_id,
+                json!({
+                    "v":1,
+                    "type":"ok",
+                    "session_handle":session.to_string(),
+                    "vendor_session_id":"new-thread"
+                }),
+                None,
+            )
+            .unwrap();
+        let support_id = Uuid::new_v4();
+        store
+            .prepare_operation(
+                support_id,
+                session,
+                "attachment_support".into(),
+                attachment_support_request(support_id, session, OriginHarness::ClaudeCode, false),
+            )
+            .unwrap();
+        store
+            .settle_operation(support_id, json!({"v":1,"type":"ok"}), None)
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.cursor, 2);
+        let pending = snapshot.pending_for(session);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|entry| entry.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(pending[0].request_id.as_deref(), Some("request-a"));
+        assert_eq!(pending[0].request_revision, Some(1));
+        assert_eq!(pending[1].request_id.as_deref(), Some("request-b"));
+        assert_eq!(pending[1].request_revision, Some(3));
+        assert!(pending.iter().all(|entry| entry.delivered_at_ms.is_none()));
+    }
+
+    #[test]
+    fn attach_support_does_not_claim_codex_listening() {
+        let request =
+            attachment_support_request(Uuid::new_v4(), Uuid::new_v4(), OriginHarness::Codex, false);
+        assert_eq!(request["route"], "codex");
+        assert!(
+            request["unsupported_reason"]
+                .as_str()
+                .unwrap()
+                .contains("not supported yet")
+        );
+        assert!(
+            attachment_support_request(Uuid::new_v4(), Uuid::new_v4(), OriginHarness::Other, true,)
+                ["unsupported_reason"]
+                .is_null()
+        );
+        assert!(
+            !attachment_support_request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                OriginHarness::Other,
+                false,
+            )["unsupported_reason"]
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn support_confirmation_requires_the_exact_route_version_and_reason() {
+        let expected = json!({
+            "route":"claude-code",
+            "cli_version":env!("CARGO_PKG_VERSION"),
+            "unsupported_reason":null
+        });
+        assert!(support_record_matches(
+            &json!({"listening_support":expected}),
+            &expected
+        ));
+        assert!(!support_record_matches(
+            &json!({"listening_support":{
+                "route":"codex",
+                "cli_version":env!("CARGO_PKG_VERSION"),
+                "unsupported_reason":"Codex listening is not supported yet"
+            }}),
+            &expected
         ));
     }
 

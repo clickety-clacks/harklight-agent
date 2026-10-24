@@ -46,6 +46,16 @@ enum Command {
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
     },
+    Attach {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long, value_name = "ID|none")]
+        vendor_session_id: String,
+        #[arg(long, value_enum)]
+        route: Route,
+        #[arg(long)]
+        controller: bool,
+    },
     Listen(ListenArgs),
     Ack {
         #[arg(long)]
@@ -258,6 +268,18 @@ fn main() {
             route.map(Into::into),
             controller,
             &files,
+        ),
+        Command::Attach {
+            session,
+            vendor_session_id,
+            route,
+            controller,
+        } => commands::attach(
+            &context,
+            session,
+            &vendor_session_id,
+            route.into(),
+            controller,
         ),
         Command::Listen(args) => commands::listen(
             &context,
