@@ -3584,8 +3584,8 @@ mod tests {
     fn one_shot_read_returns_own_answer_without_listener_support() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
-        let mut store = JournalStore::open(&scratch.0.join("state"), "test-device", session)
-            .unwrap();
+        let mut store =
+            JournalStore::open(&scratch.0.join("state"), "test-device", session).unwrap();
         let response = json!({
             "type":"ok",
             "cursor":1,

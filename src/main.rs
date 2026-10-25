@@ -529,16 +529,20 @@ mod tests {
             "123e4567-e89b-42d3-a456-426614174000",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Command::Read { session } if session.to_string() == "123e4567-e89b-42d3-a456-426614174000"));
+        assert!(
+            matches!(cli.command, Command::Read { session } if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
+        );
 
-        assert!(Cli::try_parse_from([
-            "harklight-agent",
-            "read",
-            "--session",
-            "123e4567-e89b-42d3-a456-426614174000",
-            "--controller",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "read",
+                "--session",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "--controller",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
