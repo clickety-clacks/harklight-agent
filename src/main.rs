@@ -35,8 +35,18 @@ enum Command {
         title: Option<String>,
         #[arg(long)]
         body: Option<String>,
-        #[arg(long = "choice", action = clap::ArgAction::Append)]
+        #[arg(
+            long = "choice",
+            action = clap::ArgAction::Append,
+            help = "Add this exact value choice; may be repeated"
+        )]
         choices: Vec<String>,
+        #[arg(
+            long,
+            conflicts_with = "choices",
+            help = "Offer only the Seen action for an informational message"
+        )]
+        informational: bool,
         #[arg(long)]
         vendor_session_id: Option<String>,
         #[arg(long, value_enum)]
@@ -259,6 +269,7 @@ fn main() {
             title,
             body,
             choices,
+            informational,
             vendor_session_id,
             route,
             controller,
@@ -273,6 +284,7 @@ fn main() {
             title.as_deref(),
             body.as_deref(),
             &choices,
+            informational,
             vendor_session_id.as_deref(),
             route.map(Into::into),
             controller,
@@ -501,5 +513,48 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn informational_send_is_explicit_and_cannot_include_choices() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--title",
+            "A notice",
+            "--route",
+            "claude-code",
+            "--informational",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                informational: true,
+                choices,
+                ..
+            } if choices.is_empty()
+        ));
+
+        assert!(Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--title",
+            "A notice",
+            "--route",
+            "claude-code",
+            "--informational",
+            "--choice",
+            "Approve",
+        ])
+        .is_err());
     }
 }

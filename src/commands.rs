@@ -300,10 +300,24 @@ fn validate_send_route(
     Ok(route)
 }
 
-/// The client's existing answer descriptor schema. Choices are written as one
-/// `value` action each; the server stores the message as supplied and the
-/// client renders the descriptor with its existing controls.
+/// The client's existing answer descriptor schema. Text, choice and Seen
+/// controls are stored in the message and rendered by the existing client.
 const ANSWER_UI_SCHEMA: &str = "attention-client.actions/1";
+
+fn text_reply_action() -> Value {
+    json!({"id":"reply","label":"Reply","kind":"text"})
+}
+
+fn text_reply_answer_ui() -> Value {
+    json!({"schema":ANSWER_UI_SCHEMA,"actions":[text_reply_action()]})
+}
+
+fn seen_answer_ui() -> Value {
+    json!({
+        "schema":ANSWER_UI_SCHEMA,
+        "actions":[{"id":"seen","label":"Seen","kind":"value","value":{"acknowledgment":"seen"}}]
+    })
+}
 
 fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
     let mut seen = BTreeSet::new();
@@ -328,12 +342,103 @@ fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
             "value": choice
         }));
     }
+    actions.push(text_reply_action());
     Ok(json!({ "schema": ANSWER_UI_SCHEMA, "actions": actions }))
 }
 
+fn answer_ui_for_send(choices: &[String], informational: bool) -> Result<Value, CommandError> {
+    if informational {
+        if !choices.is_empty() {
+            return Err(CommandError::new(
+                "--informational cannot be combined with --choice",
+                EXIT_REFUSED,
+            ));
+        }
+        return Ok(seen_answer_ui());
+    }
+    choices_answer_ui(choices)
+}
+
+fn valid_answer_ui(answer_ui: &Value) -> bool {
+    if answer_ui["schema"] != ANSWER_UI_SCHEMA {
+        return false;
+    }
+    let Some(actions) = answer_ui["actions"].as_array() else {
+        return false;
+    };
+    if actions.is_empty() {
+        return false;
+    }
+
+    let mut ids = BTreeSet::new();
+    actions.iter().all(|action| {
+        let Some(id) = action["id"].as_str() else {
+            return false;
+        };
+        let Some(label) = action["label"].as_str() else {
+            return false;
+        };
+        if id.trim().is_empty() || label.trim().is_empty() || !ids.insert(id) {
+            return false;
+        }
+        match action["kind"].as_str() {
+            Some("text") => true,
+            Some("value") => action.get("value").is_some(),
+            _ => false,
+        }
+    })
+}
+
+fn answer_ui_for_revision(current: &Value) -> Result<Value, CommandError> {
+    if let Some(answer_ui) = current.get("answer_ui") {
+        if !valid_answer_ui(answer_ui) {
+            return Err(CommandError::new(
+                "current request has an invalid attention-client.actions/1 descriptor; refusing to revise",
+                EXIT_REFUSED,
+            ));
+        }
+        let actions = answer_ui["actions"].as_array().unwrap();
+        if actions.len() == 1
+            && actions[0]
+                == seen_answer_ui()["actions"][0]
+        {
+            return Ok(answer_ui.clone());
+        }
+
+        let mut actions = actions.clone();
+        if !actions.iter().any(|action| action["kind"] == "text") {
+            actions.push(text_reply_action());
+        }
+        return Ok(json!({"schema":ANSWER_UI_SCHEMA,"actions":actions}));
+    }
+
+    if let Some(legacy_choices) = current.get("choices") {
+        let Some(legacy_choices) = legacy_choices.as_array() else {
+            return Err(CommandError::new(
+                "current request choices are malformed; refusing to revise",
+                EXIT_REFUSED,
+            ));
+        };
+        let choices = legacy_choices
+            .iter()
+            .map(|choice| {
+                choice.as_str().map(str::to_owned).ok_or_else(|| {
+                    CommandError::new(
+                        "current request choices are malformed; refusing to revise",
+                        EXIT_REFUSED,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return choices_answer_ui(&choices);
+    }
+
+    Ok(text_reply_answer_ui())
+}
+
 /// Builds the revised message from the current one: `--choice` replaces the
-/// answer descriptor, `--clear-choices` removes it, neither keeps it. A legacy
-/// `choices` member written by an earlier build is never carried forward.
+/// answer descriptor, `--clear-choices` leaves a text Reply descriptor, and
+/// neither preserves the descriptor while ensuring it remains usable.
 fn revised_message(
     current: &Value,
     title: &str,
@@ -341,10 +446,18 @@ fn revised_message(
     choices: &[String],
     clear_choices: bool,
 ) -> Result<Value, CommandError> {
-    let answer_ui = if choices.is_empty() {
-        None
+    if clear_choices && !choices.is_empty() {
+        return Err(CommandError::new(
+            "use either --choice or --clear-choices, not both",
+            EXIT_REFUSED,
+        ));
+    }
+    let answer_ui = if clear_choices {
+        text_reply_answer_ui()
+    } else if !choices.is_empty() {
+        choices_answer_ui(choices)?
     } else {
-        Some(choices_answer_ui(choices)?)
+        answer_ui_for_revision(current)?
     };
     let mut message = current.clone();
     message["title"] = Value::String(title.to_owned());
@@ -354,13 +467,8 @@ fn revised_message(
     }
     if let Some(object) = message.as_object_mut() {
         object.remove("choices");
-        if clear_choices {
-            object.remove("answer_ui");
-        }
     }
-    if let Some(answer_ui) = answer_ui {
-        message["answer_ui"] = answer_ui;
-    }
+    message["answer_ui"] = answer_ui;
     Ok(message)
 }
 
@@ -371,6 +479,7 @@ pub fn send_command(
     title: Option<&str>,
     body: Option<&str>,
     choices: &[String],
+    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -393,6 +502,7 @@ pub fn send_command(
             || title.is_some()
             || body.is_some()
             || !choices.is_empty()
+            || informational
             || vendor_session_id.is_some()
             || route.is_some()
             || controller
@@ -426,6 +536,7 @@ pub fn send_command(
             title,
             body,
             choices,
+            informational,
             vendor_session_id,
             route,
             controller,
@@ -440,6 +551,7 @@ pub fn send_command(
         title,
         body,
         choices,
+        informational,
         vendor_session_id,
         route,
         controller,
@@ -454,19 +566,21 @@ pub fn send(
     title: &str,
     body: Option<&str>,
     choices: &[String],
+    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
     files: &[PathBuf],
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
-    choices_answer_ui(choices)?;
+    answer_ui_for_send(choices, informational)?;
     let file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
         "title":title,
         "body":body,
         "choices":choices,
+        "informational":informational,
         "vendor_session_id":vendor_session_id,
         "route":route.map(OriginHarness::as_str)
     });
@@ -488,6 +602,7 @@ pub fn send(
         title,
         body,
         choices,
+        informational,
         vendor_session_id,
         route,
         controller,
@@ -535,16 +650,13 @@ fn build_send_request(
     title: &str,
     body: Option<&str>,
     choices: &[String],
+    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
     file_entries: &[Value],
 ) -> Result<Value, CommandError> {
-    let answer_ui = if choices.is_empty() {
-        None
-    } else {
-        Some(choices_answer_ui(choices)?)
-    };
+    let answer_ui = answer_ui_for_send(choices, informational)?;
     let mut message = json!({
         "sender_id": sender_id,
         "message_id": message_id,
@@ -554,9 +666,7 @@ fn build_send_request(
     if let Some(body) = body {
         message["body"] = Value::String(body.to_owned());
     }
-    if let Some(answer_ui) = answer_ui {
-        message["answer_ui"] = answer_ui;
-    }
+    message["answer_ui"] = answer_ui;
 
     let mut request = json!({
         "v": 1,
@@ -585,12 +695,13 @@ fn send_input_identity(
     title: &str,
     body: Option<&str>,
     choices: &[String],
+    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
     files: &[files::FileManifestEntry],
 ) -> Value {
-    json!({
+    let mut inputs = json!({
         "session":session_arg,
         "sender_id":sender_id,
         "title":title,
@@ -600,7 +711,13 @@ fn send_input_identity(
         "route":route.map(OriginHarness::as_str),
         "controller":controller,
         "files":files
-    })
+    });
+    // Preserve idempotent retries for default-mode operations prepared by an
+    // earlier CLI, while distinguishing an explicitly Seen-only operation.
+    if informational {
+        inputs["informational"] = Value::Bool(true);
+    }
+    inputs
 }
 
 pub fn prepare_send(
@@ -610,6 +727,7 @@ pub fn prepare_send(
     title: &str,
     body: Option<&str>,
     choices: &[String],
+    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -619,7 +737,7 @@ pub fn prepare_send(
     if op_id.get_version_num() != 4 {
         return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
     }
-    choices_answer_ui(choices)?;
+    answer_ui_for_send(choices, informational)?;
     let route = validate_send_route(session_arg, route, controller)?;
     let global = context.open_global_store()?;
 
@@ -638,6 +756,7 @@ pub fn prepare_send(
             title,
             body,
             choices,
+            informational,
             vendor_session_id,
             route,
             controller,
@@ -664,6 +783,7 @@ pub fn prepare_send(
         title,
         body,
         choices,
+        informational,
         vendor_session_id,
         route,
     );
@@ -678,6 +798,7 @@ pub fn prepare_send(
         title,
         body,
         choices,
+        informational,
         vendor_session_id,
         route,
         controller,
@@ -699,6 +820,7 @@ pub fn prepare_send(
         title,
         body,
         choices,
+        informational,
         vendor_session_id,
         route,
         controller,
@@ -730,6 +852,7 @@ fn send_draft(
     title: &str,
     body: Option<&str>,
     choices: &[String],
+    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
 ) -> Value {
@@ -739,6 +862,7 @@ fn send_draft(
         "title":title,
         "body":body,
         "choices":choices,
+        "informational":informational,
         "vendor_session_id":vendor_session_id,
         "route":route.map(OriginHarness::as_str)
     })
@@ -3509,6 +3633,7 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
+            false,
             None,
             None,
             false,
@@ -3522,6 +3647,7 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
+            false,
             None,
             None,
             false,
@@ -3540,6 +3666,10 @@ mod tests {
         assert_eq!(file_limits_calls.get(), 1);
         assert_eq!(operation.state, OperationState::Prepared);
         assert_eq!(operation.prepared_send.as_ref().unwrap().request, request);
+        assert_eq!(
+            operation.prepared_send.as_ref().unwrap().request["message"]["answer_ui"],
+            text_reply_answer_ui()
+        );
         assert_eq!(operation.prepared_send.as_ref().unwrap().files, manifest);
         assert_eq!(operation.request["files"][0]["upload_pending"], true);
         assert_eq!(operation.uploads.len(), 1);
@@ -3556,6 +3686,7 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
+            false,
             None,
             None,
             false,
@@ -3591,6 +3722,7 @@ mod tests {
             "Original",
             None,
             &[],
+            false,
             None,
             None,
             false,
@@ -3603,6 +3735,7 @@ mod tests {
             "Original",
             None,
             &[],
+            false,
             None,
             None,
             false,
@@ -3626,6 +3759,7 @@ mod tests {
             "Changed",
             None,
             &[],
+            false,
             None,
             None,
             false,
@@ -3638,6 +3772,7 @@ mod tests {
             "Changed",
             None,
             &[],
+            false,
             None,
             None,
             false,
@@ -3711,6 +3846,7 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
+            false,
             None,
             None,
             false,
@@ -3723,6 +3859,7 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
+            false,
             None,
             None,
             false,
@@ -3772,7 +3909,8 @@ mod tests {
                 "schema":"attention-client.actions/1",
                 "actions":[
                     {"id":"choice-1","label":"Approve","kind":"value","value":"Approve"},
-                    {"id":"choice-2","label":"Hold","kind":"value","value":"Hold"}
+                    {"id":"choice-2","label":"Hold","kind":"value","value":"Hold"},
+                    {"id":"reply","label":"Reply","kind":"text"}
                 ]
             })
         );
@@ -3780,6 +3918,104 @@ mod tests {
         let action = &descriptor["actions"][0];
         assert_eq!(action["label"], action["value"]);
         assert_eq!(action.as_object().unwrap().len(), 4);
+        assert_eq!(descriptor["actions"][1], text_reply_action());
+    }
+
+    #[test]
+    fn every_new_send_has_the_selected_actions_one_descriptor() {
+        let session = Uuid::new_v4();
+        let plain = build_send_request(
+            Uuid::new_v4(),
+            session,
+            "plain",
+            "app:example",
+            "A question",
+            None,
+            &[],
+            false,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plain["type"], "send");
+        assert_eq!(plain["session_handle"], session.to_string());
+        assert_eq!(plain["message"]["answer_ui"], text_reply_answer_ui());
+
+        let choices = vec!["Approve".to_string(), "Hold".to_string()];
+        let structured = build_send_request(
+            Uuid::new_v4(),
+            session,
+            "structured",
+            "app:example",
+            "Choose one",
+            None,
+            &choices,
+            false,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            structured["message"]["answer_ui"],
+            choices_answer_ui(&choices).unwrap()
+        );
+
+        let informational = build_send_request(
+            Uuid::new_v4(),
+            session,
+            "notice",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            true,
+            None,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(informational["message"]["answer_ui"], seen_answer_ui());
+        assert_eq!(
+            informational["message"]["answer_ui"]["actions"],
+            json!([{"id":"seen","label":"Seen","kind":"value","value":{"acknowledgment":"seen"}}])
+        );
+        assert!(answer_ui_for_send(&choices, true).is_err());
+    }
+
+    #[test]
+    fn prepared_send_identity_distinguishes_seen_only_without_changing_default_retries() {
+        let default = send_input_identity(
+            "new",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            false,
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+        );
+        let informational = send_input_identity(
+            "new",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            true,
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+        );
+        assert!(default.get("informational").is_none());
+        assert_eq!(informational["informational"], true);
+        assert_ne!(default, informational);
     }
 
     #[test]
@@ -3844,7 +4080,7 @@ mod tests {
     }
 
     #[test]
-    fn revise_replaces_removes_or_keeps_the_answer_descriptor() {
+    fn revise_replaces_clears_or_keeps_a_valid_answer_descriptor() {
         let original = choices_answer_ui(&["Approve".to_string(), "Hold".to_string()]).unwrap();
         let current = json!({
             "sender_id":"app:example",
@@ -3871,7 +4107,7 @@ mod tests {
         assert_eq!(replaced["body"], "first wording");
 
         let cleared = revised_message(&current, "Deploy the fix?", Some("new"), &[], true).unwrap();
-        assert!(cleared.get("answer_ui").is_none());
+        assert_eq!(cleared["answer_ui"], text_reply_answer_ui());
         assert!(cleared.get("choices").is_none());
         assert_eq!(cleared["body"], "new");
 
@@ -3881,7 +4117,64 @@ mod tests {
         assert_eq!(kept["title"], "Retitled");
 
         let plain = revised_message(&json!({"title":"t"}), "t", None, &[], false).unwrap();
-        assert!(plain.get("answer_ui").is_none());
+        assert_eq!(plain["answer_ui"], text_reply_answer_ui());
+    }
+
+    #[test]
+    fn revise_adds_reply_to_older_choice_descriptors_without_losing_values() {
+        let original = json!({
+            "schema":"attention-client.actions/1",
+            "actions":[
+                {"id":"choice-1","label":"Approve","kind":"value","value":"Approve"},
+                {"id":"choice-2","label":"Hold","kind":"value","value":"Hold"}
+            ]
+        });
+        let revised = revised_message(
+            &json!({"title":"t","answer_ui":original}),
+            "Retitled",
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            revised["answer_ui"],
+            choices_answer_ui(&["Approve".into(), "Hold".into()]).unwrap()
+        );
+
+        let legacy = revised_message(
+            &json!({"title":"t","choices":["Approve","Hold"]}),
+            "Retitled",
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(legacy["answer_ui"], revised["answer_ui"]);
+        assert!(legacy.get("choices").is_none());
+    }
+
+    #[test]
+    fn revise_preserves_seen_only_and_refuses_malformed_descriptors() {
+        let seen = seen_answer_ui();
+        let revised = revised_message(
+            &json!({"title":"notice","answer_ui":seen}),
+            "Updated notice",
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(revised["answer_ui"], seen_answer_ui());
+
+        assert!(revised_message(
+            &json!({"title":"t","answer_ui":{"schema":"other","actions":[]}}),
+            "Retitled",
+            None,
+            &[],
+            false
+        )
+        .is_err());
     }
 
     #[test]

@@ -69,7 +69,9 @@ environment variables:
 The origin HTTPS port is separate from the relay port. Set it in the enrolled
 `server.json` as `origin_port` or provide it with `--origin-port` or
 `HARKLIGHT_ORIGIN_PORT`; the CLI will not guess it from the relay port. The
-server operator must configure and expose the origin endpoint.
+server operator must configure and expose the origin endpoint. Agent messages
+use this origin session route; the relay endpoint is not a message submission
+route.
 
 The journal defaults to `~/Library/Application Support/Harklight/Agent` on
 macOS, `$XDG_STATE_HOME/harklight-agent` when `XDG_STATE_HOME` is set on Linux,
@@ -99,6 +101,28 @@ harklight-agent send --session new --sender-id app:example \
 The successful JSON result includes `message_url`, a `harklight://message/…`
 link built from the sender ID and message ID. Each ID is percent-encoded as its
 own path segment. A committed send returned by `retry` includes the same field.
+
+Every new request carries an `attention-client.actions/1` answer descriptor.
+With no `--choice` options, the recipient gets a text Reply action. Repeated
+`--choice` options add one value action for each exact choice, followed by text
+Reply so the recipient can also answer in their own words:
+
+```sh
+harklight-agent send --session new --sender-id app:example \
+  --route claude-code --title "Choose the next step" \
+  --choice "Approve" --choice "Hold"
+```
+
+Use `--informational` for a notice that should offer only the exact Seen
+action. It cannot be combined with `--choice`:
+
+```sh
+harklight-agent send --session new --sender-id app:example \
+  --route claude-code --title "Update complete" --informational
+```
+
+Revisions keep a valid answer descriptor. Replacing choices adds text Reply;
+`--clear-choices` leaves a text Reply action instead of removing the descriptor.
 
 The route is required when creating the session handle and is stored with the
 CLI version in the server's listening-support record. When sending another
@@ -216,7 +240,7 @@ keeps the request and its history, ends outstanding work, and is not a person
 answer. `retract` uses the sender and message identity already recorded in the
 selected session journal and submits the existing v1 `withdraw` operation
 without an `in_reply_to` reference; it accepts no caller-supplied sender ID.
-The legacy `withdraw` command keeps its existing behavior. If a retraction or
+The `withdraw` command keeps its existing behavior. If a retraction or
 answer outcome is uncertain, retry the same journaled operation with its
 original UUID; a server refusal with `reason: "retracted"` remains a refusal
 and includes the retained retraction state and time.
