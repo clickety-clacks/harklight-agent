@@ -398,10 +398,7 @@ fn answer_ui_for_revision(current: &Value) -> Result<Value, CommandError> {
             ));
         }
         let actions = answer_ui["actions"].as_array().unwrap();
-        if actions.len() == 1
-            && actions[0]
-                == seen_answer_ui()["actions"][0]
-        {
+        if actions.len() == 1 && actions[0] == seen_answer_ui()["actions"][0] {
             return Ok(answer_ui.clone());
         }
 
@@ -4167,14 +4164,16 @@ mod tests {
         .unwrap();
         assert_eq!(revised["answer_ui"], seen_answer_ui());
 
-        assert!(revised_message(
-            &json!({"title":"t","answer_ui":{"schema":"other","actions":[]}}),
-            "Retitled",
-            None,
-            &[],
-            false
-        )
-        .is_err());
+        assert!(
+            revised_message(
+                &json!({"title":"t","answer_ui":{"schema":"other","actions":[]}}),
+                "Retitled",
+                None,
+                &[],
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]

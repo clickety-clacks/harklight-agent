@@ -540,21 +540,23 @@ mod tests {
             } if choices.is_empty()
         ));
 
-        assert!(Cli::try_parse_from([
-            "harklight-agent",
-            "send",
-            "--session",
-            "new",
-            "--sender-id",
-            "app:example",
-            "--title",
-            "A notice",
-            "--route",
-            "claude-code",
-            "--informational",
-            "--choice",
-            "Approve",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "send",
+                "--session",
+                "new",
+                "--sender-id",
+                "app:example",
+                "--title",
+                "A notice",
+                "--route",
+                "claude-code",
+                "--informational",
+                "--choice",
+                "Approve",
+            ])
+            .is_err()
+        );
     }
 }
