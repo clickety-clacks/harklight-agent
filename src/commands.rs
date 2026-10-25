@@ -2890,6 +2890,10 @@ fn event_line(entry: &JournalEntry, pending_remaining: usize) -> Value {
         "entry":raw
     });
 
+    if let Some(channel) = raw["channel"].as_str() {
+        line["channel"] = Value::String(channel.to_owned());
+    }
+
     if entry.kind == "terminal" && raw["terminal_kind"] == "no_comment" {
         line["final_terminal"] = json!(FinalTerminal::NoComment);
     }
@@ -2923,6 +2927,12 @@ fn session_idle(status: &Value) -> Result<bool, CommandError> {
     let open_requests = status["open_requests"]
         .as_u64()
         .ok_or_else(|| CommandError::new("status response has no open_requests count", 1))?;
+    let open_chats = match status.get("open_chats") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            CommandError::new("status response has no integer open_chats count", 1)
+        })?,
+        None => open_requests,
+    };
     let pending_undelivered = status["pending_undelivered"]
         .as_u64()
         .ok_or_else(|| CommandError::new("status response has no pending_undelivered count", 1))?;
@@ -2932,7 +2942,7 @@ fn session_idle(status: &Value) -> Result<bool, CommandError> {
             .ok_or_else(|| {
                 CommandError::new("status response has no pending_delivered_unacted count", 1)
             })?;
-    Ok(open_requests == 0 && pending_undelivered == 0 && pending_delivered_unacted == 0)
+    Ok(open_chats == 0 && pending_undelivered == 0 && pending_delivered_unacted == 0)
 }
 
 fn stream_should_reconnect(error: &ApiError) -> bool {
@@ -3240,6 +3250,92 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn event_lines_preserve_reply_and_chat_channel_labels() {
+        let session = Uuid::new_v4();
+        let reply = JournalEntry::fetched(
+            1,
+            "1".into(),
+            session,
+            "terminal".into(),
+            "person".into(),
+            true,
+            Some("app:example".into()),
+            Some("message-1".into()),
+            Some(1),
+            json!({
+                "event_id":"1",
+                "session_handle":session.to_string(),
+                "kind":"terminal",
+                "author":"person",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "terminal_state":"answered",
+                "channel":"reply",
+                "answer":"Done"
+            }),
+        );
+        let chat = JournalEntry::fetched(
+            2,
+            "2".into(),
+            session,
+            "discussion".into(),
+            "person".into(),
+            true,
+            Some("app:example".into()),
+            Some("message-1".into()),
+            Some(1),
+            json!({
+                "event_id":"2",
+                "session_handle":session.to_string(),
+                "kind":"discussion",
+                "author":"person",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "channel":"chat",
+                "text":"Can you clarify?"
+            }),
+        );
+
+        let reply_line = event_line(&reply, 1);
+        let chat_line = event_line(&chat, 0);
+        assert_eq!(reply_line["channel"], "reply");
+        assert_eq!(reply_line["entry"]["channel"], "reply");
+        assert_eq!(chat_line["channel"], "chat");
+        assert_eq!(chat_line["entry"]["channel"], "chat");
+
+        let mut no_comment = reply.clone();
+        no_comment.feed_seq = 3;
+        no_comment.event_id = "3".into();
+        no_comment.raw["event_id"] = json!("3");
+        no_comment.raw["terminal_kind"] = json!("no_comment");
+        no_comment.raw.as_object_mut().unwrap().remove("answer");
+        let no_comment_line = event_line(&no_comment, 1);
+        assert_eq!(no_comment_line["channel"], "reply");
+        assert_eq!(no_comment_line["final_terminal"], "NoComment");
+    }
+
+    #[test]
+    fn open_chats_keeps_idle_listener_active_after_answer_or_no_comment() {
+        let status = json!({
+            "open_requests":0,
+            "open_chats":1,
+            "pending_undelivered":0,
+            "pending_delivered_unacted":0
+        });
+        assert!(!session_idle(&status).unwrap());
+
+        let closed = json!({
+            "open_requests":0,
+            "open_chats":0,
+            "pending_undelivered":0,
+            "pending_delivered_unacted":0
+        });
+        assert!(session_idle(&closed).unwrap());
     }
 
     struct MockTransport {
