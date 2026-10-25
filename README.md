@@ -175,11 +175,12 @@ on a timer. It re-offers pending entries from the durable journal after
 reconnection.
 
 Each event line includes its server-assigned `channel` at the top level and in
-the entry. Request-side entries, including revisions, results, and all terminal
-outcomes, use `reply`; side-conversation entries, including person discussions
-and origin replies, use `chat`. The stream remains one cursor subscription for
-both channels. Listening stays open while the status response reports a positive
-`open_chats` count, even when `open_requests` is zero after an answer.
+the entry. Every request-side entry, including revisions, results, and all
+terminal outcomes, uses `reply`. Only person `discussion` entries and origin
+conversation `reply` entries use `chat`. The stream remains one cursor
+subscription for both channels. Listening stays open while the status response
+reports a positive `open_chats` count, even when `open_requests` is zero after
+an answer.
 
 Check session availability and pending counts with:
 

@@ -3304,8 +3304,10 @@ mod tests {
         revision.feed_seq = 3;
         revision.event_id = "3".into();
         revision.kind = "revision".into();
+        revision.author = "origin".into();
         revision.raw["event_id"] = json!("3");
         revision.raw["kind"] = json!("revision");
+        revision.raw["author"] = json!("origin");
         revision.raw["request_revision"] = json!(2);
         revision
             .raw
