@@ -3300,23 +3300,81 @@ mod tests {
                 "text":"Can you clarify?"
             }),
         );
+        let mut revision = reply.clone();
+        revision.feed_seq = 3;
+        revision.event_id = "3".into();
+        revision.kind = "revision".into();
+        revision.raw["event_id"] = json!("3");
+        revision.raw["kind"] = json!("revision");
+        revision.raw["request_revision"] = json!(2);
+        revision
+            .raw
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_state");
+        revision.raw.as_object_mut().unwrap().remove("answer");
+
+        let mut result = reply.clone();
+        result.feed_seq = 4;
+        result.event_id = "4".into();
+        result.kind = "result".into();
+        result.author = "origin".into();
+        result.raw["event_id"] = json!("4");
+        result.raw["kind"] = json!("result");
+        result.raw["author"] = json!("origin");
+        result.raw["request_revision"] = json!(2);
+        result.raw["status"] = json!("applied");
+        result.raw.as_object_mut().unwrap().remove("terminal_state");
+        result.raw.as_object_mut().unwrap().remove("answer");
+
+        let mut origin_chat_reply = chat.clone();
+        origin_chat_reply.feed_seq = 5;
+        origin_chat_reply.event_id = "5".into();
+        origin_chat_reply.kind = "reply".into();
+        origin_chat_reply.author = "origin".into();
+        origin_chat_reply.raw["event_id"] = json!("5");
+        origin_chat_reply.raw["kind"] = json!("reply");
+        origin_chat_reply.raw["author"] = json!("origin");
 
         let reply_line = event_line(&reply, 1);
         let chat_line = event_line(&chat, 0);
+        let revision_line = event_line(&revision, 0);
+        let result_line = event_line(&result, 0);
+        let origin_chat_reply_line = event_line(&origin_chat_reply, 0);
         assert_eq!(reply_line["channel"], "reply");
         assert_eq!(reply_line["entry"]["channel"], "reply");
         assert_eq!(chat_line["channel"], "chat");
         assert_eq!(chat_line["entry"]["channel"], "chat");
+        assert_eq!(revision_line["channel"], "reply");
+        assert_eq!(revision_line["entry"]["channel"], "reply");
+        assert_eq!(result_line["channel"], "reply");
+        assert_eq!(result_line["entry"]["channel"], "reply");
+        assert_eq!(origin_chat_reply_line["channel"], "chat");
+        assert_eq!(origin_chat_reply_line["entry"]["channel"], "chat");
 
         let mut no_comment = reply.clone();
-        no_comment.feed_seq = 3;
-        no_comment.event_id = "3".into();
-        no_comment.raw["event_id"] = json!("3");
+        no_comment.feed_seq = 6;
+        no_comment.event_id = "6".into();
+        no_comment.raw["event_id"] = json!("6");
         no_comment.raw["terminal_kind"] = json!("no_comment");
         no_comment.raw.as_object_mut().unwrap().remove("answer");
         let no_comment_line = event_line(&no_comment, 1);
         assert_eq!(no_comment_line["channel"], "reply");
         assert_eq!(no_comment_line["final_terminal"], "NoComment");
+
+        for (index, terminal_state) in ["retracted", "expired", "superseded"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut terminal = reply.clone();
+            let event_id = (7 + index).to_string();
+            terminal.feed_seq = 7 + index as u64;
+            terminal.event_id = event_id.clone();
+            terminal.raw["event_id"] = json!(event_id);
+            terminal.raw["terminal_state"] = json!(terminal_state);
+            terminal.raw.as_object_mut().unwrap().remove("answer");
+            assert_eq!(event_line(&terminal, 0)["channel"], "reply");
+        }
     }
 
     #[test]
