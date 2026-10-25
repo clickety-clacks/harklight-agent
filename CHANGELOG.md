@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.1.3
+
+- Keep request replies separate from chat in listener output, and continue listening to available chat after an answer or no-comment outcome.
+
 ## 0.1.2
 
 - Added `attach` for reconnecting an existing session handle on the same enrolled origin. It updates the vendor session ID and records listener support before opening the stream, while preserving the existing session handle and conversation history.
