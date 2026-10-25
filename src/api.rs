@@ -276,7 +276,9 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn sse_decoder_ignores_keepalives_and_reads_cursor_only_change_notices() {
+    fn one_cursor_subscription_reads_multiple_change_notices() {
+        // One stream remains open across feed changes; channel labels belong to
+        // the authoritative feed entries fetched for those cursor updates.
         let frames = concat!(
             ": keepalive\n\n",
             "event: message\n",

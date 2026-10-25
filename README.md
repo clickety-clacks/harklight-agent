@@ -174,6 +174,14 @@ after connection, after a newer notice, and after reconnecting; it does not poll
 on a timer. It re-offers pending entries from the durable journal after
 reconnection.
 
+Each event line includes its server-assigned `channel` at the top level and in
+the entry. Every request-side entry, including revisions, results, and all
+terminal outcomes, uses `reply`. Only person `discussion` entries and origin
+conversation `reply` entries use `chat`. The stream remains one cursor
+subscription for both channels. Listening stays open while the status response
+reports a positive `open_chats` count, even when `open_requests` is zero after
+an answer.
+
 Check session availability and pending counts with:
 
 ```sh
@@ -216,7 +224,8 @@ and includes the retained retraction state and time.
 ## No comment result
 
 The server can complete a request with a payload-free `no_comment` terminal;
-the listener reports it as the final `NoComment` result. A native client must
+the listener reports it as the final `NoComment` result on the `reply` channel.
+The `no_comment` result leaves the `chat` channel available. A native client must
 include the displayed `request_revision` when sending the action (use `1` for
 an ordinary request). App build11 omits that field and needs a client update
 before this action works; missing or stale revisions do not complete the
