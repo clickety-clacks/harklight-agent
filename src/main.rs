@@ -73,6 +73,10 @@ enum Command {
         controller: bool,
     },
     Listen(ListenArgs),
+    Read {
+        #[arg(long)]
+        session: Uuid,
+    },
     Ack {
         #[arg(long)]
         session: Uuid,
@@ -314,6 +318,7 @@ fn main() {
             args.follow,
             args.controller,
         ),
+        Command::Read { session } => commands::read(&context, session),
         Command::Ack { session, event } => commands::ack(&context, session, &event),
         Command::Reply {
             session,
@@ -513,6 +518,27 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn read_is_a_one_shot_session_command_without_listener_options() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "read",
+            "--session",
+            "123e4567-e89b-42d3-a456-426614174000",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Read { session } if session.to_string() == "123e4567-e89b-42d3-a456-426614174000"));
+
+        assert!(Cli::try_parse_from([
+            "harklight-agent",
+            "read",
+            "--session",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "--controller",
+        ])
+        .is_err());
     }
 
     #[test]

@@ -206,6 +206,24 @@ subscription for both channels. Listening stays open while the status response
 reports a positive `open_chats` count, even when `open_requests` is zero after
 an answer.
 
+### Read once without listening
+
+A sender whose route does not support listening can still fetch answers and
+other pending entries from its own session:
+
+```sh
+harklight-agent read --session "$HARKLIGHT_SESSION"
+```
+
+`read` makes one request to the existing origin feed using this session's saved
+cursor and journal, then prints all currently pending actionable entries as
+JSON lines in the same shape as `listen`. It does not arm listening support,
+open an SSE stream, or claim that future messages will arrive in the
+background. Keep the session's declared route and unsupported listening reason
+unchanged. Running `read` again fetches later entries and re-offers any pending
+entries that have not been acted on. Reading does not acknowledge delivery;
+use `ack` explicitly when a delivery receipt is needed.
+
 Check session availability and pending counts with:
 
 ```sh
@@ -225,6 +243,7 @@ harklight-agent retract --session "$HARKLIGHT_SESSION" --request "$HARKLIGHT_REQ
   --op-id "$HARKLIGHT_OP_ID"
 harklight-agent result --session "$HARKLIGHT_SESSION" --request "$HARKLIGHT_REQUEST" \
   --in-reply-to "$HARKLIGHT_EVENT" --status applied
+harklight-agent read --session "$HARKLIGHT_SESSION"
 harklight-agent retry --op-id "$HARKLIGHT_OP_ID"
 ```
 

@@ -16,8 +16,8 @@ use crate::{
     config::{EnrolledIdentity, default_state_root},
     files::{self, PreparedFiles, ServerFileLimits},
     journal::{
-        Journal, JournalEntry, JournalError, JournalStore, OperationRecord, OperationState,
-        PreparedSend,
+        FileTransfer, Journal, JournalEntry, JournalError, JournalStore, OperationRecord,
+        OperationState, PreparedSend,
     },
 };
 
@@ -1876,6 +1876,21 @@ pub fn status(context: &CommandContext, session: Uuid) -> Result<(), CommandErro
     emit(&response)
 }
 
+/// Fetch and display pending entries once from this session's origin feed.
+/// This path intentionally does not inspect or mutate listening support and
+/// does not attach to the change-notice stream.
+pub fn read(context: &CommandContext, session: Uuid) -> Result<(), CommandError> {
+    let mut store = context.open_store(session)?;
+    let lines = read_pending_once(&mut store, session, |store| fetch_feed(context, store))?;
+    for (event_id, line) in lines {
+        emit(&line)?;
+        store
+            .mark_emitted(&event_id)
+            .map_err(|error| journal_error(error, 1))?;
+    }
+    Ok(())
+}
+
 pub fn session_end(context: &CommandContext, session: Uuid) -> Result<(), CommandError> {
     let request = json!({
         "v":1,
@@ -2884,8 +2899,26 @@ fn prepare_with_uploads(
 }
 
 fn fetch_feed(context: &CommandContext, store: &mut JournalStore) -> Result<(), CommandError> {
+    fetch_feed_with(
+        store,
+        |request| post_read(context, request),
+        |raw, directory| {
+            files::materialize_incoming(raw, directory, &context.api)
+                .map_err(|error| CommandError::new(error, 1))
+        },
+    )
+}
+
+fn fetch_feed_with(
+    store: &mut JournalStore,
+    mut post: impl FnMut(&Value) -> Result<Value, CommandError>,
+    mut materialize: impl FnMut(
+        &mut Value,
+        &Path,
+    ) -> Result<BTreeMap<String, FileTransfer>, CommandError>,
+) -> Result<(), CommandError> {
     let since = store.cursor().map_err(|error| journal_error(error, 1))?;
-    let response = post_read(context, &json!({"v":1,"type":"feed","since":since}))?;
+    let response = post(&json!({"v":1,"type":"feed","since":since}))?;
     let high_water = response["cursor"]
         .as_u64()
         .ok_or_else(|| CommandError::new("feed response has no integer cursor", 1))?;
@@ -2924,8 +2957,7 @@ fn fetch_feed(context: &CommandContext, store: &mut JournalStore) -> Result<(), 
         let mut raw = raw.clone();
         let file_transfers = if actionable {
             let directory = store.event_file_directory(session_handle, event_id);
-            files::materialize_incoming(&mut raw, &directory, &context.api)
-                .map_err(|error| CommandError::new(error, 1))?
+            materialize(&mut raw, &directory)?
         } else {
             files::strip_file_payloads(&mut raw);
             BTreeMap::new()
@@ -2986,6 +3018,35 @@ fn emit_pending(
         offered.insert(event_id);
     }
     Ok(!follow && printed)
+}
+
+fn pending_event_lines(
+    store: &JournalStore,
+    session: Uuid,
+) -> Result<Vec<(String, Value)>, CommandError> {
+    let pending = store
+        .pending_for(session)
+        .map_err(|error| journal_error(error, 1))?;
+    let remaining = pending.len();
+    Ok(pending
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            (
+                entry.event_id.clone(),
+                event_line(entry, remaining.saturating_sub(index + 1)),
+            )
+        })
+        .collect())
+}
+
+fn read_pending_once(
+    store: &mut JournalStore,
+    session: Uuid,
+    fetch: impl FnOnce(&mut JournalStore) -> Result<(), CommandError>,
+) -> Result<Vec<(String, Value)>, CommandError> {
+    fetch(store)?;
+    pending_event_lines(store, session)
 }
 
 #[derive(serde::Serialize)]
@@ -3517,6 +3578,54 @@ mod tests {
             "pending_delivered_unacted":0
         });
         assert!(session_idle(&closed).unwrap());
+    }
+
+    #[test]
+    fn one_shot_read_returns_own_answer_without_listener_support() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0.join("state"), "test-device", session)
+            .unwrap();
+        let response = json!({
+            "type":"ok",
+            "cursor":1,
+            "entries":[{
+                "event_id":"1",
+                "session_handle":session.to_string(),
+                "kind":"terminal",
+                "author":"person",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "terminal_state":"answered",
+                "channel":"reply",
+                "answer":"The answer is ready."
+            }]
+        });
+        let mut posts = Vec::new();
+        let lines = read_pending_once(&mut store, session, |store| {
+            fetch_feed_with(
+                store,
+                |request| {
+                    posts.push(request.clone());
+                    Ok(response.clone())
+                },
+                |_raw, _directory| Ok(BTreeMap::new()),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(posts, vec![json!({"v":1,"type":"feed","since":0})]);
+        assert!(store.operations_for_session(session).unwrap().is_empty());
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0].1;
+        assert_eq!(line["session_handle"], session.to_string());
+        assert_eq!(line["request"]["sender_id"], "app:example");
+        assert_eq!(line["request"]["message_id"], "message-1");
+        assert_eq!(line["channel"], "reply");
+        assert_eq!(line["entry"]["answer"], "The answer is ready.");
+        assert_eq!(line["delivered"], false);
+        assert_eq!(line["acted"], false);
     }
 
     struct MockTransport {
