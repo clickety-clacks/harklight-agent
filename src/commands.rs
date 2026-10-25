@@ -3581,26 +3581,41 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_read_returns_own_answer_without_listener_support() {
+    fn one_shot_read_returns_only_own_session_answer_without_listener_support() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
+        let another_session = Uuid::new_v4();
         let mut store =
             JournalStore::open(&scratch.0.join("state"), "test-device", session).unwrap();
         let response = json!({
             "type":"ok",
-            "cursor":1,
-            "entries":[{
-                "event_id":"1",
-                "session_handle":session.to_string(),
-                "kind":"terminal",
-                "author":"person",
-                "sender_id":"app:example",
-                "message_id":"message-1",
-                "request_revision":1,
-                "terminal_state":"answered",
-                "channel":"reply",
-                "answer":"The answer is ready."
-            }]
+            "cursor":2,
+            "entries":[
+                {
+                    "event_id":"1",
+                    "session_handle":another_session.to_string(),
+                    "kind":"terminal",
+                    "author":"person",
+                    "sender_id":"app:example",
+                    "message_id":"other-message",
+                    "request_revision":1,
+                    "terminal_state":"answered",
+                    "channel":"reply",
+                    "answer":"An answer for another session."
+                },
+                {
+                    "event_id":"2",
+                    "session_handle":session.to_string(),
+                    "kind":"terminal",
+                    "author":"person",
+                    "sender_id":"app:example",
+                    "message_id":"message-1",
+                    "request_revision":1,
+                    "terminal_state":"answered",
+                    "channel":"reply",
+                    "answer":"The answer is ready."
+                }
+            ]
         });
         let mut posts = Vec::new();
         let lines = read_pending_once(&mut store, session, |store| {
@@ -3617,6 +3632,7 @@ mod tests {
 
         assert_eq!(posts, vec![json!({"v":1,"type":"feed","since":0})]);
         assert!(store.operations_for_session(session).unwrap().is_empty());
+        assert_eq!(store.pending_for(another_session).unwrap().len(), 1);
         assert_eq!(lines.len(), 1);
         let line = &lines[0].1;
         assert_eq!(line["session_handle"], session.to_string());
