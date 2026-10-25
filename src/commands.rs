@@ -409,27 +409,6 @@ fn answer_ui_for_revision(current: &Value) -> Result<Value, CommandError> {
         return Ok(json!({"schema":ANSWER_UI_SCHEMA,"actions":actions}));
     }
 
-    if let Some(legacy_choices) = current.get("choices") {
-        let Some(legacy_choices) = legacy_choices.as_array() else {
-            return Err(CommandError::new(
-                "current request choices are malformed; refusing to revise",
-                EXIT_REFUSED,
-            ));
-        };
-        let choices = legacy_choices
-            .iter()
-            .map(|choice| {
-                choice.as_str().map(str::to_owned).ok_or_else(|| {
-                    CommandError::new(
-                        "current request choices are malformed; refusing to revise",
-                        EXIT_REFUSED,
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return choices_answer_ui(&choices);
-    }
-
     Ok(text_reply_answer_ui())
 }
 
@@ -4243,7 +4222,7 @@ mod tests {
     }
 
     #[test]
-    fn revise_adds_reply_to_older_choice_descriptors_without_losing_values() {
+    fn revise_adds_reply_to_value_descriptors_without_losing_values() {
         let original = json!({
             "schema":"attention-client.actions/1",
             "actions":[
@@ -4263,17 +4242,6 @@ mod tests {
             revised["answer_ui"],
             choices_answer_ui(&["Approve".into(), "Hold".into()]).unwrap()
         );
-
-        let legacy = revised_message(
-            &json!({"title":"t","choices":["Approve","Hold"]}),
-            "Retitled",
-            None,
-            &[],
-            false,
-        )
-        .unwrap();
-        assert_eq!(legacy["answer_ui"], revised["answer_ui"]);
-        assert!(legacy.get("choices").is_none());
     }
 
     #[test]
