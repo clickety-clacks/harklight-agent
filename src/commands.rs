@@ -580,19 +580,19 @@ pub fn send(
         prepare_outgoing_files(context, &store, session, op_id, files, "send", file_draft)?;
     let request = with_supersedes(
         build_send_request(
-        op_id,
-        session,
-        &message_id,
-        sender_id,
-        title,
-        body,
-        choices,
-        informational,
-        vendor_session_id,
-        route,
-        controller,
-        &prepared_files.entries,
-    )?,
+            op_id,
+            session,
+            &message_id,
+            sender_id,
+            title,
+            body,
+            choices,
+            informational,
+            vendor_session_id,
+            route,
+            controller,
+            &prepared_files.entries,
+        )?,
         supersedes,
     );
     if let Err(error) = validate_request_pre_upload(&request) {
