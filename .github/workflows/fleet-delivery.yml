@@ -1,0 +1,27 @@
+name: Fleet delivery
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harklight-agent-fleet-delivery
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    # The runner has the existing SSH configuration and reads its private fleet
+    # configuration from HARKLIGHT_FLEET_CONFIG. Neither belongs in this repo.
+    runs-on: [self-hosted, harklight-agent-fleet]
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconcile the fleet to the newest published stable release
+        run: python3 scripts/fleet_delivery.py
