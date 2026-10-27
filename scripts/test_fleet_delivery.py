@@ -234,7 +234,7 @@ class FleetDeliveryTests(unittest.TestCase):
             run_failure = run_remote(home, unusable, "0.1.4", unusable_digest)
             self.assertNotEqual(run_failure.returncode, 0)
             self.assertEqual(run_failure.stdout.split(b"\0")[1], b"failed")
-            self.assertEqual(link.resolve(), prior)
+            self.assertTrue(link.samefile(prior))
 
     def test_withdrawn_target_reactivates_retained_release_without_mutating_newer_one(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -260,7 +260,7 @@ class FleetDeliveryTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertEqual(result.stdout.split(b"\0")[1], b"updated")
-            self.assertEqual(link.resolve(), prior)
+            self.assertTrue(link.samefile(prior))
             self.assertEqual(hashlib.sha256(newer.read_bytes()).hexdigest(), newer_hash)
             self.assertEqual(hashlib.sha256(prior.read_bytes()).hexdigest(), prior_hash)
 
