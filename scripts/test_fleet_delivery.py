@@ -198,7 +198,10 @@ class FleetDeliveryTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr.decode())
             self.assertEqual(result.stdout.split(b"\0")[1], b"updated")
-            self.assertEqual(link.resolve(), home / ".local/share/harklight-agent/releases/v0.1.4/harklight-agent")
+            self.assertEqual(
+                link.resolve(),
+                (home / ".local/share/harklight-agent/releases/v0.1.4/harklight-agent").resolve(),
+            )
             self.assertEqual(hashlib.sha256(prior.read_bytes()).hexdigest(), prior_hash)
 
     def test_checksum_or_unusable_candidate_leaves_active_link_unchanged(self):
@@ -218,14 +221,14 @@ class FleetDeliveryTests(unittest.TestCase):
             checksum_failure = run_remote(home, archive, "0.1.4", "0" * 64)
             self.assertNotEqual(checksum_failure.returncode, 0)
             self.assertEqual(checksum_failure.stdout.split(b"\0")[1], b"failed")
-            self.assertEqual(link.resolve(), prior)
+            self.assertEqual(link.resolve(), prior.resolve())
 
             wrong_archive = make_archive(root, "0.1.4", "0.1.9")
             wrong_digest = hashlib.sha256(wrong_archive.read_bytes()).hexdigest()
             version_failure = run_remote(home, wrong_archive, "0.1.4", wrong_digest)
             self.assertNotEqual(version_failure.returncode, 0)
             self.assertEqual(version_failure.stdout.split(b"\0")[1], b"failed")
-            self.assertEqual(link.resolve(), prior)
+            self.assertEqual(link.resolve(), prior.resolve())
 
             unusable = make_archive(root, "0.1.4", None)
             unusable_digest = hashlib.sha256(unusable.read_bytes()).hexdigest()
