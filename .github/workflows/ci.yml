@@ -22,3 +22,5 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+      - name: Test fleet delivery logic
+        run: python3 -m unittest discover -s scripts -p 'test_fleet_delivery.py' -v
