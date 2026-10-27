@@ -102,6 +102,18 @@ The successful JSON result includes `message_url`, a `harklight://message/…`
 link built from the sender ID and message ID. Each ID is percent-encoded as its
 own path segment. A committed send returned by `retry` includes the same field.
 
+When a new message replaces earlier messages from the same sender, repeat
+`--supersedes` with each earlier request ID:
+
+```sh
+harklight-agent send --session new --sender-id app:example \
+  --route claude-code --title "Updated plan" \
+  --supersedes "$EARLIER_ID_1" --supersedes "$EARLIER_ID_2"
+```
+
+The server reports an odd or already closed target in `supersedes_warnings`;
+valid targets and the new message still post.
+
 Every new request carries an `attention-client.actions/1` answer descriptor.
 With no `--choice` options, the recipient gets a text Reply action. Repeated
 `--choice` options add one value action for each exact choice, followed by text
