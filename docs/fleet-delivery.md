@@ -58,3 +58,28 @@ tests the candidate binary's exact version before activating it, keeps existing
 release directories intact, and replaces the active symlink with an atomic
 rename. The workflow does not change CLI behavior, package contents, or release
 metadata.
+
+## Optional local retry timer
+
+If scheduled workflow events are unavailable, the same reconciler can run from
+a systemd user timer. It reads the same private configuration and release API,
+so stable releases, checksum verification, destination isolation, and the
+private readback remain unchanged. The timer starts shortly after the user
+service manager starts and retries 20 minutes after each completed attempt;
+when the manager starts again after downtime, it makes a fresh attempt.
+
+The service expects a persistent, reviewed checkout at
+`~/.local/share/harklight-agent-fleet-delivery/current` and a private environment
+file at `~/.config/harklight-agent-fleet-delivery/runner.env`. That file must
+define only `HARKLIGHT_FLEET_CONFIG`, pointing to the existing private JSON
+outside the checkout and Actions workspace. Do not copy the JSON into the
+checkout or put its contents in this repository. The user service manager and
+the Actions runner must use the same OS account so they share the existing SSH
+access and the reconciler's local overlap lock.
+
+Install the unit files from `ops/systemd/` in the account's user-unit directory,
+reload the user manager, and enable
+`harklight-agent-fleet-delivery.timer`. Starting the user manager at host boot
+depends on the host's existing user-manager policy. The timer does not install
+or update this checkout, the CLI, or any destination; code updates remain a
+separate reviewed operation.
