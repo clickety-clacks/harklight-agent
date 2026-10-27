@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile published Harklight Agent releases to configured destinations
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.local/share/harklight-agent-fleet-delivery/current
+EnvironmentFile=%h/.config/harklight-agent-fleet-delivery/runner.env
+ExecStart=/usr/bin/python3 %h/.local/share/harklight-agent-fleet-delivery/current/scripts/fleet_delivery.py
+TimeoutStartSec=70min
+UMask=0077

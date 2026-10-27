@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -579,9 +580,18 @@ def public_summary(report: dict) -> str:
 
 
 def main() -> int:
+    lock_path = Path.home() / ".local" / "state" / "harklight-agent-fleet-delivery" / "reconcile.lock"
     try:
-        path = config_from_environment()
-        report = reconcile(path, os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Fleet reconciliation skipped because another local run is active.")
+                return 0
+
+            path = config_from_environment()
+            report = reconcile(path, os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
     except DeliveryError:
         print("Fleet reconciliation could not read its private input or release metadata.")
         return 1
