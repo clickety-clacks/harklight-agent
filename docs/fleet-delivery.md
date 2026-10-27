@@ -64,9 +64,11 @@ metadata.
 If scheduled workflow events are unavailable, the same reconciler can run from
 a systemd user timer. It reads the same private configuration and release API,
 so stable releases, checksum verification, destination isolation, and the
-private readback remain unchanged. The timer starts shortly after the user
-service manager starts and retries 20 minutes after each completed attempt;
-when the manager starts again after downtime, it makes a fresh attempt.
+private readback remain unchanged. The first run is five minutes after the
+timer unit is activated; later runs occur 20 minutes after each completed
+attempt. When the user service manager returns after downtime, the enabled timer
+unit becomes active and schedules a fresh first run. The user service manager
+must remain available for unattended retries.
 
 The service expects a persistent, reviewed checkout at
 `~/.local/share/harklight-agent-fleet-delivery/current` and a private environment

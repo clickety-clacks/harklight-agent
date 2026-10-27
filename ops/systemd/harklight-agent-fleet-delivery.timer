@@ -2,7 +2,7 @@
 Description=Retry published Harklight Agent release delivery
 
 [Timer]
-OnBootSec=5min
+OnActiveSec=5min
 OnUnitInactiveSec=20min
 Unit=harklight-agent-fleet-delivery.service
 
