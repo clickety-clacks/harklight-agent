@@ -456,6 +456,7 @@ pub fn send_command(
     body: Option<&str>,
     choices: &[String],
     informational: bool,
+    supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -479,6 +480,7 @@ pub fn send_command(
             || body.is_some()
             || !choices.is_empty()
             || informational
+            || !supersedes.is_empty()
             || vendor_session_id.is_some()
             || route.is_some()
             || controller
@@ -513,6 +515,7 @@ pub fn send_command(
             body,
             choices,
             informational,
+            supersedes,
             vendor_session_id,
             route,
             controller,
@@ -528,6 +531,7 @@ pub fn send_command(
         body,
         choices,
         informational,
+        supersedes,
         vendor_session_id,
         route,
         controller,
@@ -543,6 +547,7 @@ pub fn send(
     body: Option<&str>,
     choices: &[String],
     informational: bool,
+    supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -550,7 +555,7 @@ pub fn send(
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
     answer_ui_for_send(choices, informational)?;
-    let file_draft = json!({
+    let mut file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
         "title":title,
@@ -560,6 +565,9 @@ pub fn send(
         "vendor_session_id":vendor_session_id,
         "route":route.map(OriginHarness::as_str)
     });
+    if !supersedes.is_empty() {
+        file_draft["supersedes"] = json!(supersedes);
+    }
     let session = if session_arg == "new" {
         Uuid::new_v4()
     } else {
@@ -570,20 +578,23 @@ pub fn send(
     let mut store = context.open_store(session)?;
     let prepared_files =
         prepare_outgoing_files(context, &store, session, op_id, files, "send", file_draft)?;
-    let request = build_send_request(
-        op_id,
-        session,
-        &message_id,
-        sender_id,
-        title,
-        body,
-        choices,
-        informational,
-        vendor_session_id,
-        route,
-        controller,
-        &prepared_files.entries,
-    )?;
+    let request = with_supersedes(
+        build_send_request(
+            op_id,
+            session,
+            &message_id,
+            sender_id,
+            title,
+            body,
+            choices,
+            informational,
+            vendor_session_id,
+            route,
+            controller,
+            &prepared_files.entries,
+        )?,
+        supersedes,
+    );
     if let Err(error) = validate_request_pre_upload(&request) {
         files::cleanup_staged_uploads(&prepared_files.uploads);
         return Err(error);
@@ -665,6 +676,13 @@ fn build_send_request(
     Ok(request)
 }
 
+fn with_supersedes(mut request: Value, supersedes: &[String]) -> Value {
+    if !supersedes.is_empty() {
+        request["message"]["supersedes"] = json!(supersedes);
+    }
+    request
+}
+
 fn send_input_identity(
     session_arg: &str,
     sender_id: &str,
@@ -672,6 +690,7 @@ fn send_input_identity(
     body: Option<&str>,
     choices: &[String],
     informational: bool,
+    supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -693,6 +712,9 @@ fn send_input_identity(
     if informational {
         inputs["informational"] = Value::Bool(true);
     }
+    if !supersedes.is_empty() {
+        inputs["supersedes"] = json!(supersedes);
+    }
     inputs
 }
 
@@ -704,6 +726,7 @@ pub fn prepare_send(
     body: Option<&str>,
     choices: &[String],
     informational: bool,
+    supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -733,6 +756,7 @@ pub fn prepare_send(
             body,
             choices,
             informational,
+            supersedes,
             vendor_session_id,
             route,
             controller,
@@ -760,6 +784,7 @@ pub fn prepare_send(
         body,
         choices,
         informational,
+        supersedes,
         vendor_session_id,
         route,
     );
@@ -780,7 +805,7 @@ pub fn prepare_send(
         controller,
         &prepared_files.entries,
     ) {
-        Ok(request) => request,
+        Ok(request) => with_supersedes(request, supersedes),
         Err(error) => {
             files::cleanup_staged_uploads(&prepared_files.uploads);
             return Err(error);
@@ -797,6 +822,7 @@ pub fn prepare_send(
         body,
         choices,
         informational,
+        supersedes,
         vendor_session_id,
         route,
         controller,
@@ -829,10 +855,11 @@ fn send_draft(
     body: Option<&str>,
     choices: &[String],
     informational: bool,
+    supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
 ) -> Value {
-    json!({
+    let mut draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
         "title":title,
@@ -841,7 +868,11 @@ fn send_draft(
         "informational":informational,
         "vendor_session_id":vendor_session_id,
         "route":route.map(OriginHarness::as_str)
-    })
+    });
+    if !supersedes.is_empty() {
+        draft["supersedes"] = json!(supersedes);
+    }
+    draft
 }
 
 fn emit_prepared_or_saved_result(
@@ -923,14 +954,18 @@ pub fn execute_send(context: &CommandContext, op_id: Uuid) -> Result<(), Command
 }
 
 fn send_result(sender_id: &str, message_id: &str, session: Uuid, response: &Value) -> Value {
-    json!({
+    let mut result = json!({
         "request": message_id,
         "sender_id": sender_id,
         "message_url": message_url(sender_id, message_id),
         "session": session,
         "revision": response["revision"].as_u64().unwrap_or(1),
         "listening_support": response.get("listening_support").cloned().unwrap_or(Value::Null)
-    })
+    });
+    if let Some(warnings) = response.get("supersedes_warnings") {
+        result["supersedes_warnings"] = warnings.clone();
+    }
+    result
 }
 
 fn message_url(sender_id: &str, message_id: &str) -> String {
@@ -3269,7 +3304,13 @@ fn delivered_event<'a>(
 }
 
 fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), CommandError> {
-    emit(&json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response}))
+    let mut output = json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response});
+    if kind == "send" {
+        if let Some(warnings) = output["response"].get("supersedes_warnings").cloned() {
+            output["supersedes_warnings"] = warnings;
+        }
+    }
+    emit(&output)
 }
 
 fn retry_committed_result(
@@ -3293,6 +3334,9 @@ fn retry_committed_result(
             .as_str()
             .ok_or_else(|| CommandError::new("saved send operation has no message ID", 1))?;
         output["message_url"] = Value::String(message_url(sender_id, message_id));
+        if let Some(warnings) = output["response"].get("supersedes_warnings").cloned() {
+            output["supersedes_warnings"] = warnings;
+        }
     }
     Ok(output)
 }
@@ -3749,6 +3793,7 @@ mod tests {
             Some("A body"),
             &[],
             false,
+            &[],
             None,
             None,
             false,
@@ -3837,6 +3882,7 @@ mod tests {
             None,
             &[],
             false,
+            &[],
             None,
             None,
             false,
@@ -3874,6 +3920,7 @@ mod tests {
             None,
             &[],
             false,
+            &[],
             None,
             None,
             false,
@@ -3961,6 +4008,7 @@ mod tests {
             Some("A body"),
             &[],
             false,
+            &[],
             None,
             None,
             false,
@@ -4041,6 +4089,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plain["type"], "send");
+        assert!(plain["message"].get("supersedes").is_none());
+        let superseding = with_supersedes(
+            plain.clone(),
+            &["earlier-1".to_string(), "earlier-2".to_string()],
+        );
+        assert_eq!(
+            superseding["message"]["supersedes"],
+            json!(["earlier-1", "earlier-2"])
+        );
+        assert!(superseding.get("supersedes").is_none());
         assert_eq!(plain["session_handle"], session.to_string());
         assert_eq!(plain["message"]["answer_ui"], text_reply_answer_ui());
 
@@ -4097,6 +4155,7 @@ mod tests {
             None,
             &[],
             false,
+            &[],
             None,
             Some(OriginHarness::ClaudeCode),
             false,
@@ -4109,14 +4168,48 @@ mod tests {
             None,
             &[],
             true,
+            &[],
             None,
             Some(OriginHarness::ClaudeCode),
             false,
             &[],
         );
         assert!(default.get("informational").is_none());
+        assert!(default.get("supersedes").is_none());
         assert_eq!(informational["informational"], true);
         assert_ne!(default, informational);
+
+        let replacing = send_input_identity(
+            "new",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            false,
+            &["old-1".to_string(), "old-2".to_string()],
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+        );
+        assert_eq!(replacing["supersedes"], json!(["old-1", "old-2"]));
+        assert_ne!(default, replacing);
+    }
+
+    #[test]
+    fn send_result_exposes_supersession_warnings_without_changing_plain_output() {
+        let session = Uuid::new_v4();
+        let plain = send_result("app:example", "new", session, &json!({"revision":1}));
+        assert!(plain.get("supersedes_warnings").is_none());
+
+        let warnings = json!([{"message_id":"old","reason":"closed"}]);
+        let result = send_result(
+            "app:example",
+            "new",
+            session,
+            &json!({"revision":1,"supersedes_warnings":warnings}),
+        );
+        assert_eq!(result["supersedes_warnings"], warnings);
     }
 
     #[test]

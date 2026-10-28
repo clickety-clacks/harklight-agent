@@ -47,6 +47,8 @@ enum Command {
             help = "Offer only the Seen action for an informational message"
         )]
         informational: bool,
+        #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
+        supersedes: Vec<String>,
         #[arg(long)]
         vendor_session_id: Option<String>,
         #[arg(long, value_enum)]
@@ -274,6 +276,7 @@ fn main() {
             body,
             choices,
             informational,
+            supersedes,
             vendor_session_id,
             route,
             controller,
@@ -289,6 +292,7 @@ fn main() {
             body.as_deref(),
             &choices,
             informational,
+            &supersedes,
             vendor_session_id.as_deref(),
             route.map(Into::into),
             controller,
@@ -478,6 +482,32 @@ mod tests {
                 op_id: Some(_),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn send_accepts_multiple_superseded_message_ids_in_order() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--title",
+            "Updated plan",
+            "--route",
+            "claude-code",
+            "--supersedes",
+            "earlier-1",
+            "--supersedes",
+            "earlier-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Send { supersedes, .. }
+                if supersedes == vec!["earlier-1".to_string(), "earlier-2".to_string()]
         ));
     }
 
