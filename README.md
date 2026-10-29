@@ -23,7 +23,7 @@ version and your target:
 | Linux, arm64 | `aarch64-unknown-linux-gnu` |
 
 ```sh
-v=0.1.4 t=aarch64-apple-darwin
+v=0.1.5 t=aarch64-apple-darwin
 base="https://github.com/clickety-clacks/harklight-agent/releases/download/v$v"
 curl -fLO "$base/harklight-agent-$v-$t.tar.gz"
 curl -fLO "$base/SHA256SUMS"
