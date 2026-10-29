@@ -26,6 +26,343 @@ pub const EXIT_UNSUPPORTED: i32 = 5;
 pub const EXIT_LISTENER_ACTIVE: i32 = 6;
 pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageFieldOptions {
+    pub urgency: Option<String>,
+    pub by_when: Option<String>,
+    pub stake: Option<String>,
+    pub thread: Option<String>,
+    pub default_choice: Option<String>,
+    pub default_at: Option<String>,
+    pub choice_styles: Vec<String>,
+    pub clear_default: bool,
+}
+
+impl MessageFieldOptions {
+    fn has_any(&self) -> bool {
+        self.urgency.is_some()
+            || self.by_when.is_some()
+            || self.stake.is_some()
+            || self.thread.is_some()
+            || self.default_choice.is_some()
+            || self.default_at.is_some()
+            || !self.choice_styles.is_empty()
+            || self.clear_default
+    }
+
+    fn identity(&self) -> Value {
+        json!({
+            "urgency":self.urgency,
+            "by_when":self.by_when,
+            "stake":self.stake,
+            "thread":self.thread,
+            "default_choice":self.default_choice,
+            "default_at":self.default_at,
+            "choice_styles":self.choice_styles,
+            "clear_default":self.clear_default
+        })
+    }
+}
+
+fn add_field_options_identity(value: &mut Value, fields: &MessageFieldOptions) {
+    if fields.has_any() {
+        value["message_field_options"] = fields.identity();
+    }
+}
+
+fn print_message_field_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChoiceTarget {
+    id: String,
+    value: Value,
+}
+
+#[derive(Debug, Default)]
+struct NormalizedMessageFields {
+    members: Map<String, Value>,
+    warnings: Vec<String>,
+}
+
+fn send_choice_targets(choices: &[String]) -> BTreeMap<String, ChoiceTarget> {
+    choices
+        .iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            (
+                choice.clone(),
+                ChoiceTarget {
+                    id: format!("choice-{}", index + 1),
+                    value: Value::String(choice.clone()),
+                },
+            )
+        })
+        .collect()
+}
+
+fn answer_ui_choice_targets(answer_ui: &Value) -> BTreeMap<String, ChoiceTarget> {
+    let mut targets = BTreeMap::new();
+    if let Some(actions) = answer_ui["actions"].as_array() {
+        for action in actions {
+            if action["kind"] == "value" {
+                if let (Some(id), Some(label), Some(value)) = (
+                    action["id"].as_str(),
+                    action["label"].as_str(),
+                    action.get("value"),
+                ) {
+                    targets
+                        .entry(label.to_owned())
+                        .or_insert_with(|| ChoiceTarget {
+                            id: id.to_owned(),
+                            value: value.clone(),
+                        });
+                }
+            }
+        }
+    }
+    targets
+}
+
+fn normalize_message_fields(
+    options: &MessageFieldOptions,
+    choices: &BTreeMap<String, ChoiceTarget>,
+    include_thread: bool,
+    informational: bool,
+) -> NormalizedMessageFields {
+    let mut normalized = NormalizedMessageFields::default();
+
+    if let Some(urgency) = options.urgency.as_deref() {
+        if matches!(urgency, "low" | "normal" | "high" | "now") {
+            normalized
+                .members
+                .insert("urgency".into(), Value::String(urgency.to_owned()));
+        } else {
+            normalized.warnings.push(format!(
+                "--urgency value {urgency:?} is unsupported; leaving urgency out"
+            ));
+        }
+    }
+
+    match (&options.default_choice, &options.default_at) {
+        (None, None) => {}
+        (Some(_), None) => normalized
+            .warnings
+            .push("--default needs --default-at; leaving the default out".into()),
+        (None, Some(_)) => normalized
+            .warnings
+            .push("--default-at needs --default; leaving the default out".into()),
+        (Some(choice), Some(at)) => {
+            let target = choices.get(choice);
+            let timestamp = parse_rfc3339_ms(at);
+
+            if informational {
+                normalized.warnings.push(
+                    "--default is not available on an informational message; leaving the default out"
+                        .into(),
+                );
+            } else if options.clear_default {
+                normalized.warnings.push(
+                    "--default conflicts with --clear-default; leaving the default out".into(),
+                );
+            } else {
+                if target.is_none() {
+                    normalized.warnings.push(format!(
+                        "--default choice {choice:?} does not name a choice; leaving the default out"
+                    ));
+                }
+                if timestamp.is_none() {
+                    normalized.warnings.push(format!(
+                        "--default-at value {at:?} is not a valid RFC 3339 time; leaving the default out"
+                    ));
+                }
+                if let (Some(target), Some(timestamp)) = (target, timestamp) {
+                    normalized.members.insert(
+                        "default".into(),
+                        json!({"value":target.value,"at":timestamp}),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(by_when) = options.by_when.as_deref() {
+        match parse_rfc3339_ms(by_when) {
+            Some(timestamp) => {
+                normalized
+                    .members
+                    .insert("by_when".into(), Value::from(timestamp));
+            }
+            None => normalized.warnings.push(format!(
+                "--by-when value {by_when:?} is not a valid RFC 3339 time; leaving by_when out"
+            )),
+        }
+    }
+
+    if include_thread {
+        if let Some(thread) = options.thread.as_deref() {
+            if !thread.is_empty() {
+                normalized
+                    .members
+                    .insert("thread".into(), Value::String(thread.to_owned()));
+            } else {
+                normalized
+                    .warnings
+                    .push("--thread is empty; leaving thread out".into());
+            }
+        }
+    }
+
+    if !options.choice_styles.is_empty() {
+        let mut styles = Map::new();
+        for style_option in &options.choice_styles {
+            let Some((choice_text, style)) = style_option.rsplit_once('=') else {
+                normalized.warnings.push(format!(
+                    "--choice-style value {style_option:?} must end with =STYLE; leaving this style out"
+                ));
+                continue;
+            };
+            if !matches!(style, "primary" | "secondary" | "destructive") {
+                normalized.warnings.push(format!(
+                    "--choice-style value {style_option:?} has an unsupported style; leaving this style out"
+                ));
+                continue;
+            }
+            let Some(target) = choices.get(choice_text) else {
+                normalized.warnings.push(format!(
+                    "--choice-style choice {choice_text:?} does not name a choice; leaving this style out"
+                ));
+                continue;
+            };
+            styles.insert(target.id.clone(), Value::String(style.to_owned()));
+        }
+        if !styles.is_empty() {
+            normalized
+                .members
+                .insert("choice_styles".into(), Value::Object(styles));
+        }
+    }
+
+    if let Some(stake) = options.stake.as_deref() {
+        if !stake.is_empty() {
+            normalized
+                .members
+                .insert("stake".into(), Value::String(stake.to_owned()));
+        } else {
+            normalized
+                .warnings
+                .push("--stake is empty; leaving stake out".into());
+        }
+    }
+
+    normalized
+}
+
+fn parse_rfc3339_ms(value: &str) -> Option<i64> {
+    let value = value.as_bytes();
+    if value.len() < 20 || value.get(10).copied()? != b'T' && value.get(10).copied()? != b't' {
+        return None;
+    }
+
+    let year = parse_digits(value.get(0..4)?)? as i64;
+    let month = parse_digits(value.get(5..7)?)? as i64;
+    let day = parse_digits(value.get(8..10)?)? as i64;
+    let hour = parse_digits(value.get(11..13)?)? as i64;
+    let minute = parse_digits(value.get(14..16)?)? as i64;
+    let second = parse_digits(value.get(17..19)?)? as i64;
+    if value.get(4).copied()? != b'-'
+        || value.get(7).copied()? != b'-'
+        || value.get(13).copied()? != b':'
+        || value.get(16).copied()? != b':'
+        || month == 0
+        || month > 12
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let mut cursor = 19;
+    let mut fraction_ms = 0i64;
+    if value.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let start = cursor;
+        while value.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == start {
+            return None;
+        }
+        let fraction = value.get(start..cursor)?;
+        for index in 0..3 {
+            fraction_ms *= 10;
+            if let Some(digit) = fraction.get(index) {
+                fraction_ms += (digit - b'0') as i64;
+            }
+        }
+    }
+
+    let offset_minutes = match value.get(cursor).copied()? {
+        b'Z' | b'z' if cursor + 1 == value.len() => 0i64,
+        sign @ (b'+' | b'-') if cursor + 6 == value.len() => {
+            if value.get(cursor + 3) != Some(&b':') {
+                return None;
+            }
+            let hours = parse_digits(value.get(cursor + 1..cursor + 3)?)? as i64;
+            let minutes = parse_digits(value.get(cursor + 4..cursor + 6)?)? as i64;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let magnitude = hours * 60 + minutes;
+            if sign == b'+' { magnitude } else { -magnitude }
+        }
+        _ => return None,
+    };
+
+    let days = days_from_civil(year, month, day);
+    let local_seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    local_seconds
+        .checked_sub(offset_minutes * 60)?
+        .checked_mul(1_000)?
+        .checked_add(fraction_ms)
+}
+
+fn parse_digits(value: &[u8]) -> Option<u32> {
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    value.iter().try_fold(0u32, |number, digit| {
+        number.checked_mul(10)?.checked_add((digit - b'0') as u32)
+    })
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct CommandError {
@@ -415,6 +752,7 @@ fn answer_ui_for_revision(current: &Value) -> Result<Value, CommandError> {
 /// Builds the revised message from the current one: `--choice` replaces the
 /// answer descriptor, `--clear-choices` leaves a text Reply descriptor, and
 /// neither preserves the descriptor while ensuring it remains usable.
+#[cfg(test)]
 fn revised_message(
     current: &Value,
     title: &str,
@@ -422,6 +760,25 @@ fn revised_message(
     choices: &[String],
     clear_choices: bool,
 ) -> Result<Value, CommandError> {
+    revised_message_with_fields(
+        current,
+        title,
+        body,
+        choices,
+        clear_choices,
+        &MessageFieldOptions::default(),
+    )
+    .map(|(message, _warnings)| message)
+}
+
+fn revised_message_with_fields(
+    current: &Value,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    clear_choices: bool,
+    fields: &MessageFieldOptions,
+) -> Result<(Value, Vec<String>), CommandError> {
     if clear_choices && !choices.is_empty() {
         return Err(CommandError::new(
             "use either --choice or --clear-choices, not both",
@@ -435,6 +792,7 @@ fn revised_message(
     } else {
         answer_ui_for_revision(current)?
     };
+    let replacing_choices = clear_choices || !choices.is_empty();
     let mut message = current.clone();
     message["title"] = Value::String(title.to_owned());
     message["created_at"] = Value::from(now_ms());
@@ -445,7 +803,85 @@ fn revised_message(
         object.remove("choices");
     }
     message["answer_ui"] = answer_ui;
-    Ok(message)
+    if replacing_choices {
+        if let Some(object) = message.as_object_mut() {
+            object.remove("default");
+            object.remove("choice_styles");
+        }
+    }
+
+    let mut options = fields.clone();
+    let mut warnings = Vec::new();
+    if options.clear_default && (options.default_choice.is_some() || options.default_at.is_some()) {
+        warnings
+            .push("--default conflicts with --clear-default; leaving the default cleared".into());
+        options.default_choice = None;
+        options.default_at = None;
+    }
+    if options.clear_default {
+        if let Some(object) = message.as_object_mut() {
+            object.remove("default");
+        }
+    }
+
+    let normalized = normalize_message_fields(
+        &options,
+        &answer_ui_choice_targets(&message["answer_ui"]),
+        false,
+        message["answer_ui"] == seen_answer_ui(),
+    );
+    warnings.extend(normalized.warnings.iter().cloned());
+    let normalized_members = normalized.members;
+    for (field, value) in &normalized_members {
+        message[field] = value.clone();
+    }
+
+    // A valid member supplied on a revise replaces its prior value. An invalid
+    // member is treated as absent, preserving the prior revision's value.
+    for field in ["urgency", "by_when", "stake"] {
+        if let Some(raw) = options_field(&options, field) {
+            if !normalized_member_is_valid(field, raw) {
+                if let Some(old_value) = current.get(field) {
+                    message[field] = old_value.clone();
+                }
+            }
+        }
+    }
+    if (options.default_choice.is_some() || options.default_at.is_some())
+        && !normalized_members.contains_key("default")
+        && !replacing_choices
+    {
+        if let Some(old_value) = current.get("default") {
+            message["default"] = old_value.clone();
+        }
+    }
+    if !options.choice_styles.is_empty()
+        && !normalized_members.contains_key("choice_styles")
+        && !replacing_choices
+    {
+        if let Some(old_value) = current.get("choice_styles") {
+            message["choice_styles"] = old_value.clone();
+        }
+    }
+    Ok((message, warnings))
+}
+
+fn options_field<'a>(options: &'a MessageFieldOptions, field: &str) -> Option<&'a str> {
+    match field {
+        "urgency" => options.urgency.as_deref(),
+        "by_when" => options.by_when.as_deref(),
+        "stake" => options.stake.as_deref(),
+        _ => None,
+    }
+}
+
+fn normalized_member_is_valid(field: &str, value: &str) -> bool {
+    match field {
+        "urgency" => matches!(value, "low" | "normal" | "high" | "now"),
+        "by_when" => parse_rfc3339_ms(value).is_some(),
+        "stake" => !value.is_empty(),
+        _ => false,
+    }
 }
 
 pub fn send_command(
@@ -464,6 +900,44 @@ pub fn send_command(
     prepare: bool,
     execute: bool,
     op_id: Option<Uuid>,
+) -> Result<(), CommandError> {
+    send_command_with_fields(
+        context,
+        session,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        supersedes,
+        vendor_session_id,
+        route,
+        controller,
+        files,
+        prepare,
+        execute,
+        op_id,
+        &MessageFieldOptions::default(),
+    )
+}
+
+pub fn send_command_with_fields(
+    context: &CommandContext,
+    session: Option<&str>,
+    sender_id: Option<&str>,
+    title: Option<&str>,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    supersedes: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[PathBuf],
+    prepare: bool,
+    execute: bool,
+    op_id: Option<Uuid>,
+    fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
     if prepare && execute {
         return Err(CommandError::new(
@@ -485,6 +959,7 @@ pub fn send_command(
             || route.is_some()
             || controller
             || !files.is_empty()
+            || fields.has_any()
         {
             return Err(CommandError::new(
                 "--execute accepts only --op-id; it uses the saved send inputs",
@@ -507,7 +982,7 @@ pub fn send_command(
     if prepare {
         let op_id =
             op_id.ok_or_else(|| CommandError::new("--prepare requires --op-id", EXIT_REFUSED))?;
-        return prepare_send(
+        return prepare_send_with_fields(
             context,
             session,
             sender_id,
@@ -521,9 +996,10 @@ pub fn send_command(
             controller,
             files,
             op_id,
+            fields,
         );
     }
-    send(
+    send_with_fields(
         context,
         session,
         sender_id,
@@ -536,6 +1012,7 @@ pub fn send_command(
         route,
         controller,
         files,
+        fields,
     )
 }
 
@@ -553,8 +1030,43 @@ pub fn send(
     controller: bool,
     files: &[PathBuf],
 ) -> Result<(), CommandError> {
+    send_with_fields(
+        context,
+        session_arg,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        supersedes,
+        vendor_session_id,
+        route,
+        controller,
+        files,
+        &MessageFieldOptions::default(),
+    )
+}
+
+pub fn send_with_fields(
+    context: &CommandContext,
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    supersedes: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[PathBuf],
+    fields: &MessageFieldOptions,
+) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
     answer_ui_for_send(choices, informational)?;
+    let choice_targets = send_choice_targets(choices);
+    let normalized = normalize_message_fields(fields, &choice_targets, true, informational);
+    print_message_field_warnings(&normalized.warnings);
     let mut file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
@@ -568,6 +1080,7 @@ pub fn send(
     if !supersedes.is_empty() {
         file_draft["supersedes"] = json!(supersedes);
     }
+    add_field_options_identity(&mut file_draft, fields);
     let session = if session_arg == "new" {
         Uuid::new_v4()
     } else {
@@ -579,7 +1092,7 @@ pub fn send(
     let prepared_files =
         prepare_outgoing_files(context, &store, session, op_id, files, "send", file_draft)?;
     let request = with_supersedes(
-        build_send_request(
+        build_send_request_with_fields(
             op_id,
             session,
             &message_id,
@@ -592,6 +1105,7 @@ pub fn send(
             route,
             controller,
             &prepared_files.entries,
+            fields,
         )?,
         supersedes,
     );
@@ -629,6 +1143,7 @@ fn validate_send_response_session(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_send_request(
     op_id: Uuid,
     session: Uuid,
@@ -643,7 +1158,41 @@ fn build_send_request(
     controller: bool,
     file_entries: &[Value],
 ) -> Result<Value, CommandError> {
+    build_send_request_with_fields(
+        op_id,
+        session,
+        message_id,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        vendor_session_id,
+        route,
+        controller,
+        file_entries,
+        &MessageFieldOptions::default(),
+    )
+}
+
+fn build_send_request_with_fields(
+    op_id: Uuid,
+    session: Uuid,
+    message_id: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    file_entries: &[Value],
+    fields: &MessageFieldOptions,
+) -> Result<Value, CommandError> {
     let answer_ui = answer_ui_for_send(choices, informational)?;
+    let normalized =
+        normalize_message_fields(fields, &send_choice_targets(choices), true, informational);
     let mut message = json!({
         "sender_id": sender_id,
         "message_id": message_id,
@@ -654,6 +1203,9 @@ fn build_send_request(
         message["body"] = Value::String(body.to_owned());
     }
     message["answer_ui"] = answer_ui;
+    for (field, value) in normalized.members {
+        message[field] = value;
+    }
 
     let mut request = json!({
         "v": 1,
@@ -683,6 +1235,7 @@ fn with_supersedes(mut request: Value, supersedes: &[String]) -> Value {
     request
 }
 
+#[cfg(test)]
 fn send_input_identity(
     session_arg: &str,
     sender_id: &str,
@@ -695,6 +1248,36 @@ fn send_input_identity(
     route: Option<OriginHarness>,
     controller: bool,
     files: &[files::FileManifestEntry],
+) -> Value {
+    send_input_identity_with_fields(
+        session_arg,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        supersedes,
+        vendor_session_id,
+        route,
+        controller,
+        files,
+        &MessageFieldOptions::default(),
+    )
+}
+
+fn send_input_identity_with_fields(
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    supersedes: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[files::FileManifestEntry],
+    fields: &MessageFieldOptions,
 ) -> Value {
     let mut inputs = json!({
         "session":session_arg,
@@ -715,6 +1298,7 @@ fn send_input_identity(
     if !supersedes.is_empty() {
         inputs["supersedes"] = json!(supersedes);
     }
+    add_field_options_identity(&mut inputs, fields);
     inputs
 }
 
@@ -733,10 +1317,47 @@ pub fn prepare_send(
     files: &[PathBuf],
     op_id: Uuid,
 ) -> Result<(), CommandError> {
+    prepare_send_with_fields(
+        context,
+        session_arg,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        supersedes,
+        vendor_session_id,
+        route,
+        controller,
+        files,
+        op_id,
+        &MessageFieldOptions::default(),
+    )
+}
+
+pub fn prepare_send_with_fields(
+    context: &CommandContext,
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    supersedes: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[PathBuf],
+    op_id: Uuid,
+    fields: &MessageFieldOptions,
+) -> Result<(), CommandError> {
     if op_id.get_version_num() != 4 {
         return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
     }
     answer_ui_for_send(choices, informational)?;
+    let normalized =
+        normalize_message_fields(fields, &send_choice_targets(choices), true, informational);
+    print_message_field_warnings(&normalized.warnings);
     let route = validate_send_route(session_arg, route, controller)?;
     let global = context.open_global_store()?;
 
@@ -749,7 +1370,7 @@ pub fn prepare_send(
             .as_ref()
             .ok_or_else(|| journal_error(JournalError::OperationConflict(op_id), EXIT_REFUSED))?;
         let manifest = files::identify(files).map_err(|reason| CommandError::new(reason, 1))?;
-        let inputs = send_input_identity(
+        let inputs = send_input_identity_with_fields(
             session_arg,
             sender_id,
             title,
@@ -761,6 +1382,7 @@ pub fn prepare_send(
             route,
             controller,
             &manifest,
+            fields,
         );
         if saved.inputs != inputs || saved.files != manifest {
             return Err(journal_error(
@@ -777,7 +1399,7 @@ pub fn prepare_send(
         parse_session(session_arg)?
     };
     let mut store = context.open_store(session)?;
-    let draft = send_draft(
+    let draft = send_draft_with_fields(
         session_arg,
         sender_id,
         title,
@@ -787,11 +1409,12 @@ pub fn prepare_send(
         supersedes,
         vendor_session_id,
         route,
+        fields,
     );
     let prepared_files =
         prepare_outgoing_files(context, &store, session, op_id, files, "send", draft)?;
     let message_id = Uuid::new_v4().to_string();
-    let request = match build_send_request(
+    let request = match build_send_request_with_fields(
         op_id,
         session,
         &message_id,
@@ -804,6 +1427,7 @@ pub fn prepare_send(
         route,
         controller,
         &prepared_files.entries,
+        fields,
     ) {
         Ok(request) => with_supersedes(request, supersedes),
         Err(error) => {
@@ -815,7 +1439,7 @@ pub fn prepare_send(
         files::cleanup_staged_uploads(&prepared_files.uploads);
         return Err(error);
     }
-    let inputs = send_input_identity(
+    let inputs = send_input_identity_with_fields(
         session_arg,
         sender_id,
         title,
@@ -827,6 +1451,7 @@ pub fn prepare_send(
         route,
         controller,
         &prepared_files.manifest,
+        fields,
     );
     let prepared_send = PreparedSend {
         inputs,
@@ -848,6 +1473,7 @@ pub fn prepare_send(
     emit_prepared_or_saved_result(&operation, op_id)
 }
 
+#[cfg(test)]
 fn send_draft(
     session_arg: &str,
     sender_id: &str,
@@ -858,6 +1484,32 @@ fn send_draft(
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
+) -> Value {
+    send_draft_with_fields(
+        session_arg,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        supersedes,
+        vendor_session_id,
+        route,
+        &MessageFieldOptions::default(),
+    )
+}
+
+fn send_draft_with_fields(
+    session_arg: &str,
+    sender_id: &str,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    supersedes: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    fields: &MessageFieldOptions,
 ) -> Value {
     let mut draft = json!({
         "session":session_arg,
@@ -872,6 +1524,7 @@ fn send_draft(
     if !supersedes.is_empty() {
         draft["supersedes"] = json!(supersedes);
     }
+    add_field_options_identity(&mut draft, fields);
     draft
 }
 
@@ -964,6 +1617,9 @@ fn send_result(sender_id: &str, message_id: &str, session: Uuid, response: &Valu
     });
     if let Some(warnings) = response.get("supersedes_warnings") {
         result["supersedes_warnings"] = warnings.clone();
+    }
+    if let Some(warnings) = response.get("field_warnings") {
+        result["field_warnings"] = warnings.clone();
     }
     result
 }
@@ -1633,6 +2289,36 @@ pub fn revise(
     files: &[PathBuf],
     op_id: Option<Uuid>,
 ) -> Result<(), CommandError> {
+    revise_with_fields(
+        context,
+        session,
+        request_id,
+        base_revision,
+        title,
+        body,
+        choices,
+        clear_choices,
+        in_reply_to,
+        files,
+        op_id,
+        &MessageFieldOptions::default(),
+    )
+}
+
+pub fn revise_with_fields(
+    context: &CommandContext,
+    session: Uuid,
+    request_id: &str,
+    base_revision: u64,
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    clear_choices: bool,
+    in_reply_to: Option<&str>,
+    files: &[PathBuf],
+    op_id: Option<Uuid>,
+    fields: &MessageFieldOptions,
+) -> Result<(), CommandError> {
     if clear_choices && !choices.is_empty() {
         return Err(CommandError::new(
             "use either --choice or --clear-choices, not both",
@@ -1668,7 +2354,15 @@ pub fn revise(
         let event = delivered_event(&snapshot, session, &request, event_id, "discussion", false)?;
         ensure_current_revision(request.revision, event.request_revision)?;
     }
-    let mut message = revised_message(&request.message, title, body, choices, clear_choices)?;
+    let (mut message, tool_warnings) = revised_message_with_fields(
+        &request.message,
+        title,
+        body,
+        choices,
+        clear_choices,
+        fields,
+    )?;
+    print_message_field_warnings(&tool_warnings);
     message["sender_id"] = Value::String(request.sender_id.clone());
     message["message_id"] = Value::String(request.message_id.clone());
     let op_id = op_id.unwrap_or_else(Uuid::new_v4);
@@ -3305,6 +3999,11 @@ fn delivered_event<'a>(
 
 fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), CommandError> {
     let mut output = json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response});
+    if matches!(kind, "send" | "revise") {
+        if let Some(warnings) = output["response"].get("field_warnings").cloned() {
+            output["field_warnings"] = warnings;
+        }
+    }
     if kind == "send" {
         if let Some(warnings) = output["response"].get("supersedes_warnings").cloned() {
             output["supersedes_warnings"] = warnings;
@@ -3336,6 +4035,11 @@ fn retry_committed_result(
         output["message_url"] = Value::String(message_url(sender_id, message_id));
         if let Some(warnings) = output["response"].get("supersedes_warnings").cloned() {
             output["supersedes_warnings"] = warnings;
+        }
+    }
+    if matches!(operation_kind, "send" | "revise") {
+        if let Some(warnings) = output["response"].get("field_warnings").cloned() {
+            output["field_warnings"] = warnings;
         }
     }
     Ok(output)
@@ -4210,6 +4914,183 @@ mod tests {
             &json!({"revision":1,"supersedes_warnings":warnings}),
         );
         assert_eq!(result["supersedes_warnings"], warnings);
+    }
+
+    #[test]
+    fn send_result_exposes_field_warnings_without_changing_plain_output() {
+        let session = Uuid::new_v4();
+        let plain = send_result("app:example", "new", session, &json!({"revision":1}));
+        assert!(plain.get("field_warnings").is_none());
+
+        let warnings = json!([{"field":"urgency","reason":"invalid"}]);
+        let result = send_result(
+            "app:example",
+            "new",
+            session,
+            &json!({"revision":1,"field_warnings":warnings}),
+        );
+        assert_eq!(result["field_warnings"], warnings);
+    }
+
+    #[test]
+    fn rfc3339_message_times_normalize_to_epoch_milliseconds() {
+        assert_eq!(
+            parse_rfc3339_ms("2026-10-30T15:00:00.123-07:00"),
+            parse_rfc3339_ms("2026-10-30T22:00:00.123Z")
+        );
+        assert!(parse_rfc3339_ms("2024-02-29T00:00:00Z").is_some());
+        assert!(parse_rfc3339_ms("2026-02-29T00:00:00Z").is_none());
+        assert!(parse_rfc3339_ms("2026-10-30T15:00:00+24:00").is_none());
+        assert!(parse_rfc3339_ms("tomorrow").is_none());
+    }
+
+    #[test]
+    fn send_field_options_become_top_level_members_and_styles_map_to_choice_ids() {
+        let choices = vec!["Hold".to_string(), "Ship".to_string()];
+        let fields = MessageFieldOptions {
+            urgency: Some("high".into()),
+            by_when: Some("2026-10-30T22:00:00Z".into()),
+            stake: Some("A one-week delay".into()),
+            thread: Some("release".into()),
+            default_choice: Some("Ship".into()),
+            default_at: Some("2026-10-30T23:00:00Z".into()),
+            choice_styles: vec!["Ship=destructive".into()],
+            clear_default: false,
+        };
+
+        let request = build_send_request_with_fields(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "message-1",
+            "app:example",
+            "Ship?",
+            None,
+            &choices,
+            false,
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+            &fields,
+        )
+        .unwrap();
+
+        assert_eq!(request["message"]["urgency"], "high");
+        assert_eq!(
+            request["message"]["by_when"],
+            parse_rfc3339_ms("2026-10-30T22:00:00Z").unwrap()
+        );
+        assert_eq!(request["message"]["stake"], "A one-week delay");
+        assert_eq!(request["message"]["thread"], "release");
+        assert_eq!(request["message"]["default"]["value"], "Ship");
+        assert_eq!(
+            request["message"]["choice_styles"],
+            json!({"choice-2":"destructive"})
+        );
+        assert!(
+            request["message"]["answer_ui"]["actions"][1]
+                .get("style")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_send_fields_are_left_out_with_flag_specific_warnings_in_contract_order() {
+        let choices = vec!["Hold".to_string(), "Ship".to_string()];
+        let options = MessageFieldOptions {
+            urgency: Some("urgent".into()),
+            by_when: Some("tomorrow".into()),
+            stake: Some("".into()),
+            thread: Some("".into()),
+            default_choice: Some("Later".into()),
+            default_at: Some("bad-time".into()),
+            choice_styles: vec!["Later=primary".into(), "Ship=urgent".into()],
+            clear_default: false,
+        };
+
+        let normalized =
+            normalize_message_fields(&options, &send_choice_targets(&choices), true, false);
+
+        assert!(normalized.members.is_empty());
+        assert_eq!(
+            normalized.warnings,
+            vec![
+                "--urgency value \"urgent\" is unsupported; leaving urgency out",
+                "--default choice \"Later\" does not name a choice; leaving the default out",
+                "--default-at value \"bad-time\" is not a valid RFC 3339 time; leaving the default out",
+                "--by-when value \"tomorrow\" is not a valid RFC 3339 time; leaving by_when out",
+                "--thread is empty; leaving thread out",
+                "--choice-style choice \"Later\" does not name a choice; leaving this style out",
+                "--choice-style value \"Ship=urgent\" has an unsupported style; leaving this style out",
+                "--stake is empty; leaving stake out",
+            ]
+        );
+    }
+
+    #[test]
+    fn revise_preserves_existing_members_when_invalid_flags_are_ignored() {
+        let answer_ui = choices_answer_ui(&["Hold".into(), "Ship".into()]).unwrap();
+        let current = json!({
+            "sender_id":"app:example",
+            "message_id":"message-1",
+            "created_at":1,
+            "title":"Old title",
+            "answer_ui":answer_ui,
+            "urgency":"high",
+            "by_when":1234,
+            "stake":"Existing impact",
+            "thread":"release",
+            "default":{"value":"Ship","at":9999999999999_i64},
+            "choice_styles":{"choice-2":"primary"}
+        });
+        let fields = MessageFieldOptions {
+            urgency: Some("urgent".into()),
+            by_when: Some("bad-time".into()),
+            stake: Some("".into()),
+            default_choice: Some("Missing".into()),
+            default_at: Some("bad-time".into()),
+            choice_styles: vec!["Missing=destructive".into()],
+            ..MessageFieldOptions::default()
+        };
+
+        let (revised, warnings) =
+            revised_message_with_fields(&current, "New title", None, &[], false, &fields).unwrap();
+
+        assert_eq!(revised["urgency"], "high");
+        assert_eq!(revised["by_when"], 1234);
+        assert_eq!(revised["stake"], "Existing impact");
+        assert_eq!(revised["thread"], "release");
+        assert_eq!(revised["default"], current["default"]);
+        assert_eq!(revised["choice_styles"], current["choice_styles"]);
+        assert_eq!(warnings.len(), 6);
+
+        let replaced = revised_message_with_fields(
+            &current,
+            "New choices",
+            None,
+            &["Later".into()],
+            false,
+            &MessageFieldOptions::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(replaced.get("default").is_none());
+        assert!(replaced.get("choice_styles").is_none());
+
+        let cleared = revised_message_with_fields(
+            &current,
+            "Cleared default",
+            None,
+            &[],
+            false,
+            &MessageFieldOptions {
+                clear_default: true,
+                ..MessageFieldOptions::default()
+            },
+        )
+        .unwrap()
+        .0;
+        assert!(cleared.get("default").is_none());
     }
 
     #[test]

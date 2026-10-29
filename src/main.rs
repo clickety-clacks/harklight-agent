@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
-use harklight_agent::commands::{self, CommandContext};
+use harklight_agent::commands::{self, CommandContext, MessageFieldOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -49,6 +49,20 @@ enum Command {
         informational: bool,
         #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
         supersedes: Vec<String>,
+        #[arg(long)]
+        urgency: Option<String>,
+        #[arg(long)]
+        by_when: Option<String>,
+        #[arg(long)]
+        stake: Option<String>,
+        #[arg(long)]
+        thread: Option<String>,
+        #[arg(long = "default")]
+        default_choice: Option<String>,
+        #[arg(long = "default-at")]
+        default_at: Option<String>,
+        #[arg(long = "choice-style", action = clap::ArgAction::Append)]
+        choice_styles: Vec<String>,
         #[arg(long)]
         vendor_session_id: Option<String>,
         #[arg(long, value_enum)]
@@ -114,6 +128,20 @@ enum Command {
         choices: Vec<String>,
         #[arg(long)]
         clear_choices: bool,
+        #[arg(long)]
+        urgency: Option<String>,
+        #[arg(long)]
+        by_when: Option<String>,
+        #[arg(long)]
+        stake: Option<String>,
+        #[arg(long = "default")]
+        default_choice: Option<String>,
+        #[arg(long = "default-at")]
+        default_at: Option<String>,
+        #[arg(long)]
+        clear_default: bool,
+        #[arg(long = "choice-style", action = clap::ArgAction::Append)]
+        choice_styles: Vec<String>,
         #[arg(long)]
         in_reply_to: Option<String>,
         #[arg(long = "file", action = clap::ArgAction::Append)]
@@ -277,6 +305,13 @@ fn main() {
             choices,
             informational,
             supersedes,
+            urgency,
+            by_when,
+            stake,
+            thread,
+            default_choice,
+            default_at,
+            choice_styles,
             vendor_session_id,
             route,
             controller,
@@ -284,7 +319,7 @@ fn main() {
             prepare,
             execute,
             op_id,
-        } => commands::send_command(
+        } => commands::send_command_with_fields(
             &context,
             session.as_deref(),
             sender_id.as_deref(),
@@ -300,6 +335,16 @@ fn main() {
             prepare,
             execute,
             op_id,
+            &MessageFieldOptions {
+                urgency,
+                by_when,
+                stake,
+                thread,
+                default_choice,
+                default_at,
+                choice_styles,
+                clear_default: false,
+            },
         ),
         Command::Attach {
             session,
@@ -348,10 +393,17 @@ fn main() {
             body,
             choices,
             clear_choices,
+            urgency,
+            by_when,
+            stake,
+            default_choice,
+            default_at,
+            clear_default,
+            choice_styles,
             in_reply_to,
             files,
             op_id,
-        } => commands::revise(
+        } => commands::revise_with_fields(
             &context,
             session,
             &request,
@@ -363,6 +415,16 @@ fn main() {
             in_reply_to.as_deref(),
             &files,
             op_id,
+            &MessageFieldOptions {
+                urgency,
+                by_when,
+                stake,
+                thread: None,
+                default_choice,
+                default_at,
+                choice_styles,
+                clear_default,
+            },
         ),
         Command::Withdraw {
             session,
@@ -615,6 +677,107 @@ mod tests {
                 "--informational",
                 "--choice",
                 "Approve",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn send_and_revise_accept_the_message_field_flags_but_revise_has_no_thread_flag() {
+        let send = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--title",
+            "A request",
+            "--choice",
+            "Hold",
+            "--choice",
+            "Ship",
+            "--urgency",
+            "high",
+            "--by-when",
+            "2026-10-30T22:00:00Z",
+            "--stake",
+            "A one-week delay",
+            "--thread",
+            "release",
+            "--default",
+            "Ship",
+            "--default-at",
+            "2026-10-30T23:00:00Z",
+            "--choice-style",
+            "Ship=destructive",
+            "--choice-style",
+            "Hold=secondary",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            send.command,
+            Command::Send {
+                urgency: Some(urgency),
+                by_when: Some(by_when),
+                stake: Some(stake),
+                thread: Some(thread),
+                default_choice: Some(default_choice),
+                default_at: Some(default_at),
+                choice_styles,
+                ..
+            } if urgency == "high"
+                && by_when == "2026-10-30T22:00:00Z"
+                && stake == "A one-week delay"
+                && thread == "release"
+                && default_choice == "Ship"
+                && default_at == "2026-10-30T23:00:00Z"
+                && choice_styles == vec!["Ship=destructive", "Hold=secondary"]
+        ));
+
+        let revise = Cli::try_parse_from([
+            "harklight-agent",
+            "revise",
+            "--session",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "--request",
+            "message-1",
+            "--base-revision",
+            "1",
+            "--title",
+            "Updated request",
+            "--urgency",
+            "now",
+            "--clear-default",
+            "--choice-style",
+            "Ship=primary",
+        ])
+        .unwrap();
+        assert!(matches!(
+            revise.command,
+            Command::Revise {
+                urgency: Some(urgency),
+                clear_default: true,
+                choice_styles,
+                ..
+            } if urgency == "now" && choice_styles == vec!["Ship=primary"]
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "revise",
+                "--session",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "--request",
+                "message-1",
+                "--base-revision",
+                "1",
+                "--title",
+                "Updated request",
+                "--thread",
+                "release",
             ])
             .is_err()
         );
