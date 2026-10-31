@@ -32,6 +32,7 @@ pub struct MessageFieldOptions {
     pub by_when: Option<String>,
     pub stake: Option<String>,
     pub thread: Option<String>,
+    pub display_name: Option<String>,
     pub default_choice: Option<String>,
     pub default_at: Option<String>,
     pub choice_styles: Vec<String>,
@@ -44,6 +45,7 @@ impl MessageFieldOptions {
             || self.by_when.is_some()
             || self.stake.is_some()
             || self.thread.is_some()
+            || self.display_name.is_some()
             || self.default_choice.is_some()
             || self.default_at.is_some()
             || !self.choice_styles.is_empty()
@@ -51,7 +53,7 @@ impl MessageFieldOptions {
     }
 
     fn identity(&self) -> Value {
-        json!({
+        let mut identity = json!({
             "urgency":self.urgency,
             "by_when":self.by_when,
             "stake":self.stake,
@@ -60,7 +62,11 @@ impl MessageFieldOptions {
             "default_at":self.default_at,
             "choice_styles":self.choice_styles,
             "clear_default":self.clear_default
-        })
+        });
+        if let Some(display_name) = &self.display_name {
+            identity["display_name"] = Value::String(display_name.clone());
+        }
+        identity
     }
 }
 
@@ -1203,6 +1209,9 @@ fn build_send_request_with_fields(
         message["body"] = Value::String(body.to_owned());
     }
     message["answer_ui"] = answer_ui;
+    if let Some(display_name) = &fields.display_name {
+        message["display_name"] = Value::String(display_name.clone());
+    }
     for (field, value) in normalized.members {
         message[field] = value;
     }
@@ -4851,6 +4860,59 @@ mod tests {
     }
 
     #[test]
+    fn send_carries_display_name_unchanged_and_separate_from_sender_id() {
+        let display_name = "  Mei\n/💧  ";
+        let fields = MessageFieldOptions {
+            display_name: Some(display_name.to_owned()),
+            ..MessageFieldOptions::default()
+        };
+        let request = build_send_request_with_fields(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "message-1",
+            "app:example",
+            "A title",
+            None,
+            &[],
+            false,
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+            &fields,
+        )
+        .unwrap();
+
+        assert_eq!(request["message"]["display_name"], display_name);
+        assert_eq!(request["message"]["sender_id"], "app:example");
+        assert_ne!(
+            request["message"]["display_name"],
+            request["message"]["sender_id"]
+        );
+
+        let empty = build_send_request_with_fields(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "message-2",
+            "app:example",
+            "Another title",
+            None,
+            &[],
+            false,
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+            &MessageFieldOptions {
+                display_name: Some(String::new()),
+                ..MessageFieldOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(empty["message"]["display_name"], "");
+    }
+
+    #[test]
     fn prepared_send_identity_distinguishes_seen_only_without_changing_default_retries() {
         let default = send_input_identity(
             "new",
@@ -4882,6 +4944,46 @@ mod tests {
         assert!(default.get("supersedes").is_none());
         assert_eq!(informational["informational"], true);
         assert_ne!(default, informational);
+
+        let named = send_input_identity_with_fields(
+            "new",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            false,
+            &[],
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+            &MessageFieldOptions {
+                display_name: Some("any / name\n".into()),
+                ..MessageFieldOptions::default()
+            },
+        );
+        let renamed = send_input_identity_with_fields(
+            "new",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            false,
+            &[],
+            None,
+            Some(OriginHarness::ClaudeCode),
+            false,
+            &[],
+            &MessageFieldOptions {
+                display_name: Some("different name".into()),
+                ..MessageFieldOptions::default()
+            },
+        );
+        assert_eq!(
+            named["message_field_options"]["display_name"],
+            "any / name\n"
+        );
+        assert_ne!(named, renamed);
 
         let replacing = send_input_identity(
             "new",
@@ -4952,6 +5054,7 @@ mod tests {
             by_when: Some("2026-10-30T22:00:00Z".into()),
             stake: Some("A one-week delay".into()),
             thread: Some("release".into()),
+            display_name: None,
             default_choice: Some("Ship".into()),
             default_at: Some("2026-10-30T23:00:00Z".into()),
             choice_styles: vec!["Ship=destructive".into()],
@@ -5002,6 +5105,7 @@ mod tests {
             by_when: Some("tomorrow".into()),
             stake: Some("".into()),
             thread: Some("".into()),
+            display_name: None,
             default_choice: Some("Later".into()),
             default_at: Some("bad-time".into()),
             choice_styles: vec!["Later=primary".into(), "Ship=urgent".into()],
