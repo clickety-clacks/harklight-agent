@@ -31,6 +31,11 @@ enum Command {
         session: Option<String>,
         #[arg(long, required_unless_present = "execute")]
         sender_id: Option<String>,
+        #[arg(
+            long,
+            help = "Display this exact string to the recipient, independent of sender-id authentication"
+        )]
+        display_name: Option<String>,
         #[arg(long, required_unless_present = "execute")]
         title: Option<String>,
         #[arg(long)]
@@ -300,6 +305,7 @@ fn main() {
         Command::Send {
             session,
             sender_id,
+            display_name,
             title,
             body,
             choices,
@@ -340,6 +346,7 @@ fn main() {
                 by_when,
                 stake,
                 thread,
+                display_name,
                 default_choice,
                 default_at,
                 choice_styles,
@@ -420,6 +427,7 @@ fn main() {
                 by_when,
                 stake,
                 thread: None,
+                display_name: None,
                 default_choice,
                 default_at,
                 choice_styles,
@@ -570,6 +578,35 @@ mod tests {
             cli.command,
             Command::Send { supersedes, .. }
                 if supersedes == vec!["earlier-1".to_string(), "earlier-2".to_string()]
+        ));
+    }
+
+    #[test]
+    fn send_accepts_an_arbitrary_display_name_string() {
+        let display_name = "  Mei\n/💧  ";
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--display-name",
+            display_name,
+            "--title",
+            "A title",
+            "--route",
+            "claude-code",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                sender_id: Some(sender_id),
+                display_name: Some(name),
+                ..
+            } if sender_id == "app:example" && name == display_name
         ));
     }
 
