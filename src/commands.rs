@@ -2445,11 +2445,15 @@ fn handle_operation_error_response(
     announce: bool,
 ) -> Result<Value, CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+    // OriginWire diagnoses storage_unavailable as unknown; its optional ref is
+    // only an echoed correlation value and is not part of that outcome.
+    let message_operation = matches!(operation.kind.as_str(), "send" | "revise");
     if reason == "storage_unavailable"
-        && matches!(
-            operation.kind.as_str(),
-            "attachment_update" | "attachment_support" | "support"
-        )
+        && (message_operation
+            || matches!(
+                operation.kind.as_str(),
+                "attachment_update" | "attachment_support" | "support"
+            ))
     {
         if announce {
             emit(&json!({
@@ -6960,6 +6964,102 @@ mod tests {
                     .unwrap();
             assert_eq!(retry.op_id, op_id, "{kind}");
             assert_eq!(retry.request, saved.request, "{kind}");
+        }
+    }
+
+    #[test]
+    fn ref_bearing_storage_unavailable_keeps_send_unknown_and_retries_saved_operation() {
+        for kind in ["send", "revise"] {
+            for with_ref in [false, true] {
+                let scratch = Scratch::new();
+                let session = Uuid::new_v4();
+                let op_id = Uuid::new_v4();
+                let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+                let mut request = match kind {
+                    "send" => build_send_request(
+                        op_id,
+                        session,
+                        "message-1",
+                        "app:test",
+                        "A request",
+                        Some("Please review"),
+                        &[],
+                        false,
+                        None,
+                        None,
+                        false,
+                        &[],
+                    )
+                    .unwrap(),
+                    "revise" => json!({
+                        "v":1,
+                        "type":"revise",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "base_revision":1,
+                        "message":{
+                            "sender_id":"app:test",
+                            "message_id":"message-1",
+                            "created_at":1,
+                            "title":"A revised request",
+                            "body":"Please review the updated plan"
+                        }
+                    }),
+                    _ => unreachable!(),
+                };
+                let ref_value = format!("{kind}-attempt-1");
+                let mut server_error = json!({"v":1,"type":"error","reason":"storage_unavailable"});
+                let mut success_response = json!({"v":1,"type":"ok","seq":1});
+                if with_ref {
+                    request["ref"] = json!(ref_value);
+                    server_error["ref"] = json!(ref_value);
+                    success_response["ref"] = json!(ref_value);
+                }
+                let transport = MockTransport::new([Ok(server_error), Ok(success_response)]);
+                let operation = store
+                    .prepare_operation(op_id, session, kind.into(), request.clone())
+                    .unwrap();
+
+                let error =
+                    submit_operation_inner(&transport, &mut store, operation, false).unwrap_err();
+                assert_eq!(
+                    error.exit_code, EXIT_OUTCOME_UNKNOWN,
+                    "{kind}, ref={with_ref}"
+                );
+                let saved = store.operation(op_id).unwrap().unwrap();
+                assert_eq!(saved.op_id, op_id, "{kind}, ref={with_ref}");
+                assert_eq!(
+                    saved.state,
+                    OperationState::Unknown,
+                    "{kind}, ref={with_ref}"
+                );
+                assert_eq!(saved.request, request, "{kind}, ref={with_ref}");
+                assert_eq!(
+                    *transport.posts.lock().unwrap(),
+                    vec![request.clone()],
+                    "{kind}, ref={with_ref}"
+                );
+
+                // This second submission models the explicit `retry --op-id` path:
+                // the journaled operation, idempotency key and inputs are unchanged.
+                let response =
+                    submit_operation_inner(&transport, &mut store, saved, false).unwrap();
+                assert_eq!(response["type"], "ok", "{kind}, ref={with_ref}");
+                assert_eq!(
+                    *transport.posts.lock().unwrap(),
+                    vec![request.clone(), request.clone()],
+                    "{kind}, ref={with_ref}"
+                );
+                let committed = store.operation(op_id).unwrap().unwrap();
+                assert_eq!(committed.op_id, op_id, "{kind}, ref={with_ref}");
+                assert_eq!(
+                    committed.state,
+                    OperationState::Committed,
+                    "{kind}, ref={with_ref}"
+                );
+                assert_eq!(committed.request, request, "{kind}, ref={with_ref}");
+            }
         }
     }
 
