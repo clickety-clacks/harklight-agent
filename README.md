@@ -94,7 +94,7 @@ Create a request and save the returned session handle:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --route claude-code --title "Choose the next step" \
+  --route claude-code --type request --reply --title "Choose the next step" \
   --body "Pick one option or write a note."
 ```
 
@@ -107,34 +107,53 @@ When a new message replaces earlier messages from the same sender, repeat
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --route claude-code --title "Updated plan" \
+  --route claude-code --type request --reply --title "Updated plan" \
   --supersedes "$EARLIER_ID_1" --supersedes "$EARLIER_ID_2"
 ```
 
 The server reports an odd or already closed target in `supersedes_warnings`;
 valid targets and the new message still post.
 
-Every new request carries an `attention-client.actions/1` answer descriptor.
-With no `--choice` options, the recipient gets a text Reply action. Repeated
-`--choice` options add one value action for each exact choice, followed by text
-Reply so the recipient can also answer in their own words:
+Messages can be untyped for compatibility, FYI, or requests. An untyped send
+continues to build its existing controls and prints a warning naming
+`--type request` and `--type fyi`; a later server stage may refuse untyped
+sends. `--type fyi` sends only the Seen action. A request needs at least one
+`--choice` or `--reply`. Each
+`--choice` adds one value action, and `--reply` adds a free-text Reply action:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --route claude-code --title "Choose the next step" \
-  --choice "Approve" --choice "Hold"
+  --route claude-code --type request --title "Choose the next step" \
+  --choice "Approve" --choice "Hold" --reply
 ```
 
-Use `--informational` for a notice that should offer only the exact Seen
-action. It cannot be combined with `--choice`:
+Use `--informational` as a compatibility spelling for `--type fyi`. FYIs
+cannot include choices, Reply, defaults, or choice styles. `--kind` may label a
+message as `blocker` or `success`. `--importance` sets the sender's view
+(`low`, `normal`, `high`, or `now`); Harklight's ranking decides the priority
+the recipient sees. The old `--urgency` spelling remains accepted temporarily
+and prints a warning to use `--importance`. Invalid importance or `--by-when`
+values are refused with a correction; `--by-when` takes an RFC 3339 timestamp.
+
+```sh
+harklight-agent send --session new --sender-id app:example \
+  --route claude-code --type fyi --kind success --importance normal \
+  --title "Update complete"
+```
+
+`--informational` sends the same FYI message as `--type fyi`:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
   --route claude-code --title "Update complete" --informational
 ```
 
-Revisions keep a valid answer descriptor. Replacing choices adds text Reply;
-`--clear-choices` leaves a text Reply action instead of removing the descriptor.
+Revisions keep the stored type and kind unless `--type` or `--kind` changes
+them. Untyped revisions keep today's automatic Reply behavior and preserve a
+stored Seen-only notice. Typed requests preserve their existing controls;
+`--reply` adds Reply, while replacing choices does not add Reply unless
+requested. `--type fyi` revises with only the Seen action and refuses
+answer-control flags.
 
 The route is required when creating the session handle and is stored with the
 CLI version in the server's listening-support record. When sending another
@@ -164,6 +183,12 @@ authenticated sending-session record before calling `--execute`. Execute
 accepts only the saved operation ID; it does not take replacement send inputs.
 It reports the existing `committed`, `refused` or `outcome_unknown` result. For
 an uncertain result, use `retry --op-id` with the same operation key.
+
+Only after a definite refusal (exit 2), correct the named input and submit a new
+send or revision. A prepared operation stays unchanged; use a new operation for
+the correction. For an unknown outcome (exit 7), retry only with
+`harklight-agent retry --op-id "$HARKLIGHT_OP_ID"` using the same key and
+unchanged inputs; do not submit a changed operation.
 
 ### Reattach an existing handle
 
@@ -293,7 +318,7 @@ listener instead of using the Claude Code one-shot waiter pattern:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --route other --controller \
+  --route other --controller --type request --reply \
   --title "Choose the next step" --body "Pick one option or write a note."
 harklight-agent listen --follow --controller --session "$HARKLIGHT_SESSION"
 ```

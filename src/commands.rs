@@ -28,6 +28,11 @@ pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageFieldOptions {
+    pub message_type: Option<String>,
+    pub message_kind: Option<String>,
+    pub reply: bool,
+    pub importance: Option<String>,
+    /// Deprecated CLI alias retained as a distinct input for its warning and migration behavior.
     pub urgency: Option<String>,
     pub by_when: Option<String>,
     pub stake: Option<String>,
@@ -41,7 +46,11 @@ pub struct MessageFieldOptions {
 
 impl MessageFieldOptions {
     fn has_any(&self) -> bool {
-        self.urgency.is_some()
+        self.message_type.is_some()
+            || self.message_kind.is_some()
+            || self.reply
+            || self.importance.is_some()
+            || self.urgency.is_some()
             || self.by_when.is_some()
             || self.stake.is_some()
             || self.thread.is_some()
@@ -65,6 +74,18 @@ impl MessageFieldOptions {
         });
         if let Some(display_name) = &self.display_name {
             identity["display_name"] = Value::String(display_name.clone());
+        }
+        if let Some(message_type) = &self.message_type {
+            identity["message_type"] = Value::String(message_type.clone());
+        }
+        if let Some(message_kind) = &self.message_kind {
+            identity["message_kind"] = Value::String(message_kind.clone());
+        }
+        if self.reply {
+            identity["reply"] = Value::Bool(true);
+        }
+        if let Some(importance) = &self.importance {
+            identity["importance"] = Value::String(importance.clone());
         }
         identity
     }
@@ -92,6 +113,7 @@ struct ChoiceTarget {
 struct NormalizedMessageFields {
     members: Map<String, Value>,
     warnings: Vec<String>,
+    errors: Vec<String>,
 }
 
 fn send_choice_targets(choices: &[String]) -> BTreeMap<String, ChoiceTarget> {
@@ -137,18 +159,22 @@ fn normalize_message_fields(
     options: &MessageFieldOptions,
     choices: &BTreeMap<String, ChoiceTarget>,
     include_thread: bool,
-    informational: bool,
 ) -> NormalizedMessageFields {
     let mut normalized = NormalizedMessageFields::default();
 
-    if let Some(urgency) = options.urgency.as_deref() {
-        if matches!(urgency, "low" | "normal" | "high" | "now") {
+    if options.importance.is_some() && options.urgency.is_some() {
+        normalized
+            .errors
+            .push("use only one of --importance or its deprecated alias --urgency".into());
+    }
+    if let Some(importance) = options.importance.as_deref().or(options.urgency.as_deref()) {
+        if matches!(importance, "low" | "normal" | "high" | "now") {
             normalized
                 .members
-                .insert("urgency".into(), Value::String(urgency.to_owned()));
+                .insert("urgency".into(), Value::String(importance.to_owned()));
         } else {
-            normalized.warnings.push(format!(
-                "--urgency value {urgency:?} is unsupported; leaving urgency out"
+            normalized.errors.push(format!(
+                "--importance must be one of low, normal, high, now; got {importance:?}"
             ));
         }
     }
@@ -165,12 +191,7 @@ fn normalize_message_fields(
             let target = choices.get(choice);
             let timestamp = parse_rfc3339_ms(at);
 
-            if informational {
-                normalized.warnings.push(
-                    "--default is not available on an informational message; leaving the default out"
-                        .into(),
-                );
-            } else if options.clear_default {
+            if options.clear_default {
                 normalized.warnings.push(
                     "--default conflicts with --clear-default; leaving the default out".into(),
                 );
@@ -202,8 +223,8 @@ fn normalize_message_fields(
                     .members
                     .insert("by_when".into(), Value::from(timestamp));
             }
-            None => normalized.warnings.push(format!(
-                "--by-when value {by_when:?} is not a valid RFC 3339 time; leaving by_when out"
+            None => normalized.errors.push(format!(
+                "--by-when must be a valid RFC 3339 time; got {by_when:?} (for example, 2026-11-01T17:00:00Z)"
             )),
         }
     }
@@ -265,6 +286,263 @@ fn normalize_message_fields(
     }
 
     normalized
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageType {
+    Fyi,
+    Request,
+}
+
+impl MessageType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fyi => "fyi",
+            Self::Request => "request",
+        }
+    }
+}
+
+fn parse_message_type(value: &str) -> Result<MessageType, CommandError> {
+    match value {
+        "fyi" => Ok(MessageType::Fyi),
+        "request" => Ok(MessageType::Request),
+        _ => Err(CommandError::new(
+            format!("--type must be fyi or request; got {value:?}"),
+            EXIT_REFUSED,
+        )),
+    }
+}
+
+fn send_message_type(
+    fields: &MessageFieldOptions,
+    informational: bool,
+) -> Result<Option<MessageType>, CommandError> {
+    let message_type = fields
+        .message_type
+        .as_deref()
+        .map(parse_message_type)
+        .transpose()?;
+    if informational && message_type == Some(MessageType::Request) {
+        return Err(CommandError::new(
+            "--informational means --type fyi: remove --informational to send a request, or use --type fyi",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(message_type.or_else(|| informational.then_some(MessageType::Fyi)))
+}
+
+fn revise_message_type(
+    current: &Value,
+    fields: &MessageFieldOptions,
+) -> Result<Option<MessageType>, CommandError> {
+    if let Some(message_type) = fields.message_type.as_deref() {
+        return parse_message_type(message_type).map(Some);
+    }
+    match current.get("message_type") {
+        None => Ok(None),
+        Some(Value::String(message_type)) => parse_message_type(message_type).map(Some),
+        Some(_) => Err(CommandError::new(
+            "stored message_type is invalid; revise with --type fyi or --type request",
+            EXIT_REFUSED,
+        )),
+    }
+}
+
+fn validate_message_kind(fields: &MessageFieldOptions) -> Result<(), CommandError> {
+    if let Some(kind) = fields.message_kind.as_deref()
+        && !matches!(kind, "blocker" | "success")
+    {
+        return Err(CommandError::new(
+            format!("--kind must be blocker or success, or left out; got {kind:?}"),
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_send_controls(
+    message_type: Option<MessageType>,
+    choices: &[String],
+    fields: &MessageFieldOptions,
+) -> Result<(), CommandError> {
+    match message_type {
+        Some(MessageType::Fyi) => {
+            if !choices.is_empty() {
+                return Err(CommandError::new(
+                    "--type fyi carries only the Seen acknowledgment: remove --choice, or use --type request",
+                    EXIT_REFUSED,
+                ));
+            }
+            if fields.reply {
+                return Err(CommandError::new(
+                    "--type fyi carries only the Seen acknowledgment: remove --reply, or use --type request",
+                    EXIT_REFUSED,
+                ));
+            }
+            if fields.default_choice.is_some() || fields.default_at.is_some() {
+                return Err(CommandError::new(
+                    "--type fyi carries only the Seen acknowledgment: remove --default and --default-at, or use --type request",
+                    EXIT_REFUSED,
+                ));
+            }
+            if !fields.choice_styles.is_empty() {
+                return Err(CommandError::new(
+                    "--type fyi carries only the Seen acknowledgment: remove --choice-style, or use --type request",
+                    EXIT_REFUSED,
+                ));
+            }
+        }
+        Some(MessageType::Request) => {
+            for (index, choice) in choices.iter().enumerate() {
+                if choice.trim().is_empty() {
+                    return Err(CommandError::new(
+                        "--choice must have a non-empty label; provide a label or remove --choice",
+                        EXIT_REFUSED,
+                    ));
+                }
+                if choices[..index].iter().any(|prior| prior == choice) {
+                    return Err(CommandError::new(
+                        format!(
+                            "--choice {choice:?} is repeated; remove the duplicate or use a distinct label"
+                        ),
+                        EXIT_REFUSED,
+                    ));
+                }
+            }
+            if choices.is_empty() && !fields.reply {
+                return Err(CommandError::new(
+                    "--type request needs at least one choice or a reply: add --choice <label> or --reply, or send as --type fyi",
+                    EXIT_REFUSED,
+                ));
+            }
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn validate_revision_controls(
+    message_type: Option<MessageType>,
+    choices: &[String],
+    clear_choices: bool,
+    fields: &MessageFieldOptions,
+) -> Result<(), CommandError> {
+    if message_type == Some(MessageType::Fyi) {
+        if !choices.is_empty() {
+            return Err(CommandError::new(
+                "--type fyi carries only the Seen acknowledgment: remove --choice, or revise as --type request",
+                EXIT_REFUSED,
+            ));
+        }
+        if clear_choices {
+            return Err(CommandError::new(
+                "--type fyi carries only the Seen acknowledgment: remove --clear-choices, or revise as --type request",
+                EXIT_REFUSED,
+            ));
+        }
+        if fields.reply {
+            return Err(CommandError::new(
+                "--type fyi carries only the Seen acknowledgment: remove --reply, or revise as --type request",
+                EXIT_REFUSED,
+            ));
+        }
+        if fields.default_choice.is_some() || fields.default_at.is_some() || fields.clear_default {
+            return Err(CommandError::new(
+                "--type fyi carries only the Seen acknowledgment: remove --default, --default-at and --clear-default, or revise as --type request",
+                EXIT_REFUSED,
+            ));
+        }
+        if !fields.choice_styles.is_empty() {
+            return Err(CommandError::new(
+                "--type fyi carries only the Seen acknowledgment: remove --choice-style, or revise as --type request",
+                EXIT_REFUSED,
+            ));
+        }
+    }
+    if message_type == Some(MessageType::Request) && clear_choices && !fields.reply {
+        return Err(CommandError::new(
+            "--type request needs at least one choice or a reply: add --choice <label> or --reply, or revise as --type fyi",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(())
+}
+
+fn first_field_error(normalized: &NormalizedMessageFields) -> Result<(), CommandError> {
+    if let Some(error) = normalized.errors.first() {
+        return Err(CommandError::new(error.clone(), EXIT_REFUSED));
+    }
+    Ok(())
+}
+
+fn validate_send_options(
+    choices: &[String],
+    informational: bool,
+    fields: &MessageFieldOptions,
+    include_thread: bool,
+) -> Result<(Option<MessageType>, NormalizedMessageFields), CommandError> {
+    let message_type = send_message_type(fields, informational)?;
+    validate_message_kind(fields)?;
+    validate_send_controls(message_type, choices, fields)?;
+    let answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
+    validate_typed_answer_ui(message_type, &answer_ui)?;
+    let normalized =
+        normalize_message_fields(fields, &send_choice_targets(choices), include_thread);
+    first_field_error(&normalized)?;
+    Ok((message_type, normalized))
+}
+
+fn validate_typed_answer_ui(
+    message_type: Option<MessageType>,
+    answer_ui: &Value,
+) -> Result<(), CommandError> {
+    match message_type {
+        Some(MessageType::Fyi) if *answer_ui != seen_answer_ui() => Err(CommandError::new(
+            "--type fyi carries only the Seen acknowledgment; revise with --type fyi to restore Seen, or use --type request with --choice or --reply",
+            EXIT_REFUSED,
+        )),
+        Some(MessageType::Request) => {
+            if answer_ui.is_null() {
+                return Err(CommandError::new(
+                    "--type request needs at least one choice or a reply: add --choice <label> or --reply, or revise as --type fyi",
+                    EXIT_REFUSED,
+                ));
+            }
+            if answer_ui["schema"] != ANSWER_UI_SCHEMA {
+                return Err(CommandError::new(
+                    "--type request supports only attention-client.actions/1 controls; replace them with --choice or --reply",
+                    EXIT_REFUSED,
+                ));
+            }
+            let Some(actions) = answer_ui["actions"].as_array() else {
+                return Err(CommandError::new(
+                    "--type request needs a usable actions/1 control: replace the controls with --choice or --reply",
+                    EXIT_REFUSED,
+                ));
+            };
+            if actions.is_empty() || actions.iter().all(|action| action["id"] == "seen") {
+                return Err(CommandError::new(
+                    "--type request needs at least one choice or a reply: add --choice <label> or --reply, or revise as --type fyi",
+                    EXIT_REFUSED,
+                ));
+            }
+            if !valid_typed_answer_ui_descriptor(answer_ui) {
+                return Err(CommandError::new(
+                    "--type request needs a usable actions/1 control: replace the controls with --choice or --reply",
+                    EXIT_REFUSED,
+                ));
+            }
+            if actions.iter().any(|action| action["id"] == "seen") {
+                return Err(CommandError::new(
+                    "--type request cannot carry the Seen action: replace the controls with --choice or --reply, or revise as --type fyi",
+                    EXIT_REFUSED,
+                ));
+            }
+            Ok(())
+        }
+        Some(MessageType::Fyi) | None => Ok(()),
+    }
 }
 
 fn parse_rfc3339_ms(value: &str) -> Option<i64> {
@@ -662,9 +940,12 @@ fn seen_answer_ui() -> Value {
     })
 }
 
-fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
+fn choices_answer_ui_with_reply(
+    choices: &[String],
+    include_reply: bool,
+) -> Result<Value, CommandError> {
     let mut seen = BTreeSet::new();
-    let mut actions = Vec::with_capacity(choices.len());
+    let mut actions = Vec::with_capacity(choices.len() + usize::from(include_reply));
     for (index, choice) in choices.iter().enumerate() {
         if choice.trim().is_empty() {
             return Err(CommandError::new(
@@ -685,21 +966,61 @@ fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
             "value": choice
         }));
     }
-    actions.push(text_reply_action());
+    if include_reply {
+        actions.push(text_reply_action());
+    }
     Ok(json!({ "schema": ANSWER_UI_SCHEMA, "actions": actions }))
 }
 
-fn answer_ui_for_send(choices: &[String], informational: bool) -> Result<Value, CommandError> {
-    if informational {
-        if !choices.is_empty() {
-            return Err(CommandError::new(
-                "--informational cannot be combined with --choice",
-                EXIT_REFUSED,
-            ));
-        }
-        return Ok(seen_answer_ui());
+fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
+    choices_answer_ui_with_reply(choices, true)
+}
+
+fn answer_ui_for_send(
+    choices: &[String],
+    message_type: Option<MessageType>,
+    reply: bool,
+) -> Result<Value, CommandError> {
+    match message_type {
+        Some(MessageType::Fyi) => Ok(seen_answer_ui()),
+        Some(MessageType::Request) => choices_answer_ui_with_reply(choices, reply),
+        None => choices_answer_ui(choices),
     }
-    choices_answer_ui(choices)
+}
+
+fn valid_typed_answer_ui_descriptor(answer_ui: &Value) -> bool {
+    if !has_exact_members(answer_ui, &["schema", "actions"])
+        || answer_ui["schema"] != ANSWER_UI_SCHEMA
+    {
+        return false;
+    }
+    let Some(actions) = answer_ui["actions"].as_array() else {
+        return false;
+    };
+    if actions.is_empty() {
+        return false;
+    }
+
+    let mut ids = BTreeSet::new();
+    actions.iter().all(|action| {
+        if !action.is_object() {
+            return false;
+        }
+        let Some(id) = action["id"].as_str() else {
+            return false;
+        };
+        let Some(label) = action["label"].as_str() else {
+            return false;
+        };
+        if id.is_empty() || label.is_empty() || !ids.insert(id) {
+            return false;
+        }
+        match action["kind"].as_str() {
+            Some("text") => has_exact_members(action, &["id", "label", "kind"]),
+            Some("value") => has_exact_members(action, &["id", "label", "kind", "value"]),
+            _ => false,
+        }
+    })
 }
 
 fn valid_answer_ui(answer_ui: &Value) -> bool {
@@ -732,27 +1053,53 @@ fn valid_answer_ui(answer_ui: &Value) -> bool {
     })
 }
 
-fn answer_ui_for_revision(current: &Value) -> Result<Value, CommandError> {
+fn has_exact_members(value: &Value, members: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == members.len() && members.iter().all(|member| object.contains_key(*member))
+}
+
+fn answer_ui_for_revision(
+    current: &Value,
+    add_reply: bool,
+    strict: bool,
+) -> Result<Value, CommandError> {
     if let Some(answer_ui) = current.get("answer_ui") {
-        if !valid_answer_ui(answer_ui) {
-            return Err(CommandError::new(
-                "current request has an invalid attention-client.actions/1 descriptor; refusing to revise",
-                EXIT_REFUSED,
-            ));
+        let valid = if strict {
+            valid_typed_answer_ui_descriptor(answer_ui)
+        } else {
+            valid_answer_ui(answer_ui)
+        };
+        if !valid {
+            let message = if strict {
+                "current answer controls are unsupported or invalid; replace them with --choice <label>, or use --clear-choices --reply"
+            } else {
+                "current request has an invalid attention-client.actions/1 descriptor; refusing to revise"
+            };
+            return Err(CommandError::new(message, EXIT_REFUSED));
         }
         let actions = answer_ui["actions"].as_array().unwrap();
         if actions.len() == 1 && actions[0] == seen_answer_ui()["actions"][0] {
-            return Ok(answer_ui.clone());
+            return Ok(if add_reply && strict {
+                text_reply_answer_ui()
+            } else {
+                answer_ui.clone()
+            });
         }
 
         let mut actions = actions.clone();
-        if !actions.iter().any(|action| action["kind"] == "text") {
+        if add_reply && !actions.iter().any(|action| action["kind"] == "text") {
             actions.push(text_reply_action());
         }
         return Ok(json!({"schema":ANSWER_UI_SCHEMA,"actions":actions}));
     }
 
-    Ok(text_reply_answer_ui())
+    Ok(if add_reply {
+        text_reply_answer_ui()
+    } else {
+        Value::Null
+    })
 }
 
 /// Builds the revised message from the current one: `--choice` replaces the
@@ -791,12 +1138,32 @@ fn revised_message_with_fields(
             EXIT_REFUSED,
         ));
     }
-    let answer_ui = if clear_choices {
-        text_reply_answer_ui()
-    } else if !choices.is_empty() {
-        choices_answer_ui(choices)?
-    } else {
-        answer_ui_for_revision(current)?
+    let message_type = revise_message_type(current, fields)?;
+    validate_message_kind(fields)?;
+    validate_revision_controls(message_type, choices, clear_choices, fields)?;
+
+    let answer_ui = match message_type {
+        Some(MessageType::Fyi) => {
+            if fields.message_type.as_deref() == Some("fyi") {
+                seen_answer_ui()
+            } else {
+                answer_ui_for_revision(current, false, true)?
+            }
+        }
+        Some(MessageType::Request) => {
+            if clear_choices {
+                text_reply_answer_ui()
+            } else if !choices.is_empty() {
+                choices_answer_ui_with_reply(choices, fields.reply)?
+            } else if fields.reply {
+                answer_ui_for_revision(current, true, true)?
+            } else {
+                answer_ui_for_revision(current, false, true)?
+            }
+        }
+        None if clear_choices => text_reply_answer_ui(),
+        None if !choices.is_empty() => choices_answer_ui(choices)?,
+        None => answer_ui_for_revision(current, true, false)?,
     };
     let replacing_choices = clear_choices || !choices.is_empty();
     let mut message = current.clone();
@@ -805,10 +1172,21 @@ fn revised_message_with_fields(
     if let Some(body) = body {
         message["body"] = Value::String(body.to_owned());
     }
+    if let Some(message_type) = message_type {
+        message["message_type"] = Value::String(message_type.as_str().to_owned());
+    }
+    if let Some(message_kind) = fields.message_kind.as_deref() {
+        message["message_kind"] = Value::String(message_kind.to_owned());
+    }
     if let Some(object) = message.as_object_mut() {
         object.remove("choices");
+        if message_type == Some(MessageType::Fyi) {
+            object.remove("default");
+            object.remove("choice_styles");
+        }
     }
     message["answer_ui"] = answer_ui;
+    validate_typed_answer_ui(message_type, &message["answer_ui"])?;
     if replacing_choices {
         if let Some(object) = message.as_object_mut() {
             object.remove("default");
@@ -834,9 +1212,9 @@ fn revised_message_with_fields(
         &options,
         &answer_ui_choice_targets(&message["answer_ui"]),
         false,
-        message["answer_ui"] == seen_answer_ui(),
     );
     warnings.extend(normalized.warnings.iter().cloned());
+    first_field_error(&normalized)?;
     let normalized_members = normalized.members;
     for (field, value) in &normalized_members {
         message[field] = value.clone();
@@ -844,7 +1222,7 @@ fn revised_message_with_fields(
 
     // A valid member supplied on a revise replaces its prior value. An invalid
     // member is treated as absent, preserving the prior revision's value.
-    for field in ["urgency", "by_when", "stake"] {
+    for field in ["stake"] {
         if let Some(raw) = options_field(&options, field) {
             if !normalized_member_is_valid(field, raw) {
                 if let Some(old_value) = current.get(field) {
@@ -874,7 +1252,7 @@ fn revised_message_with_fields(
 
 fn options_field<'a>(options: &'a MessageFieldOptions, field: &str) -> Option<&'a str> {
     match field {
-        "urgency" => options.urgency.as_deref(),
+        "urgency" => options.importance.as_deref().or(options.urgency.as_deref()),
         "by_when" => options.by_when.as_deref(),
         "stake" => options.stake.as_deref(),
         _ => None,
@@ -1069,10 +1447,9 @@ pub fn send_with_fields(
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
-    answer_ui_for_send(choices, informational)?;
-    let choice_targets = send_choice_targets(choices);
-    let normalized = normalize_message_fields(fields, &choice_targets, true, informational);
+    let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
+    let _answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
     let mut file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
@@ -1196,9 +1573,8 @@ fn build_send_request_with_fields(
     file_entries: &[Value],
     fields: &MessageFieldOptions,
 ) -> Result<Value, CommandError> {
-    let answer_ui = answer_ui_for_send(choices, informational)?;
-    let normalized =
-        normalize_message_fields(fields, &send_choice_targets(choices), true, informational);
+    let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
+    let answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
     let mut message = json!({
         "sender_id": sender_id,
         "message_id": message_id,
@@ -1207,6 +1583,12 @@ fn build_send_request_with_fields(
     });
     if let Some(body) = body {
         message["body"] = Value::String(body.to_owned());
+    }
+    if let Some(message_type) = message_type {
+        message["message_type"] = Value::String(message_type.as_str().to_owned());
+    }
+    if let Some(message_kind) = fields.message_kind.as_deref() {
+        message["message_kind"] = Value::String(message_kind.to_owned());
     }
     message["answer_ui"] = answer_ui;
     if let Some(display_name) = &fields.display_name {
@@ -1363,10 +1745,9 @@ pub fn prepare_send_with_fields(
     if op_id.get_version_num() != 4 {
         return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
     }
-    answer_ui_for_send(choices, informational)?;
-    let normalized =
-        normalize_message_fields(fields, &send_choice_targets(choices), true, informational);
+    let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
+    let _answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
     let route = validate_send_route(session_arg, route, controller)?;
     let global = context.open_global_store()?;
 
@@ -2334,7 +2715,7 @@ pub fn revise_with_fields(
             1,
         ));
     }
-    let file_draft = json!({
+    let mut file_draft = json!({
         "request":request_id,
         "base_revision":base_revision,
         "title":title,
@@ -2343,6 +2724,7 @@ pub fn revise_with_fields(
         "clear_choices":clear_choices,
         "in_reply_to":in_reply_to
     });
+    add_field_options_identity(&mut file_draft, fields);
     let mut store = context.open_store(session)?;
     let snapshot = store
         .request_snapshot(session, request_id, in_reply_to)
@@ -4462,6 +4844,16 @@ mod tests {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
         let op_id = Uuid::new_v4();
+        let choices = vec!["Approve".to_string(), "Hold".to_string()];
+        let fields = MessageFieldOptions {
+            message_type: Some("request".into()),
+            message_kind: Some("blocker".into()),
+            reply: true,
+            importance: Some("high".into()),
+            by_when: Some("2026-11-01T17:00:00Z".into()),
+            stake: Some("A one-week delay".into()),
+            ..MessageFieldOptions::default()
+        };
         let path = scratch.0.join("attachment.txt");
         std::fs::write(&path, b"stable staged bytes").unwrap();
         let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
@@ -4483,34 +4875,36 @@ mod tests {
             },
         )
         .unwrap();
-        let request = build_send_request(
+        let request = build_send_request_with_fields(
             op_id,
             session,
             "message-1",
             "app:example",
             "A title",
             Some("A body"),
-            &[],
+            &choices,
             false,
             None,
             None,
             false,
             &prepared_files.entries,
+            &fields,
         )
         .unwrap();
         let manifest = prepared_files.manifest.clone();
-        let inputs = send_input_identity(
+        let inputs = send_input_identity_with_fields(
             "new",
             "app:example",
             "A title",
             Some("A body"),
-            &[],
+            &choices,
             false,
             &[],
             None,
             None,
             false,
             &manifest,
+            &fields,
         );
         let operation = prepared_send_record(
             &mut store,
@@ -4527,7 +4921,23 @@ mod tests {
         assert_eq!(operation.prepared_send.as_ref().unwrap().request, request);
         assert_eq!(
             operation.prepared_send.as_ref().unwrap().request["message"]["answer_ui"],
-            text_reply_answer_ui()
+            choices_answer_ui_with_reply(&choices, true).unwrap()
+        );
+        assert_eq!(request["message"]["message_type"], "request");
+        assert_eq!(request["message"]["message_kind"], "blocker");
+        assert_eq!(request["message"]["urgency"], "high");
+        assert_eq!(
+            request["message"]["by_when"],
+            parse_rfc3339_ms("2026-11-01T17:00:00Z").unwrap()
+        );
+        assert_eq!(request["message"]["stake"], "A one-week delay");
+        assert_eq!(
+            operation.prepared_send.as_ref().unwrap().inputs["message_field_options"]["message_type"],
+            "request"
+        );
+        assert_eq!(
+            operation.prepared_send.as_ref().unwrap().inputs["message_field_options"]["importance"],
+            "high"
         );
         assert_eq!(operation.prepared_send.as_ref().unwrap().files, manifest);
         assert_eq!(operation.request["files"][0]["upload_pending"], true);
@@ -4537,19 +4947,20 @@ mod tests {
             b"stable staged bytes"
         );
 
-        let resumed_request = build_send_request(
+        let resumed_request = build_send_request_with_fields(
             op_id,
             Uuid::new_v4(),
             "a-new-generated-message-id",
             "app:example",
             "A title",
             Some("A body"),
-            &[],
+            &choices,
             false,
             None,
             None,
             false,
             &prepared_files.entries,
+            &fields,
         )
         .unwrap();
         let resumed = prepared_send_record(
@@ -4803,6 +5214,7 @@ mod tests {
         .unwrap();
         assert_eq!(plain["type"], "send");
         assert!(plain["message"].get("supersedes").is_none());
+        assert!(plain["message"].get("message_type").is_none());
         let superseding = with_supersedes(
             plain.clone(),
             &["earlier-1".to_string(), "earlier-2".to_string()],
@@ -4852,11 +5264,116 @@ mod tests {
         )
         .unwrap();
         assert_eq!(informational["message"]["answer_ui"], seen_answer_ui());
+        assert_eq!(informational["message"]["message_type"], "fyi");
         assert_eq!(
             informational["message"]["answer_ui"]["actions"],
             json!([{"id":"seen","label":"Seen","kind":"value","value":{"acknowledgment":"seen"}}])
         );
-        assert!(answer_ui_for_send(&choices, true).is_err());
+        assert!(
+            validate_send_controls(
+                Some(MessageType::Fyi),
+                &choices,
+                &MessageFieldOptions::default()
+            )
+            .is_err()
+        );
+
+        let typed_fyi = build_send_request_with_fields(
+            Uuid::new_v4(),
+            session,
+            "typed-fyi",
+            "app:example",
+            "A notice",
+            None,
+            &[],
+            false,
+            None,
+            None,
+            false,
+            &[],
+            &MessageFieldOptions {
+                message_type: Some("fyi".into()),
+                message_kind: Some("success".into()),
+                ..MessageFieldOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(typed_fyi["message"]["message_type"], "fyi");
+        assert_eq!(typed_fyi["message"]["message_kind"], "success");
+        assert_eq!(typed_fyi["message"]["answer_ui"], seen_answer_ui());
+
+        let typed_request_fields = MessageFieldOptions {
+            message_type: Some("request".into()),
+            message_kind: Some("blocker".into()),
+            importance: Some("high".into()),
+            ..MessageFieldOptions::default()
+        };
+        let typed_request = build_send_request_with_fields(
+            Uuid::new_v4(),
+            session,
+            "typed-request",
+            "app:example",
+            "Choose one",
+            None,
+            &choices,
+            false,
+            None,
+            None,
+            false,
+            &[],
+            &typed_request_fields,
+        )
+        .unwrap();
+        assert_eq!(typed_request["message"]["message_type"], "request");
+        assert_eq!(typed_request["message"]["message_kind"], "blocker");
+        assert_eq!(typed_request["message"]["urgency"], "high");
+        assert_eq!(
+            typed_request["message"]["answer_ui"]["actions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            typed_request["message"]["answer_ui"]["actions"][0]["id"],
+            "choice-1"
+        );
+        assert_eq!(
+            typed_request["message"]["answer_ui"]["actions"][1]["id"],
+            "choice-2"
+        );
+
+        let reply_fields = MessageFieldOptions {
+            reply: true,
+            ..typed_request_fields.clone()
+        };
+        let typed_request_with_reply = build_send_request_with_fields(
+            Uuid::new_v4(),
+            session,
+            "typed-request-with-reply",
+            "app:example",
+            "Choose one",
+            None,
+            &choices,
+            false,
+            None,
+            None,
+            false,
+            &[],
+            &reply_fields,
+        )
+        .unwrap();
+        assert_eq!(
+            typed_request_with_reply["message"]["answer_ui"]["actions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            typed_request_with_reply["message"]["answer_ui"]["actions"][2]["id"],
+            "reply"
+        );
     }
 
     #[test]
@@ -5050,7 +5567,7 @@ mod tests {
     fn send_field_options_become_top_level_members_and_styles_map_to_choice_ids() {
         let choices = vec!["Hold".to_string(), "Ship".to_string()];
         let fields = MessageFieldOptions {
-            urgency: Some("high".into()),
+            importance: Some("high".into()),
             by_when: Some("2026-10-30T22:00:00Z".into()),
             stake: Some("A one-week delay".into()),
             thread: Some("release".into()),
@@ -5059,6 +5576,7 @@ mod tests {
             default_at: Some("2026-10-30T23:00:00Z".into()),
             choice_styles: vec!["Ship=destructive".into()],
             clear_default: false,
+            ..MessageFieldOptions::default()
         };
 
         let request = build_send_request_with_fields(
@@ -5098,10 +5616,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_send_fields_are_left_out_with_flag_specific_warnings_in_contract_order() {
+    fn invalid_importance_and_by_when_are_errors_while_other_optional_fields_warn() {
         let choices = vec!["Hold".to_string(), "Ship".to_string()];
         let options = MessageFieldOptions {
-            urgency: Some("urgent".into()),
+            importance: Some("urgent".into()),
             by_when: Some("tomorrow".into()),
             stake: Some("".into()),
             thread: Some("".into()),
@@ -5110,19 +5628,24 @@ mod tests {
             default_at: Some("bad-time".into()),
             choice_styles: vec!["Later=primary".into(), "Ship=urgent".into()],
             clear_default: false,
+            ..MessageFieldOptions::default()
         };
 
-        let normalized =
-            normalize_message_fields(&options, &send_choice_targets(&choices), true, false);
+        let normalized = normalize_message_fields(&options, &send_choice_targets(&choices), true);
 
         assert!(normalized.members.is_empty());
         assert_eq!(
+            normalized.errors,
+            vec![
+                "--importance must be one of low, normal, high, now; got \"urgent\"",
+                "--by-when must be a valid RFC 3339 time; got \"tomorrow\" (for example, 2026-11-01T17:00:00Z)"
+            ]
+        );
+        assert_eq!(
             normalized.warnings,
             vec![
-                "--urgency value \"urgent\" is unsupported; leaving urgency out",
                 "--default choice \"Later\" does not name a choice; leaving the default out",
                 "--default-at value \"bad-time\" is not a valid RFC 3339 time; leaving the default out",
-                "--by-when value \"tomorrow\" is not a valid RFC 3339 time; leaving by_when out",
                 "--thread is empty; leaving thread out",
                 "--choice-style choice \"Later\" does not name a choice; leaving this style out",
                 "--choice-style value \"Ship=urgent\" has an unsupported style; leaving this style out",
@@ -5132,7 +5655,92 @@ mod tests {
     }
 
     #[test]
-    fn revise_preserves_existing_members_when_invalid_flags_are_ignored() {
+    fn typed_send_validation_uses_route_specific_fix_it_errors() {
+        let choices = vec!["Approve".to_string()];
+        let fyi = MessageFieldOptions {
+            message_type: Some("fyi".into()),
+            ..MessageFieldOptions::default()
+        };
+        assert_eq!(
+            validate_send_options(&choices, false, &fyi, true)
+                .unwrap_err()
+                .message,
+            "--type fyi carries only the Seen acknowledgment: remove --choice, or use --type request"
+        );
+
+        let reply_on_fyi = MessageFieldOptions {
+            message_type: Some("fyi".into()),
+            reply: true,
+            ..MessageFieldOptions::default()
+        };
+        assert!(
+            validate_send_options(&[], false, &reply_on_fyi, true)
+                .unwrap_err()
+                .message
+                .contains("remove --reply")
+        );
+
+        let request_without_controls = MessageFieldOptions {
+            message_type: Some("request".into()),
+            ..MessageFieldOptions::default()
+        };
+        assert_eq!(
+            validate_send_options(&[], false, &request_without_controls, true)
+                .unwrap_err()
+                .message,
+            "--type request needs at least one choice or a reply: add --choice <label> or --reply, or send as --type fyi"
+        );
+
+        let informational_request = MessageFieldOptions {
+            message_type: Some("request".into()),
+            ..MessageFieldOptions::default()
+        };
+        assert_eq!(
+            send_message_type(&informational_request, true)
+                .unwrap_err()
+                .message,
+            "--informational means --type fyi: remove --informational to send a request, or use --type fyi"
+        );
+
+        assert_eq!(
+            validate_send_options(&["  ".into()], false, &request_without_controls, true)
+                .unwrap_err()
+                .message,
+            "--choice must have a non-empty label; provide a label or remove --choice"
+        );
+        assert_eq!(
+            validate_send_options(
+                &["Approve".into(), "Approve".into()],
+                false,
+                &request_without_controls,
+                true,
+            )
+            .unwrap_err()
+            .message,
+            "--choice \"Approve\" is repeated; remove the duplicate or use a distinct label"
+        );
+
+        let invalid_kind = MessageFieldOptions {
+            message_kind: Some("update".into()),
+            ..MessageFieldOptions::default()
+        };
+        assert_eq!(
+            validate_message_kind(&invalid_kind).unwrap_err().message,
+            "--kind must be blocker or success, or left out; got \"update\""
+        );
+
+        let legacy_urgency = MessageFieldOptions {
+            urgency: Some("now".into()),
+            ..MessageFieldOptions::default()
+        };
+        let normalized = validate_send_options(&[], false, &legacy_urgency, true)
+            .unwrap()
+            .1;
+        assert_eq!(normalized.members["urgency"], "now");
+    }
+
+    #[test]
+    fn revise_preserves_existing_members_when_other_optional_fields_warn() {
         let answer_ui = choices_answer_ui(&["Hold".into(), "Ship".into()]).unwrap();
         let current = json!({
             "sender_id":"app:example",
@@ -5148,8 +5756,6 @@ mod tests {
             "choice_styles":{"choice-2":"primary"}
         });
         let fields = MessageFieldOptions {
-            urgency: Some("urgent".into()),
-            by_when: Some("bad-time".into()),
             stake: Some("".into()),
             default_choice: Some("Missing".into()),
             default_at: Some("bad-time".into()),
@@ -5166,7 +5772,7 @@ mod tests {
         assert_eq!(revised["thread"], "release");
         assert_eq!(revised["default"], current["default"]);
         assert_eq!(revised["choice_styles"], current["choice_styles"]);
-        assert_eq!(warnings.len(), 6);
+        assert_eq!(warnings.len(), 4);
 
         let replaced = revised_message_with_fields(
             &current,
@@ -5195,6 +5801,185 @@ mod tests {
         .unwrap()
         .0;
         assert!(cleared.get("default").is_none());
+    }
+
+    #[test]
+    fn typed_revise_preserves_kind_and_controls_without_adding_unrequested_reply() {
+        let current = json!({
+            "title":"Old title",
+            "message_type":"request",
+            "message_kind":"blocker",
+            "default":{"value":"Approve","at":9999999999999_i64},
+            "choice_styles":{"choice-1":"primary"},
+            "answer_ui":choices_answer_ui_with_reply(&["Approve".into()], false).unwrap()
+        });
+
+        let kept = revised_message_with_fields(
+            &current,
+            "Retitled",
+            None,
+            &[],
+            false,
+            &MessageFieldOptions::default(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(kept["message_type"], "request");
+        assert_eq!(kept["message_kind"], "blocker");
+        assert_eq!(kept["answer_ui"]["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(kept["answer_ui"]["actions"][0]["id"], "choice-1");
+
+        let with_reply = revised_message_with_fields(
+            &current,
+            "Retitled with Reply",
+            None,
+            &[],
+            false,
+            &MessageFieldOptions {
+                reply: true,
+                ..MessageFieldOptions::default()
+            },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            with_reply["answer_ui"]["actions"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(with_reply["answer_ui"]["actions"][1]["id"], "reply");
+
+        let replacement = revised_message_with_fields(
+            &current,
+            "New choice",
+            None,
+            &["Hold".into()],
+            false,
+            &MessageFieldOptions::default(),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            replacement["answer_ui"]["actions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(replacement["answer_ui"]["actions"][0]["id"], "choice-1");
+
+        let fyi = revised_message_with_fields(
+            &current,
+            "Information only",
+            None,
+            &[],
+            false,
+            &MessageFieldOptions {
+                message_type: Some("fyi".into()),
+                ..MessageFieldOptions::default()
+            },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(fyi["message_type"], "fyi");
+        assert_eq!(fyi["message_kind"], "blocker");
+        assert_eq!(fyi["answer_ui"], seen_answer_ui());
+        assert!(fyi.get("default").is_none());
+        assert!(fyi.get("choice_styles").is_none());
+
+        let back_to_request = revised_message_with_fields(
+            &fyi,
+            "Need a response",
+            None,
+            &[],
+            false,
+            &MessageFieldOptions {
+                message_type: Some("request".into()),
+                reply: true,
+                ..MessageFieldOptions::default()
+            },
+        )
+        .unwrap()
+        .0;
+        assert_eq!(back_to_request["message_type"], "request");
+        assert_eq!(back_to_request["message_kind"], "blocker");
+        assert_eq!(back_to_request["answer_ui"], text_reply_answer_ui());
+    }
+
+    #[test]
+    fn typed_revise_refuses_invalid_effective_controls_and_fields() {
+        let current_request = json!({"message_type":"request"});
+        assert_eq!(
+            revised_message_with_fields(
+                &current_request,
+                "Still needs an answer",
+                None,
+                &[],
+                false,
+                &MessageFieldOptions::default(),
+            )
+            .unwrap_err()
+            .message,
+            "--type request needs at least one choice or a reply: add --choice <label> or --reply, or revise as --type fyi"
+        );
+
+        let current_fyi = json!({"message_type":"fyi","answer_ui":seen_answer_ui()});
+        assert!(
+            revised_message_with_fields(
+                &current_fyi,
+                "Not just information",
+                None,
+                &["Answer".into()],
+                false,
+                &MessageFieldOptions::default(),
+            )
+            .unwrap_err()
+            .message
+            .contains("remove --choice")
+        );
+
+        let unsupported_request = json!({
+            "message_type":"request",
+            "answer_ui":{
+                "schema":"attention-client.actions/1",
+                "actions":[{"id":"reply","label":"Reply","kind":"text","extra":true}]
+            }
+        });
+        assert!(
+            revised_message_with_fields(
+                &unsupported_request,
+                "Repair controls",
+                None,
+                &[],
+                false,
+                &MessageFieldOptions::default(),
+            )
+            .unwrap_err()
+            .message
+            .contains("replace them with --choice <label>")
+        );
+
+        let invalid_type = MessageFieldOptions {
+            message_type: Some("notice".into()),
+            ..MessageFieldOptions::default()
+        };
+        assert_eq!(
+            revised_message_with_fields(&json!({}), "t", None, &[], false, &invalid_type)
+                .unwrap_err()
+                .message,
+            "--type must be fyi or request; got \"notice\""
+        );
+
+        let invalid_by_when = MessageFieldOptions {
+            importance: Some("urgent".into()),
+            by_when: Some("tomorrow".into()),
+            ..MessageFieldOptions::default()
+        };
+        assert!(
+            revised_message_with_fields(&json!({}), "t", None, &[], false, &invalid_by_when,)
+                .unwrap_err()
+                .message
+                .contains("--importance must be one of")
+        );
     }
 
     #[test]
