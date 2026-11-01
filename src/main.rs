@@ -139,6 +139,17 @@ enum Command {
         #[arg(long)]
         controller: bool,
     },
+    /// Replace this existing origin handle's transport and resume its saved feed.
+    Reconnect {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long, value_name = "ID|none", requires = "route")]
+        vendor_session_id: Option<String>,
+        #[arg(long, value_enum, requires = "vendor_session_id")]
+        route: Option<Route>,
+        #[arg(long, requires = "route")]
+        controller: bool,
+    },
     Listen(ListenArgs),
     Read {
         #[arg(long)]
@@ -366,7 +377,13 @@ fn main() {
         cli.state_dir.as_deref(),
     ) {
         Ok(context) => context,
-        Err(error) => fail(error.to_string(), 1),
+        Err(error) => {
+            if let Command::Reconnect { session, .. } = &cli.command {
+                let safe = commands::reconnect_configuration_error(*session);
+                fail(safe.message, safe.exit_code);
+            }
+            fail(error.to_string(), 1)
+        }
     };
 
     let result = match cli.command {
@@ -452,6 +469,18 @@ fn main() {
             session,
             &vendor_session_id,
             route.into(),
+            controller,
+        ),
+        Command::Reconnect {
+            session,
+            vendor_session_id,
+            route,
+            controller,
+        } => commands::reconnect(
+            &context,
+            session,
+            vendor_session_id.as_deref(),
+            route.map(Into::into),
             controller,
         ),
         Command::Listen(args) => commands::listen(

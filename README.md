@@ -282,6 +282,35 @@ Check session availability and pending counts with:
 harklight-agent status --session "$HARKLIGHT_SESSION"
 ```
 
+To replace an existing origin handle's reply transport, stop and observe your
+previous owned worker, then run:
+
+```sh
+harklight-agent reconnect --session "$HARKLIGHT_SESSION" \
+  --vendor-session-id none --route other --controller
+```
+
+Use the existing vendor session ID in place of `none` when applicable. With only
+`--session`, reconnect uses the confirmed attachment and route in the same-origin
+journal. It refuses a missing attachment or a held listener lock. It does not
+create a session, move its origin, resend a message, or replay reply/result
+operations. Uncertain attachment/support operations first recover with their
+original keys and inputs.
+
+Reconnect makes one transport attempt. After the real SSE handshake and feed
+reconciliation, it prints `kind: "reconnected"` with `session_handle` and the
+durable origin-wide `feed_cursor`, then streams the usual pending event lines.
+An idle conversation prints `kind: "idle"` instead. Pending entries can be
+re-offered with the same IDs and delivered/acted flags; consumers must retain
+their capture and action receipts. A stream failure ends the worker rather than
+starting a hidden retry loop. Standalone `listen` retains its retry behavior.
+
+Failures print `refused`, `outcome_unknown`, or `connection_error` with a stage,
+safe reason code/text/source and the saved `op_id` when applicable. An unknown
+reason stays explicit; raw response text and credential/path details are not
+diagnostics. Attachment metadata and status `listening` do not prove that a
+transport is live.
+
 The main command forms are:
 
 ```sh
