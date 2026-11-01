@@ -2445,9 +2445,12 @@ fn handle_operation_error_response(
     announce: bool,
 ) -> Result<Value, CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
-    // OriginWire diagnoses storage_unavailable as unknown; its optional ref is
-    // only an echoed correlation value and is not part of that outcome.
-    let message_operation = matches!(operation.kind.as_str(), "send" | "revise");
+    // OriginWire returns storage_unavailable for all five message commands;
+    // its optional ref is only an echoed correlation value, not part of the outcome.
+    let message_operation = matches!(
+        operation.kind.as_str(),
+        "send" | "revise" | "reply" | "withdraw" | "result"
+    );
     if reason == "storage_unavailable"
         && (message_operation
             || matches!(
@@ -3674,13 +3677,13 @@ fn reconcile_listen_operations(
         .map_err(|error| journal_error(error, 1))?;
     operations.sort_by_key(|operation| (operation.created_at_ms, operation.op_id));
     for operation in operations {
-        // User actions require an explicit command, even when they are only prepared.
+        // Message operations require an explicit command, even when only prepared.
         if matches!(
             operation.state,
             OperationState::Prepared | OperationState::Unknown
         ) && matches!(
             operation.kind.as_str(),
-            "send" | "revise" | "reply" | "withdraw" | "result" | "file_use"
+            "send" | "revise" | "reply" | "withdraw" | "result"
         ) {
             continue;
         }
@@ -7082,13 +7085,85 @@ mod tests {
     }
 
     #[test]
+    fn origin_storage_unavailable_keeps_reply_withdraw_and_result_unknown() {
+        for kind in ["reply", "withdraw", "result"] {
+            for with_ref in [false, true] {
+                let scratch = Scratch::new();
+                let session = Uuid::new_v4();
+                let op_id = Uuid::new_v4();
+                let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+                let mut request = match kind {
+                    "reply" => json!({
+                        "v":1,
+                        "type":"reply",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "request_revision":1,
+                        "in_reply_to":"1",
+                        "text":"A reply"
+                    }),
+                    "withdraw" => json!({
+                        "v":1,
+                        "type":"withdraw",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1"
+                    }),
+                    "result" => json!({
+                        "v":1,
+                        "type":"result",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "in_reply_to":"1",
+                        "status":"applied"
+                    }),
+                    _ => unreachable!(),
+                };
+                let ref_value = format!("{kind}-attempt-1");
+                let mut server_error = json!({"v":1,"type":"error","reason":"storage_unavailable"});
+                if with_ref {
+                    request["ref"] = json!(ref_value);
+                    server_error["ref"] = json!(ref_value);
+                }
+                let transport = MockTransport::new([Ok(server_error)]);
+                let operation = store
+                    .prepare_operation(op_id, session, kind.into(), request.clone())
+                    .unwrap();
+
+                let error =
+                    submit_operation_inner(&transport, &mut store, operation, false).unwrap_err();
+                assert_eq!(
+                    error.exit_code, EXIT_OUTCOME_UNKNOWN,
+                    "{kind}, ref={with_ref}"
+                );
+                let saved = store.operation(op_id).unwrap().unwrap();
+                assert_eq!(saved.op_id, op_id, "{kind}, ref={with_ref}");
+                assert_eq!(
+                    saved.state,
+                    OperationState::Unknown,
+                    "{kind}, ref={with_ref}"
+                );
+                assert_eq!(saved.request, request, "{kind}, ref={with_ref}");
+                assert!(saved.response.is_none(), "{kind}, ref={with_ref}");
+                assert_eq!(
+                    *transport.posts.lock().unwrap(),
+                    vec![request],
+                    "{kind}, ref={with_ref}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn standalone_listen_keeps_user_operations_pending_and_reconciles_attachment_support() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
         let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
         let mut message_operations = Vec::new();
 
-        for kind in ["send", "revise", "reply", "withdraw", "result", "file_use"] {
+        for kind in ["send", "revise", "reply", "withdraw", "result"] {
             for state in [OperationState::Prepared, OperationState::Unknown] {
                 let op_id = Uuid::new_v4();
                 let request = match kind {
@@ -7135,14 +7210,6 @@ mod tests {
                         "in_reply_to":"event-2",
                         "status":"applied"
                     }),
-                    "file_use" => json!({
-                        "v":1,
-                        "type":"file_use",
-                        "op_id":op_id.to_string(),
-                        "event_id":"event-3",
-                        "file":"notes.txt",
-                        "status":"used"
-                    }),
                     _ => unreachable!(),
                 };
                 store
@@ -7156,7 +7223,13 @@ mod tests {
         }
 
         let mut recoverable_operations = Vec::new();
-        for kind in ["attachment_update", "attachment_support", "support"] {
+        for kind in [
+            "attachment_update",
+            "attachment_support",
+            "support",
+            "file_use",
+            "discard_uploads",
+        ] {
             for state in [OperationState::Prepared, OperationState::Unknown] {
                 let op_id = Uuid::new_v4();
                 let request = match kind {
@@ -7165,6 +7238,17 @@ mod tests {
                     }
                     "attachment_support" | "support" => {
                         attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false)
+                    }
+                    "file_use" => json!({
+                        "v":1,
+                        "type":"file_use",
+                        "op_id":op_id.to_string(),
+                        "event_id":"event-3",
+                        "file":"notes.txt",
+                        "status":"used"
+                    }),
+                    "discard_uploads" => {
+                        discard_uploads_request(op_id, "app:test", "message-1", 1).unwrap()
                     }
                     _ => unreachable!(),
                 };
@@ -7186,18 +7270,22 @@ mod tests {
             let operation = store.operation(*op_id).unwrap().unwrap();
             (operation.created_at_ms, operation.op_id)
         });
-        let transport = MockTransport::new(recovery_order.into_iter().map(|(kind, _)| {
-            if kind == "attachment_update" {
-                Ok(json!({
+        let transport =
+            MockTransport::new(recovery_order.into_iter().map(|(kind, _)| match kind {
+                "attachment_update" => Ok(json!({
                     "v":1,
                     "type":"ok",
                     "session_handle":session.to_string(),
                     "vendor_session_id":"vendor-thread"
-                }))
-            } else {
-                Ok(json!({"v":1,"type":"ok"}))
-            }
-        }));
+                })),
+                "discard_uploads" => Ok(json!({
+                    "v":1,
+                    "type":"ok",
+                    "state":"discarded",
+                    "discarded":0
+                })),
+                _ => Ok(json!({"v":1,"type":"ok"})),
+            }));
         reconcile_listen_operations(&transport, &mut store, session).unwrap();
 
         let mut posted = transport
@@ -7215,7 +7303,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             posted, expected,
-            "listen should reconcile attachment/support operations only"
+            "listen should leave user messages alone and preserve other operation recovery"
         );
 
         for (kind, state, op_id, request) in &message_operations {
