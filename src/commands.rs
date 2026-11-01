@@ -30,6 +30,9 @@ pub const EXIT_UNSUPPORTED: i32 = 5;
 pub const EXIT_LISTENER_ACTIVE: i32 = 6;
 pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
 
+mod reconnect;
+pub use reconnect::{reconnect, reconnect_configuration_error};
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageFieldOptions {
     pub message_type: Option<String>,
@@ -904,6 +907,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 pub struct CommandError {
     pub message: String,
     pub exit_code: i32,
+    safe_reason: Option<reconnect::SafeReason>,
 }
 
 impl CommandError {
@@ -911,7 +915,13 @@ impl CommandError {
         Self {
             message: message.into(),
             exit_code,
+            safe_reason: None,
         }
+    }
+
+    fn with_reason(mut self, reason: reconnect::SafeReason) -> Self {
+        self.safe_reason = Some(reason);
+        self
     }
 }
 
@@ -2458,7 +2468,7 @@ fn handle_operation_error_response(
                 operation.kind
             ),
             EXIT_OUTCOME_UNKNOWN,
-        ));
+        ).with_reason(reconnect::SafeReason::server(&reason)));
     }
 
     store
@@ -2470,7 +2480,8 @@ fn handle_operation_error_response(
     Err(CommandError::new(
         format!("{} refused: {reason}", operation.kind),
         EXIT_REFUSED,
-    ))
+    )
+    .with_reason(reconnect::SafeReason::server(&reason)))
 }
 
 fn attachment_update_response_matches(request: &Value, response: &Value) -> bool {
@@ -2571,6 +2582,9 @@ pub fn attach(
     route: OriginHarness,
     controller: bool,
 ) -> Result<(), CommandError> {
+    if controller {
+        return reconnect::controller_attach(context, session, vendor_session_arg, route);
+    }
     if session.get_version() != Some(Version::Random) {
         return Err(CommandError::new(
             "--session must be an existing UUIDv4 Harklight handle",
@@ -4216,7 +4230,7 @@ fn submit_operation_inner(
                 }
                 emit(&line)?;
             }
-            return Err(CommandError::new(error.to_string(), EXIT_OUTCOME_UNKNOWN));
+            return Err(api_error(error, EXIT_OUTCOME_UNKNOWN));
         }
         Err(error) => {
             let saved = json!({"kind":"transport_refusal","message":error.to_string()});
@@ -4499,7 +4513,8 @@ fn post_read(context: &CommandContext, request: &Value) -> Result<Value, Command
         return Err(CommandError::new(
             format!("origin refused the request: {reason}"),
             EXIT_REFUSED,
-        ));
+        )
+        .with_reason(reconnect::SafeReason::server(reason)));
     }
     Ok(response)
 }
@@ -4770,7 +4785,8 @@ fn write_json_line(value: &Value, output: &mut impl Write) -> Result<(), Command
 }
 
 fn api_error(error: ApiError, exit_code: i32) -> CommandError {
-    CommandError::new(error.to_string(), exit_code)
+    let reason = reconnect::SafeReason::api(&error);
+    CommandError::new(error.to_string(), exit_code).with_reason(reason)
 }
 
 fn journal_error(error: JournalError, fallback_code: i32) -> CommandError {
@@ -4782,7 +4798,8 @@ fn journal_error(error: JournalError, fallback_code: i32) -> CommandError {
     } else {
         fallback_code
     };
-    CommandError::new(error.to_string(), code)
+    let reason = reconnect::SafeReason::journal(&error);
+    CommandError::new(error.to_string(), code).with_reason(reason)
 }
 
 fn parse_session(value: &str) -> Result<Uuid, CommandError> {

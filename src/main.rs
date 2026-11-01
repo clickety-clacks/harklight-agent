@@ -139,6 +139,17 @@ enum Command {
         #[arg(long)]
         controller: bool,
     },
+    /// Replace this existing origin handle's transport and resume its saved feed.
+    Reconnect {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long, value_name = "ID|none", requires = "route")]
+        vendor_session_id: Option<String>,
+        #[arg(long, value_enum, requires = "vendor_session_id")]
+        route: Option<Route>,
+        #[arg(long, requires = "route")]
+        controller: bool,
+    },
     Listen(ListenArgs),
     Read {
         #[arg(long)]
@@ -366,7 +377,22 @@ fn main() {
         cli.state_dir.as_deref(),
     ) {
         Ok(context) => context,
-        Err(error) => fail(error.to_string(), 1),
+        Err(error) => {
+            if let Command::Reconnect { session, .. } = &cli.command {
+                let safe = commands::reconnect_configuration_error(*session, "reconnect");
+                fail(safe.message, safe.exit_code);
+            }
+            if let Command::Attach {
+                session,
+                controller: true,
+                ..
+            } = &cli.command
+            {
+                let safe = commands::reconnect_configuration_error(*session, "attach");
+                fail(safe.message, safe.exit_code);
+            }
+            fail(error.to_string(), 1)
+        }
     };
 
     let result = match cli.command {
@@ -452,6 +478,18 @@ fn main() {
             session,
             &vendor_session_id,
             route.into(),
+            controller,
+        ),
+        Command::Reconnect {
+            session,
+            vendor_session_id,
+            route,
+            controller,
+        } => commands::reconnect(
+            &context,
+            session,
+            vendor_session_id.as_deref(),
+            route.map(Into::into),
             controller,
         ),
         Command::Listen(args) => commands::listen(
@@ -629,6 +667,54 @@ fn fail(message: String, exit_code: i32) -> ! {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn reconnect_accepts_saved_or_complete_attachment_inputs() {
+        let handle = "123e4567-e89b-42d3-a456-426614174000";
+        let cli =
+            Cli::try_parse_from(["harklight-agent", "reconnect", "--session", handle]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reconnect {
+                vendor_session_id: None,
+                route: None,
+                controller: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "reconnect",
+            "--session",
+            handle,
+            "--vendor-session-id",
+            "none",
+            "--route",
+            "other",
+            "--controller",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reconnect {
+                vendor_session_id: Some(_),
+                route: Some(Route::Other),
+                controller: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "reconnect",
+                "--session",
+                handle,
+                "--vendor-session-id",
+                "none"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn send_warnings_cover_untyped_legacy_and_prepared_execution_cases() {

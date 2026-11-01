@@ -151,7 +151,16 @@ impl OriginClient {
     }
 
     pub fn connect_stream(&self, session: Uuid) -> Result<SseStream, ApiError> {
-        let path = format!("/origin/v1/stream?session={session}");
+        self.open_stream(session, false)
+    }
+
+    pub fn reconnect_stream(&self, session: Uuid) -> Result<SseStream, ApiError> {
+        self.open_stream(session, true)
+    }
+
+    fn open_stream(&self, session: Uuid, reconnect: bool) -> Result<SseStream, ApiError> {
+        let suffix = if reconnect { "&reconnect=1" } else { "" };
+        let path = format!("/origin/v1/stream?session={session}{suffix}");
         let url = self.identity.origin_url(self.port, &path)?;
         let response = self.client.get(url).send()?;
         if !response.status().is_success() {
