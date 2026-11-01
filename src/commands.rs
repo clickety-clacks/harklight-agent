@@ -3674,13 +3674,14 @@ fn reconcile_listen_operations(
         .map_err(|error| journal_error(error, 1))?;
     operations.sort_by_key(|operation| (operation.created_at_ms, operation.op_id));
     for operation in operations {
-        // Unknown sends, revisions, replies, results and file use require explicit retry with their saved key.
-        if operation.state == OperationState::Unknown
-            && matches!(
-                operation.kind.as_str(),
-                "send" | "revise" | "reply" | "result" | "file_use"
-            )
-        {
+        // User actions require an explicit command, even when they are only prepared.
+        if matches!(
+            operation.state,
+            OperationState::Prepared | OperationState::Unknown
+        ) && matches!(
+            operation.kind.as_str(),
+            "send" | "revise" | "reply" | "withdraw" | "result" | "file_use"
+        ) {
             continue;
         }
         match submit_operation_with_transport(transport, store, operation) {
@@ -7081,90 +7082,105 @@ mod tests {
     }
 
     #[test]
-    fn standalone_listen_keeps_unknown_messages_pending_and_reconciles_attachment_support() {
+    fn standalone_listen_keeps_user_operations_pending_and_reconciles_attachment_support() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
         let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
         let mut message_operations = Vec::new();
 
-        for kind in ["send", "revise", "reply", "result", "file_use"] {
-            let op_id = Uuid::new_v4();
-            let request = match kind {
-                "send" => json!({
-                    "v":1,
-                    "type":"send",
-                    "op_id":op_id.to_string(),
-                    "session_handle":session.to_string(),
-                    "sender_id":"app:test",
-                    "message":{"message_id":"message-1"}
-                }),
-                "revise" => json!({
-                    "v":1,
-                    "type":"revise",
-                    "op_id":op_id.to_string(),
-                    "sender_id":"app:test",
-                    "message_id":"message-1",
-                    "base_revision":1,
-                    "message":{"message_id":"message-1"}
-                }),
-                "reply" => json!({
-                    "v":1,
-                    "type":"reply",
-                    "op_id":op_id.to_string(),
-                    "sender_id":"app:test",
-                    "message_id":"message-1",
-                    "request_revision":1,
-                    "in_reply_to":"event-1",
-                    "text":"A reply"
-                }),
-                "result" => json!({
-                    "v":1,
-                    "type":"result",
-                    "op_id":op_id.to_string(),
-                    "sender_id":"app:test",
-                    "message_id":"message-1",
-                    "in_reply_to":"event-2",
-                    "status":"applied"
-                }),
-                "file_use" => json!({
-                    "v":1,
-                    "type":"file_use",
-                    "op_id":op_id.to_string(),
-                    "event_id":"event-3",
-                    "file":"notes.txt",
-                    "status":"used"
-                }),
-                _ => unreachable!(),
-            };
-            store
-                .prepare_operation(op_id, session, kind.into(), request.clone())
-                .unwrap();
-            store.mark_operation_unknown(op_id).unwrap();
-            message_operations.push((kind, op_id, request));
+        for kind in ["send", "revise", "reply", "withdraw", "result", "file_use"] {
+            for state in [OperationState::Prepared, OperationState::Unknown] {
+                let op_id = Uuid::new_v4();
+                let request = match kind {
+                    "send" => json!({
+                        "v":1,
+                        "type":"send",
+                        "op_id":op_id.to_string(),
+                        "session_handle":session.to_string(),
+                        "sender_id":"app:test",
+                        "message":{"message_id":"message-1"}
+                    }),
+                    "revise" => json!({
+                        "v":1,
+                        "type":"revise",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "base_revision":1,
+                        "message":{"message_id":"message-1"}
+                    }),
+                    "reply" => json!({
+                        "v":1,
+                        "type":"reply",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "request_revision":1,
+                        "in_reply_to":"event-1",
+                        "text":"A reply"
+                    }),
+                    "withdraw" => json!({
+                        "v":1,
+                        "type":"withdraw",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1"
+                    }),
+                    "result" => json!({
+                        "v":1,
+                        "type":"result",
+                        "op_id":op_id.to_string(),
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "in_reply_to":"event-2",
+                        "status":"applied"
+                    }),
+                    "file_use" => json!({
+                        "v":1,
+                        "type":"file_use",
+                        "op_id":op_id.to_string(),
+                        "event_id":"event-3",
+                        "file":"notes.txt",
+                        "status":"used"
+                    }),
+                    _ => unreachable!(),
+                };
+                store
+                    .prepare_operation(op_id, session, kind.into(), request.clone())
+                    .unwrap();
+                if state == OperationState::Unknown {
+                    store.mark_operation_unknown(op_id).unwrap();
+                }
+                message_operations.push((kind, state, op_id, request));
+            }
         }
 
         let mut recoverable_operations = Vec::new();
         for kind in ["attachment_update", "attachment_support", "support"] {
-            let op_id = Uuid::new_v4();
-            let request = match kind {
-                "attachment_update" => {
-                    attachment_update_request(op_id, session, Some("vendor-thread"))
+            for state in [OperationState::Prepared, OperationState::Unknown] {
+                let op_id = Uuid::new_v4();
+                let request = match kind {
+                    "attachment_update" => {
+                        attachment_update_request(op_id, session, Some("vendor-thread"))
+                    }
+                    "attachment_support" | "support" => {
+                        attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false)
+                    }
+                    _ => unreachable!(),
+                };
+                store
+                    .prepare_operation(op_id, session, kind.into(), request.clone())
+                    .unwrap();
+                if state == OperationState::Unknown {
+                    store.mark_operation_unknown(op_id).unwrap();
                 }
-                "attachment_support" | "support" => {
-                    attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false)
-                }
-                _ => unreachable!(),
-            };
-            store
-                .prepare_operation(op_id, session, kind.into(), request.clone())
-                .unwrap();
-            store.mark_operation_unknown(op_id).unwrap();
-            recoverable_operations.push((kind, op_id, request));
+                recoverable_operations.push((kind, state, op_id, request));
+            }
         }
 
         let mut recovery_order = recoverable_operations
             .iter()
-            .map(|(kind, op_id, _)| (*kind, *op_id))
+            .map(|(kind, _, op_id, _)| (*kind, *op_id))
             .collect::<Vec<_>>();
         recovery_order.sort_by_key(|(_, op_id)| {
             let operation = store.operation(*op_id).unwrap().unwrap();
@@ -7193,7 +7209,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut expected = recoverable_operations
             .iter()
-            .map(|(_, _, request)| request.to_string())
+            .map(|(_, _, _, request)| request.to_string())
             .collect::<Vec<_>>();
         posted.sort();
         expected.sort();
@@ -7202,14 +7218,14 @@ mod tests {
             "listen should reconcile attachment/support operations only"
         );
 
-        for (kind, op_id, request) in &message_operations {
+        for (kind, state, op_id, request) in &message_operations {
             let saved = store.operation(*op_id).unwrap().unwrap();
             assert_eq!(saved.kind, *kind, "{kind}");
             assert_eq!(saved.op_id, *op_id, "{kind}");
-            assert_eq!(saved.state, OperationState::Unknown, "{kind}");
+            assert_eq!(saved.state, *state, "{kind}, {state:?}");
             assert_eq!(saved.request, *request, "{kind}");
         }
-        for (kind, op_id, request) in &recoverable_operations {
+        for (kind, _, op_id, request) in &recoverable_operations {
             let saved = store.operation(*op_id).unwrap().unwrap();
             assert_eq!(saved.kind, *kind, "{kind}");
             assert_eq!(saved.op_id, *op_id, "{kind}");
