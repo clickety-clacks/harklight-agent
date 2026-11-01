@@ -4754,10 +4754,14 @@ fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), 
 }
 
 fn emit(value: &Value) -> Result<(), CommandError> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| CommandError::new(format!("could not encode output: {error}"), 1))?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
+    write_json_line(value, &mut output)
+}
+
+fn write_json_line(value: &Value, output: &mut impl Write) -> Result<(), CommandError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| CommandError::new(format!("could not encode output: {error}"), 1))?;
     output
         .write_all(&bytes)
         .and_then(|()| output.write_all(b"\n"))
@@ -5240,6 +5244,7 @@ mod tests {
         let another_session = Uuid::new_v4();
         let mut store =
             JournalStore::open(&scratch.0.join("state"), "test-device", session).unwrap();
+        let issue = serde_json::from_str::<Value>("18446744073709551617").unwrap();
         let response = json!({
             "type":"ok",
             "cursor":2,
@@ -5266,7 +5271,7 @@ mod tests {
                     "request_revision":1,
                     "terminal_state":"answered",
                     "channel":"reply",
-                    "answer":"The answer is ready."
+                    "answer":{"issue":issue,"note":"The answer is ready."}
                 }
             ]
         });
@@ -5292,7 +5297,18 @@ mod tests {
         assert_eq!(line["request"]["sender_id"], "app:example");
         assert_eq!(line["request"]["message_id"], "message-1");
         assert_eq!(line["channel"], "reply");
-        assert_eq!(line["entry"]["answer"], "The answer is ready.");
+        assert_eq!(line["entry"]["answer"]["note"], "The answer is ready.");
+        assert_eq!(
+            line["entry"]["answer"]["issue"].to_string(),
+            "18446744073709551617"
+        );
+        let mut printed = Vec::new();
+        write_json_line(line, &mut printed).unwrap();
+        assert!(
+            String::from_utf8(printed)
+                .unwrap()
+                .contains("\"issue\":18446744073709551617")
+        );
         assert_eq!(line["delivered"], false);
         assert_eq!(line["acted"], false);
     }

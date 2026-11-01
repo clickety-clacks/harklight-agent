@@ -187,11 +187,18 @@ impl OriginClient {
 fn parse_post_response(response: Response) -> Result<Value, ApiError> {
     let status = response.status().as_u16();
     let body = response.text()?;
+    parse_post_response_body(status, &body)
+}
+
+fn parse_post_response_body(status: u16, body: &str) -> Result<Value, ApiError> {
     if !(200..300).contains(&status) {
-        return Err(ApiError::Http { status, body });
+        return Err(ApiError::Http {
+            status,
+            body: body.to_owned(),
+        });
     }
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
+    let value: Value =
+        serde_json::from_str(body).map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
     if value["v"] != 1 || !matches!(value["type"].as_str(), Some("ok" | "error")) {
         return Err(ApiError::InvalidResponse(
             "missing v:1 or type ok/error".into(),
@@ -301,5 +308,24 @@ mod tests {
             decoder.next_change(),
             Err(ApiError::InvalidNotice(_))
         ));
+    }
+
+    #[test]
+    fn post_response_preserves_large_answer_integers_exactly() {
+        let response = parse_post_response_body(
+            200,
+            r#"{"v":1,"type":"ok","answer":{"issue":18446744073709551617}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response["answer"]["issue"].to_string(),
+            "18446744073709551617"
+        );
+        assert!(
+            serde_json::to_string(&response)
+                .unwrap()
+                .contains("18446744073709551617")
+        );
     }
 }
