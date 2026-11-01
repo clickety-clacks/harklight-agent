@@ -3661,12 +3661,26 @@ fn reconcile_session(
         acknowledge_event(context, store, &event_id, false)?;
     }
 
+    reconcile_listen_operations(&context.api, store, session)
+}
+
+fn reconcile_listen_operations(
+    transport: &impl OperationTransport,
+    store: &mut JournalStore,
+    session: Uuid,
+) -> Result<(), CommandError> {
     let mut operations = store
         .unknown_operations_for(session)
         .map_err(|error| journal_error(error, 1))?;
     operations.sort_by_key(|operation| (operation.created_at_ms, operation.op_id));
     for operation in operations {
-        match submit_operation(context, store, operation) {
+        // Unknown sends and revisions require an explicit retry with their saved operation key.
+        if operation.state == OperationState::Unknown
+            && matches!(operation.kind.as_str(), "send" | "revise")
+        {
+            continue;
+        }
+        match submit_operation_with_transport(transport, store, operation) {
             Ok(_) => {}
             Err(error) if error.exit_code == EXIT_REFUSED => {
                 // A definite refusal resolves the old submission. The
@@ -7061,6 +7075,77 @@ mod tests {
                 assert_eq!(committed.request, request, "{kind}, ref={with_ref}");
             }
         }
+    }
+
+    #[test]
+    fn standalone_listen_reconciliation_does_not_resubmit_unknown_send_or_revise() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let mut message_operations = Vec::new();
+
+        for kind in ["send", "revise"] {
+            let op_id = Uuid::new_v4();
+            let request = match kind {
+                "send" => json!({
+                    "v":1,
+                    "type":"send",
+                    "op_id":op_id.to_string(),
+                    "session_handle":session.to_string(),
+                    "message":{"message_id":"message-1"}
+                }),
+                "revise" => json!({
+                    "v":1,
+                    "type":"revise",
+                    "op_id":op_id.to_string(),
+                    "message_id":"message-1",
+                    "base_revision":1
+                }),
+                _ => unreachable!(),
+            };
+            store
+                .prepare_operation(op_id, session, kind.into(), request.clone())
+                .unwrap();
+            store.mark_operation_unknown(op_id).unwrap();
+            message_operations.push((kind, op_id, request));
+        }
+
+        let support_id = Uuid::new_v4();
+        let support_request = json!({
+            "v":1,
+            "type":"support",
+            "op_id":support_id.to_string(),
+            "session_handle":session.to_string()
+        });
+        store
+            .prepare_operation(
+                support_id,
+                session,
+                "support".into(),
+                support_request.clone(),
+            )
+            .unwrap();
+        store.mark_operation_unknown(support_id).unwrap();
+
+        let transport = MockTransport::new([Ok(json!({"v":1,"type":"ok"}))]);
+        reconcile_listen_operations(&transport, &mut store, session).unwrap();
+
+        assert_eq!(
+            *transport.posts.lock().unwrap(),
+            vec![support_request],
+            "listen may reconcile other operation kinds, but must not resubmit Unknown messages"
+        );
+        for (kind, op_id, request) in message_operations {
+            let saved = store.operation(op_id).unwrap().unwrap();
+            assert_eq!(saved.kind, kind, "{kind}");
+            assert_eq!(saved.op_id, op_id, "{kind}");
+            assert_eq!(saved.state, OperationState::Unknown, "{kind}");
+            assert_eq!(saved.request, request, "{kind}");
+        }
+        assert_eq!(
+            store.operation(support_id).unwrap().unwrap().state,
+            OperationState::Committed
+        );
     }
 
     #[test]
