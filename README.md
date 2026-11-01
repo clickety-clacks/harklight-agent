@@ -131,9 +131,9 @@ Use `--informational` as a compatibility spelling for `--type fyi`. FYIs
 cannot include choices, Reply, defaults, or choice styles. `--kind` may label a
 message as `blocker` or `success`. `--importance` sets the sender's view
 (`low`, `normal`, `high`, or `now`); Harklight's ranking decides the priority
-Mike sees. The old `--urgency` spelling remains accepted temporarily and prints
-a warning to use `--importance`. Invalid importance or `--by-when` values are
-refused with a correction; `--by-when` takes an RFC 3339 timestamp.
+the recipient sees. The old `--urgency` spelling remains accepted temporarily
+and prints a warning to use `--importance`. Invalid importance or `--by-when`
+values are refused with a correction; `--by-when` takes an RFC 3339 timestamp.
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
@@ -183,6 +183,12 @@ authenticated sending-session record before calling `--execute`. Execute
 accepts only the saved operation ID; it does not take replacement send inputs.
 It reports the existing `committed`, `refused` or `outcome_unknown` result. For
 an uncertain result, use `retry --op-id` with the same operation key.
+
+Only after a definite refusal (exit 2), correct the named input and submit a new
+send or revision. A prepared operation stays unchanged; use a new operation for
+the correction. For an unknown outcome (exit 7), retry only with
+`harklight-agent retry --op-id "$HARKLIGHT_OP_ID"` using the same key and
+unchanged inputs; do not submit a changed operation.
 
 ### Reattach an existing handle
 

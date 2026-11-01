@@ -48,6 +48,9 @@ fn send_cli_warnings(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(
+        after_help = "Only after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
+    )]
     Send {
         #[arg(long, value_name = "UUID|new", required_unless_present = "execute")]
         session: Option<String>,
@@ -84,7 +87,7 @@ enum Command {
         message_kind: Option<String>,
         #[arg(
             long,
-            help = "Your importance estimate; Harklight decides the priority Mike sees"
+            help = "Your importance estimate; Harklight decides the priority the recipient sees"
         )]
         importance: Option<String>,
         #[arg(long, hide = true)]
@@ -155,6 +158,9 @@ enum Command {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
+    #[command(
+        after_help = "Only after a definite refusal (exit 2), correct the named input and submit a new revision. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed revision."
+    )]
     Revise {
         #[arg(long)]
         session: Uuid,
@@ -186,7 +192,7 @@ enum Command {
         reply: bool,
         #[arg(
             long,
-            help = "Your importance estimate; Harklight decides the priority Mike sees"
+            help = "Your importance estimate; Harklight decides the priority the recipient sees"
         )]
         importance: Option<String>,
         #[arg(long, hide = true)]
@@ -997,5 +1003,31 @@ mod tests {
             .to_string();
         assert!(revise_help.contains("--importance"));
         assert!(!revise_help.contains("--urgency"));
+        assert!(send_help.contains("priority the recipient sees"));
+        assert!(revise_help.contains("priority the recipient sees"));
+    }
+
+    #[test]
+    fn send_and_revise_help_explain_safe_correction_and_retry() {
+        let mut command = Cli::command();
+        let send_help = command
+            .find_subcommand_mut("send")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(send_help.contains("Only after a definite refusal (exit 2)"));
+        assert!(send_help.contains("submit a new send"));
+        assert!(send_help.contains("unknown outcome (exit 7)"));
+        assert!(send_help.contains("retry --op-id <KEY>"));
+
+        let revise_help = command
+            .find_subcommand_mut("revise")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(revise_help.contains("Only after a definite refusal (exit 2)"));
+        assert!(revise_help.contains("submit a new revision"));
+        assert!(revise_help.contains("unknown outcome (exit 7)"));
+        assert!(revise_help.contains("retry --op-id <KEY>"));
     }
 }
