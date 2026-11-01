@@ -7092,6 +7092,34 @@ mod tests {
                 let session = Uuid::new_v4();
                 let op_id = Uuid::new_v4();
                 let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+                if matches!(kind, "reply" | "result") {
+                    let entry_kind = if kind == "reply" {
+                        "discussion"
+                    } else {
+                        "terminal"
+                    };
+                    store
+                        .record_entry(JournalEntry::fetched(
+                            1,
+                            "1".into(),
+                            session,
+                            entry_kind.into(),
+                            "person".into(),
+                            true,
+                            Some("app:test".into()),
+                            Some("message-1".into()),
+                            Some(1),
+                            json!({
+                                "event_id":"1",
+                                "kind":entry_kind,
+                                "author":"person",
+                                "sender_id":"app:test",
+                                "message_id":"message-1",
+                                "request_revision":1
+                            }),
+                        ))
+                        .unwrap();
+                }
                 let mut request = match kind {
                     "reply" => json!({
                         "v":1,
@@ -7127,7 +7155,11 @@ mod tests {
                     request["ref"] = json!(ref_value);
                     server_error["ref"] = json!(ref_value);
                 }
-                let transport = MockTransport::new([Ok(server_error)]);
+                let mut success_response = json!({"v":1,"type":"ok","seq":1});
+                if with_ref {
+                    success_response["ref"] = json!(ref_value);
+                }
+                let transport = MockTransport::new([Ok(server_error), Ok(success_response)]);
                 let operation = store
                     .prepare_operation(op_id, session, kind.into(), request.clone())
                     .unwrap();
@@ -7149,9 +7181,27 @@ mod tests {
                 assert!(saved.response.is_none(), "{kind}, ref={with_ref}");
                 assert_eq!(
                     *transport.posts.lock().unwrap(),
-                    vec![request],
+                    vec![request.clone()],
                     "{kind}, ref={with_ref}"
                 );
+
+                // Explicit retry submits the exact saved operation and key.
+                let response =
+                    submit_operation_inner(&transport, &mut store, saved, false).unwrap();
+                assert_eq!(response["type"], "ok", "{kind}, ref={with_ref}");
+                assert_eq!(
+                    *transport.posts.lock().unwrap(),
+                    vec![request.clone(), request.clone()],
+                    "{kind}, ref={with_ref}"
+                );
+                let committed = store.operation(op_id).unwrap().unwrap();
+                assert_eq!(committed.op_id, op_id, "{kind}, ref={with_ref}");
+                assert_eq!(
+                    committed.state,
+                    OperationState::Committed,
+                    "{kind}, ref={with_ref}"
+                );
+                assert_eq!(committed.request, request, "{kind}, ref={with_ref}");
             }
         }
     }
