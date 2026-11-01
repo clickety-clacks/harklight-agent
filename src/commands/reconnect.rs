@@ -374,7 +374,14 @@ fn open_locked(context: &CommandContext, session: Uuid) -> Result<JournalStore, 
         ));
     }
     let mut store = JournalStore::open_existing(&context.state_root, &context.device_id, session)
-        .map_err(|e| Failure::command("journal", journal_error(e, EXIT_REFUSED)))?;
+        .map_err(|e| {
+        let exit = if matches!(e, JournalError::MissingOriginJournal) {
+            EXIT_REFUSED
+        } else {
+            1
+        };
+        Failure::command("journal", journal_error(e, exit))
+    })?;
     store
         .acquire_listener()
         .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
