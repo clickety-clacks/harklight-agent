@@ -148,6 +148,21 @@ harklight-agent send --session new --sender-id app:example \
   --route claude-code --title "Update complete" --informational
 ```
 
+For a sender-designed picture choice, put an `attention-client.ui/1` document in
+`cover.json`. Name each attached picture in the document using its basename,
+then pass that picture with `--file`:
+
+```sh
+harklight-agent send --session "$HARKLIGHT_SESSION" --sender-id app:example \
+  --type request --title "Choose the cover" --answer-ui cover.json \
+  --file cover-a.jpg --file cover-b.jpg
+```
+
+`--answer-ui` requires `--type request` and supplies the complete answer
+document, so it cannot be combined with `--choice`, `--reply`, defaults, or
+choice styles. The CLI preserves the document as JSON and leaves UI/1 grammar
+validation to the Server.
+
 Revisions keep the stored type and kind unless `--type` or `--kind` changes
 them. Untyped revisions keep today's automatic Reply behavior and preserve a
 stored Seen-only notice. Typed requests preserve their existing controls;

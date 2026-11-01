@@ -49,7 +49,7 @@ fn send_cli_warnings(
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(
-        after_help = "Only after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
+        after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --route claude-code --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
     )]
     Send {
         #[arg(long, value_name = "UUID|new", required_unless_present = "execute")]
@@ -116,6 +116,12 @@ enum Command {
         controller: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
+        #[arg(
+            long = "answer-ui",
+            value_name = "PATH",
+            help = "Send this attention-client.ui/1 answer document (requires --type request)"
+        )]
+        answer_ui_file: Option<PathBuf>,
         #[arg(long, conflicts_with = "execute")]
         prepare: bool,
         #[arg(long, conflicts_with = "prepare")]
@@ -388,6 +394,7 @@ fn main() {
             route,
             controller,
             files,
+            answer_ui_file,
             prepare,
             execute,
             op_id,
@@ -400,7 +407,7 @@ fn main() {
             ) {
                 eprintln!("{warning}");
             }
-            commands::send_command_with_fields(
+            commands::send_command_with_answer_ui_file(
                 &context,
                 session.as_deref(),
                 sender_id.as_deref(),
@@ -430,7 +437,9 @@ fn main() {
                     default_at,
                     choice_styles,
                     clear_default: false,
+                    answer_ui: None,
                 },
+                answer_ui_file.as_deref(),
             )
         }
         Command::Attach {
@@ -524,6 +533,7 @@ fn main() {
                     default_at,
                     choice_styles,
                     clear_default,
+                    answer_ui: None,
                 },
             )
         }
@@ -666,6 +676,8 @@ mod tests {
             "A one-week delay",
             "--by-when",
             "2026-11-01T17:00:00Z",
+            "--answer-ui",
+            "cover.json",
         ])
         .unwrap();
         assert!(matches!(
@@ -681,6 +693,7 @@ mod tests {
                 choices,
                 stake: Some(stake),
                 by_when: Some(by_when),
+                answer_ui_file: Some(path),
                 ..
             } if message_type == "request"
                 && message_kind == "blocker"
@@ -688,6 +701,7 @@ mod tests {
                 && choices == vec!["Approve"]
                 && stake == "A one-week delay"
                 && by_when == "2026-11-01T17:00:00Z"
+                && path == PathBuf::from("cover.json")
         ));
     }
 
@@ -995,6 +1009,8 @@ mod tests {
             .to_string();
         assert!(send_help.contains("--importance"));
         assert!(!send_help.contains("--urgency"));
+        assert!(send_help.contains("--answer-ui"));
+        assert!(send_help.contains("--file cover-a.jpg --file cover-b.jpg"));
 
         let revise_help = command
             .find_subcommand_mut("revise")
