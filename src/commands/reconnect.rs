@@ -176,14 +176,15 @@ impl Failure {
     }
 }
 
-pub fn reconnect_configuration_error(session: Uuid) -> CommandError {
-    Failure::local(
+pub fn reconnect_configuration_error(session: Uuid, operation: &str) -> CommandError {
+    let mut failure = Failure::local(
         "journal",
         "configuration_error",
         "The enrolled origin configuration could not be loaded.",
         1,
-    )
-    .report(session)
+    );
+    failure.operation = operation.to_owned();
+    failure.report(session)
 }
 
 fn stage_for(operation: &OperationRecord) -> &'static str {

@@ -379,7 +379,16 @@ fn main() {
         Ok(context) => context,
         Err(error) => {
             if let Command::Reconnect { session, .. } = &cli.command {
-                let safe = commands::reconnect_configuration_error(*session);
+                let safe = commands::reconnect_configuration_error(*session, "reconnect");
+                fail(safe.message, safe.exit_code);
+            }
+            if let Command::Attach {
+                session,
+                controller: true,
+                ..
+            } = &cli.command
+            {
+                let safe = commands::reconnect_configuration_error(*session, "attach");
                 fail(safe.message, safe.exit_code);
             }
             fail(error.to_string(), 1)
@@ -658,6 +667,54 @@ fn fail(message: String, exit_code: i32) -> ! {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn reconnect_accepts_saved_or_complete_attachment_inputs() {
+        let handle = "123e4567-e89b-42d3-a456-426614174000";
+        let cli =
+            Cli::try_parse_from(["harklight-agent", "reconnect", "--session", handle]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reconnect {
+                vendor_session_id: None,
+                route: None,
+                controller: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "reconnect",
+            "--session",
+            handle,
+            "--vendor-session-id",
+            "none",
+            "--route",
+            "other",
+            "--controller",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Reconnect {
+                vendor_session_id: Some(_),
+                route: Some(Route::Other),
+                controller: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "reconnect",
+                "--session",
+                handle,
+                "--vendor-session-id",
+                "none"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn send_warnings_cover_untyped_legacy_and_prepared_execution_cases() {
