@@ -100,6 +100,10 @@ impl SafeReason {
 
     pub(super) fn journal(error: &JournalError) -> Self {
         match error {
+            JournalError::MissingOriginJournal => Self::local(
+                "missing_journal",
+                "The enrolled origin has no existing local journal; no connection was attempted.",
+            ),
             JournalError::ListenerActive(_) | JournalError::ListenerActiveUnknown => Self::local(
                 "listener_active",
                 "The existing local listener lock is held; no replacement was attempted.",
@@ -369,9 +373,8 @@ fn open_locked(context: &CommandContext, session: Uuid) -> Result<JournalStore, 
             EXIT_REFUSED,
         ));
     }
-    let mut store = context
-        .open_store(session)
-        .map_err(|e| Failure::command("journal", e))?;
+    let mut store = JournalStore::open_existing(&context.state_root, &context.device_id, session)
+        .map_err(|e| Failure::command("journal", journal_error(e, EXIT_REFUSED)))?;
     store
         .acquire_listener()
         .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
@@ -544,6 +547,16 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn missing_origin_journal_is_refused_without_initializing_history() {
+        let scratch = Scratch::new();
+        assert!(matches!(
+            JournalStore::open_existing(&scratch.0, "fixture-device", Uuid::new_v4()),
+            Err(JournalError::MissingOriginJournal)
+        ));
+        assert!(!scratch.0.exists());
     }
 
     #[test]
