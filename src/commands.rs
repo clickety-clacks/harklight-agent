@@ -1,12 +1,16 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    env,
+    collections::{BTreeMap, BTreeSet, HashSet},
+    env, fmt,
     io::{self, Write},
     path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{
+    Deserialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use uuid::{Uuid, Version};
@@ -42,6 +46,8 @@ pub struct MessageFieldOptions {
     pub default_at: Option<String>,
     pub choice_styles: Vec<String>,
     pub clear_default: bool,
+    /// An exact sender-provided UI/1 document accepted only by send.
+    pub answer_ui: Option<Value>,
 }
 
 impl MessageFieldOptions {
@@ -59,6 +65,7 @@ impl MessageFieldOptions {
             || self.default_at.is_some()
             || !self.choice_styles.is_empty()
             || self.clear_default
+            || self.answer_ui.is_some()
     }
 
     fn identity(&self) -> Value {
@@ -87,8 +94,165 @@ impl MessageFieldOptions {
         if let Some(importance) = &self.importance {
             identity["importance"] = Value::String(importance.clone());
         }
+        if let Some(answer_ui) = &self.answer_ui {
+            identity["answer_ui"] = answer_ui.clone();
+        }
         identity
     }
+}
+
+const SENDER_ANSWER_UI_SCHEMA: &str = "attention-client.ui/1";
+
+#[derive(Debug)]
+struct UniqueJsonMembers;
+
+impl<'de> Deserialize<'de> for UniqueJsonMembers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueJsonMembersVisitor;
+
+        impl<'de> Visitor<'de> for UniqueJsonMembersVisitor {
+            type Value = UniqueJsonMembers;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON value with no repeated object member names")
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_i128<E>(self, _value: i128) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_u128<E>(self, _value: u128) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while sequence.next_element::<UniqueJsonMembers>()?.is_some() {}
+                Ok(UniqueJsonMembers)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut names = HashSet::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if !names.insert(name.clone()) {
+                        return Err(de::Error::custom(format!("repeated member name {name:?}")));
+                    }
+                    map.next_value::<UniqueJsonMembers>()?;
+                }
+                Ok(UniqueJsonMembers)
+            }
+        }
+
+        deserializer.deserialize_any(UniqueJsonMembersVisitor)
+    }
+}
+
+fn read_answer_ui_file(path: &Path) -> Result<Value, CommandError> {
+    let source = std::fs::read_to_string(path).map_err(|error| {
+        CommandError::new(
+            format!(
+                "--answer-ui file {} could not be read: {error}; fix the path, or drop --answer-ui and use --choice/--reply",
+                path.display()
+            ),
+            EXIT_REFUSED,
+        )
+    })?;
+
+    let mut deserializer = serde_json::Deserializer::from_str(&source);
+    UniqueJsonMembers::deserialize(&mut deserializer).map_err(|error| {
+        CommandError::new(
+            format!(
+                "--answer-ui file {} is not valid JSON with unique member names: {error}; fix the JSON, or drop --answer-ui and use --choice/--reply",
+                path.display()
+            ),
+            EXIT_REFUSED,
+        )
+    })?;
+    deserializer.end().map_err(|error| {
+        CommandError::new(
+            format!(
+                "--answer-ui file {} is not valid JSON: {error}; fix the JSON, or drop --answer-ui and use --choice/--reply",
+                path.display()
+            ),
+            EXIT_REFUSED,
+        )
+    })?;
+
+    let value: Value = serde_json::from_str(&source).map_err(|error| {
+        CommandError::new(
+            format!(
+                "--answer-ui file {} is not valid JSON: {error}; fix the JSON, or drop --answer-ui and use --choice/--reply",
+                path.display()
+            ),
+            EXIT_REFUSED,
+        )
+    })?;
+    if !value.is_object() || value["schema"] != SENDER_ANSWER_UI_SCHEMA {
+        return Err(CommandError::new(
+            format!(
+                "--answer-ui file {} must be a JSON object with schema \"{SENDER_ANSWER_UI_SCHEMA}\"; fix the file, or drop --answer-ui and use --choice/--reply",
+                path.display()
+            ),
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_answer_ui_operation_mode(
+    prepare: bool,
+    execute: bool,
+    answer_ui_file: Option<&Path>,
+) -> Result<(), CommandError> {
+    if prepare && execute {
+        return Err(CommandError::new(
+            "choose only one of --prepare or --execute",
+            EXIT_REFUSED,
+        ));
+    }
+    if execute && answer_ui_file.is_some() {
+        return Err(CommandError::new(
+            "--execute accepts only --op-id; it uses the saved send inputs",
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(())
 }
 
 fn add_field_options_identity(value: &mut Value, fields: &MessageFieldOptions) {
@@ -482,15 +646,103 @@ fn validate_send_options(
     fields: &MessageFieldOptions,
     include_thread: bool,
 ) -> Result<(Option<MessageType>, NormalizedMessageFields), CommandError> {
+    validate_answer_ui_inputs(choices, informational, fields)?;
     let message_type = send_message_type(fields, informational)?;
     validate_message_kind(fields)?;
-    validate_send_controls(message_type, choices, fields)?;
-    let answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
-    validate_typed_answer_ui(message_type, &answer_ui)?;
+    if fields.answer_ui.is_none() {
+        validate_send_controls(message_type, choices, fields)?;
+        let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
+        validate_typed_answer_ui(message_type, &answer_ui)?;
+    }
     let normalized =
         normalize_message_fields(fields, &send_choice_targets(choices), include_thread);
     first_field_error(&normalized)?;
     Ok((message_type, normalized))
+}
+
+fn validate_answer_ui_inputs(
+    choices: &[String],
+    informational: bool,
+    fields: &MessageFieldOptions,
+) -> Result<(), CommandError> {
+    let Some(answer_ui) = fields.answer_ui.as_ref() else {
+        return Ok(());
+    };
+
+    if !answer_ui.is_object() || answer_ui["schema"] != SENDER_ANSWER_UI_SCHEMA {
+        return Err(CommandError::new(
+            format!(
+                "--answer-ui must be a JSON object with schema \"{SENDER_ANSWER_UI_SCHEMA}\"; fix the file, or drop --answer-ui and use --choice/--reply"
+            ),
+            EXIT_REFUSED,
+        ));
+    }
+
+    let mut type_fixes = Vec::new();
+    if informational {
+        if fields.message_type.as_deref() == Some("request") {
+            type_fixes.push("remove --informational".to_owned());
+        } else {
+            type_fixes.push("remove --informational and add --type request".to_owned());
+        }
+    }
+    if fields.message_type.as_deref() == Some("fyi") {
+        type_fixes.push("replace --type fyi with --type request".to_owned());
+    }
+    if !type_fixes.is_empty() {
+        return Err(CommandError::new(
+            format!(
+                "--answer-ui requires --type request: {}, or drop --answer-ui and use --type fyi",
+                type_fixes.join("; ")
+            ),
+            EXIT_REFUSED,
+        ));
+    }
+
+    match fields.message_type.as_deref() {
+        Some("request") => {}
+        Some(other) => {
+            return Err(CommandError::new(
+                format!(
+                    "--answer-ui requires --type request: replace --type {other:?} with --type request, or drop --answer-ui and use --choice/--reply"
+                ),
+                EXIT_REFUSED,
+            ));
+        }
+        None => {
+            return Err(CommandError::new(
+                "--answer-ui requires explicit --type request: add --type request, or drop --answer-ui and use --choice/--reply",
+                EXIT_REFUSED,
+            ));
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    if !choices.is_empty() {
+        conflicts.push("--choice");
+    }
+    if fields.reply {
+        conflicts.push("--reply");
+    }
+    if fields.default_choice.is_some() {
+        conflicts.push("--default");
+    }
+    if fields.default_at.is_some() {
+        conflicts.push("--default-at");
+    }
+    if !fields.choice_styles.is_empty() {
+        conflicts.push("--choice-style");
+    }
+    if !conflicts.is_empty() {
+        return Err(CommandError::new(
+            format!(
+                "--answer-ui carries its own inputs: remove {}, or drop --answer-ui and use --choice/--reply",
+                conflicts.join(", ")
+            ),
+            EXIT_REFUSED,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_typed_answer_ui(
@@ -979,11 +1231,14 @@ fn choices_answer_ui(choices: &[String]) -> Result<Value, CommandError> {
 fn answer_ui_for_send(
     choices: &[String],
     message_type: Option<MessageType>,
-    reply: bool,
+    fields: &MessageFieldOptions,
 ) -> Result<Value, CommandError> {
+    if let Some(answer_ui) = &fields.answer_ui {
+        return Ok(answer_ui.clone());
+    }
     match message_type {
         Some(MessageType::Fyi) => Ok(seen_answer_ui()),
-        Some(MessageType::Request) => choices_answer_ui_with_reply(choices, reply),
+        Some(MessageType::Request) => choices_answer_ui_with_reply(choices, fields.reply),
         None => choices_answer_ui(choices),
     }
 }
@@ -1400,6 +1655,51 @@ pub fn send_command_with_fields(
     )
 }
 
+pub fn send_command_with_answer_ui_file(
+    context: &CommandContext,
+    session: Option<&str>,
+    sender_id: Option<&str>,
+    title: Option<&str>,
+    body: Option<&str>,
+    choices: &[String],
+    informational: bool,
+    supersedes: &[String],
+    vendor_session_id: Option<&str>,
+    route: Option<OriginHarness>,
+    controller: bool,
+    files: &[PathBuf],
+    prepare: bool,
+    execute: bool,
+    op_id: Option<Uuid>,
+    fields: &MessageFieldOptions,
+    answer_ui_file: Option<&Path>,
+) -> Result<(), CommandError> {
+    validate_answer_ui_operation_mode(prepare, execute, answer_ui_file)?;
+
+    let mut fields = fields.clone();
+    if let Some(path) = answer_ui_file {
+        fields.answer_ui = Some(read_answer_ui_file(path)?);
+    }
+    send_command_with_fields(
+        context,
+        session,
+        sender_id,
+        title,
+        body,
+        choices,
+        informational,
+        supersedes,
+        vendor_session_id,
+        route,
+        controller,
+        files,
+        prepare,
+        execute,
+        op_id,
+        &fields,
+    )
+}
+
 pub fn send(
     context: &CommandContext,
     session_arg: &str,
@@ -1449,7 +1749,7 @@ pub fn send_with_fields(
     let route = validate_send_route(session_arg, route, controller)?;
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
-    let _answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
+    let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let mut file_draft = json!({
         "session":session_arg,
         "sender_id":sender_id,
@@ -1574,7 +1874,7 @@ fn build_send_request_with_fields(
     fields: &MessageFieldOptions,
 ) -> Result<Value, CommandError> {
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
-    let answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
+    let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let mut message = json!({
         "sender_id": sender_id,
         "message_id": message_id,
@@ -1747,7 +2047,7 @@ pub fn prepare_send_with_fields(
     }
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
-    let _answer_ui = answer_ui_for_send(choices, message_type, fields.reply)?;
+    let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let route = validate_send_route(session_arg, route, controller)?;
     let global = context.open_global_store()?;
 
@@ -4550,6 +4850,241 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn answer_ui_file_preserves_large_integers_and_rejects_nested_duplicate_names() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("cover.json");
+        std::fs::write(
+            &path,
+            br#"{"schema":"attention-client.ui/1","inputs":[{"value":18446744073709551617}]}"#,
+        )
+        .unwrap();
+
+        let document = read_answer_ui_file(&path).unwrap();
+        assert_eq!(document["schema"], SENDER_ANSWER_UI_SCHEMA);
+        assert!(
+            serde_json::to_string(&document)
+                .unwrap()
+                .contains("18446744073709551617")
+        );
+
+        std::fs::write(
+            &path,
+            br#"{"schema":"attention-client.ui/1","inputs":[{"value":{"id":"first","id":"second"}}]}"#,
+        )
+        .unwrap();
+        let error = read_answer_ui_file(&path).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_REFUSED);
+        assert!(error.message.contains("--answer-ui"));
+        assert!(error.message.contains("repeated member name \"id\""));
+        assert!(error.message.contains("drop --answer-ui"));
+
+        std::fs::write(&path, "[]").unwrap();
+        let error = read_answer_ui_file(&path).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_REFUSED);
+        assert!(error.message.contains("JSON object"));
+        assert!(error.message.contains(SENDER_ANSWER_UI_SCHEMA));
+    }
+
+    #[test]
+    fn answer_ui_send_requires_request_and_rejects_other_answer_inputs() {
+        let document = json!({"schema":SENDER_ANSWER_UI_SCHEMA,"inputs":[]});
+        let request_fields = MessageFieldOptions {
+            message_type: Some("request".into()),
+            answer_ui: Some(document.clone()),
+            ..MessageFieldOptions::default()
+        };
+        assert!(validate_send_options(&[], false, &request_fields, true).is_ok());
+
+        let missing_type = MessageFieldOptions {
+            answer_ui: Some(document.clone()),
+            ..MessageFieldOptions::default()
+        };
+        assert_eq!(
+            validate_send_options(&[], false, &missing_type, true)
+                .unwrap_err()
+                .message,
+            "--answer-ui requires explicit --type request: add --type request, or drop --answer-ui and use --choice/--reply"
+        );
+
+        let fyi_fields = MessageFieldOptions {
+            message_type: Some("fyi".into()),
+            answer_ui: Some(document.clone()),
+            ..MessageFieldOptions::default()
+        };
+        assert!(
+            validate_send_options(&[], false, &fyi_fields, true)
+                .unwrap_err()
+                .message
+                .contains("replace --type fyi with --type request")
+        );
+
+        let informational_fields = MessageFieldOptions {
+            answer_ui: Some(document.clone()),
+            ..MessageFieldOptions::default()
+        };
+        assert!(
+            validate_send_options(&[], true, &informational_fields, true)
+                .unwrap_err()
+                .message
+                .contains("remove --informational and add --type request")
+        );
+
+        assert!(
+            validate_send_options(&["Approve".into()], false, &request_fields, true)
+                .unwrap_err()
+                .message
+                .contains("remove --choice")
+        );
+
+        let with_default = MessageFieldOptions {
+            default_choice: Some("Approve".into()),
+            ..request_fields.clone()
+        };
+        assert!(
+            validate_send_options(&[], false, &with_default, true)
+                .unwrap_err()
+                .message
+                .contains("remove --default")
+        );
+
+        let with_default_at = MessageFieldOptions {
+            default_at: Some("2026-11-01T17:00:00Z".into()),
+            ..request_fields.clone()
+        };
+        assert!(
+            validate_send_options(&[], false, &with_default_at, true)
+                .unwrap_err()
+                .message
+                .contains("remove --default-at")
+        );
+
+        let with_style = MessageFieldOptions {
+            choice_styles: vec!["Approve=primary".into()],
+            ..request_fields.clone()
+        };
+        assert!(
+            validate_send_options(&[], false, &with_style, true)
+                .unwrap_err()
+                .message
+                .contains("remove --choice-style")
+        );
+
+        let with_reply = MessageFieldOptions {
+            reply: true,
+            ..request_fields.clone()
+        };
+        assert_eq!(
+            validate_send_options(&[], false, &with_reply, true)
+                .unwrap_err()
+                .message,
+            "--answer-ui carries its own inputs: remove --reply, or drop --answer-ui and use --choice/--reply"
+        );
+    }
+
+    #[test]
+    fn answer_ui_cannot_be_replaced_during_execute() {
+        let error =
+            validate_answer_ui_operation_mode(false, true, Some(Path::new("missing-cover.json")))
+                .unwrap_err();
+        assert_eq!(error.exit_code, EXIT_REFUSED);
+        assert_eq!(
+            error.message,
+            "--execute accepts only --op-id; it uses the saved send inputs"
+        );
+    }
+
+    #[test]
+    fn prepared_send_keeps_answer_ui_value_and_uses_it_in_operation_identity() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let document: Value = serde_json::from_str(
+            r#"{"schema":"attention-client.ui/1","inputs":[{"value":18446744073709551617}]}"#,
+        )
+        .unwrap();
+        let fields = MessageFieldOptions {
+            message_type: Some("request".into()),
+            answer_ui: Some(document.clone()),
+            ..MessageFieldOptions::default()
+        };
+        let request = build_send_request_with_fields(
+            op_id,
+            session,
+            "message-1",
+            "app:example",
+            "Choose the cover",
+            None,
+            &[],
+            false,
+            None,
+            None,
+            false,
+            &[],
+            &fields,
+        )
+        .unwrap();
+        assert_eq!(request["message"]["answer_ui"], document);
+        assert!(
+            serde_json::to_string(&request)
+                .unwrap()
+                .contains("18446744073709551617")
+        );
+
+        let inputs = send_input_identity_with_fields(
+            "new",
+            "app:example",
+            "Choose the cover",
+            None,
+            &[],
+            false,
+            &[],
+            None,
+            None,
+            false,
+            &[],
+            &fields,
+        );
+        assert_eq!(inputs["message_field_options"]["answer_ui"], document);
+
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let operation = prepared_send_record(
+            &mut store,
+            op_id,
+            session,
+            request.clone(),
+            Vec::new(),
+            Vec::new(),
+            inputs.clone(),
+        );
+        assert_eq!(operation.prepared_send.as_ref().unwrap().request, request);
+        assert_eq!(operation.prepared_send.as_ref().unwrap().inputs, inputs);
+
+        let changed_document: Value = serde_json::from_str(
+            r#"{"schema":"attention-client.ui/1","inputs":[{"value":18446744073709551618}]}"#,
+        )
+        .unwrap();
+        let changed_fields = MessageFieldOptions {
+            answer_ui: Some(changed_document),
+            ..fields
+        };
+        let changed_inputs = send_input_identity_with_fields(
+            "new",
+            "app:example",
+            "Choose the cover",
+            None,
+            &[],
+            false,
+            &[],
+            None,
+            None,
+            false,
+            &[],
+            &changed_fields,
+        );
+        assert_ne!(changed_inputs, inputs);
     }
 
     #[test]
