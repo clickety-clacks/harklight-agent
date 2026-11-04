@@ -7926,12 +7926,12 @@ mod tests {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
         let op_id = Uuid::new_v4();
-        let request = ack2_request(op_id, "812", None, false, None).unwrap();
+        let request = ack2_request(op_id, "1", None, false, None).unwrap();
         let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
         store
             .record_entry(JournalEntry::fetched(
-                812,
-                "812".into(),
+                1,
+                "1".into(),
                 session,
                 "discussion".into(),
                 "person".into(),
@@ -7940,7 +7940,7 @@ mod tests {
                 Some("message-1".into()),
                 Some(1),
                 json!({
-                    "event_id":"812",
+                    "event_id":"1",
                     "kind":"discussion",
                     "author":"person",
                     "sender_id":"app:test",
@@ -7982,7 +7982,7 @@ mod tests {
         assert_eq!(committed.op_id, op_id);
         assert_eq!(committed.state, OperationState::Committed);
         assert_eq!(committed.request, request);
-        let entry = store.entry_by_event("812").unwrap().unwrap();
+        let entry = store.entry_by_event("1").unwrap().unwrap();
         assert!(entry.delivered_at_ms.is_none());
         assert!(entry.acted_at_ms.is_none());
     }
