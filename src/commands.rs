@@ -2364,7 +2364,17 @@ fn attachment_support_request(
     route: OriginHarness,
     controller: bool,
 ) -> Value {
-    json!({
+    attachment_support_request_with_ack2(op_id, session, route, controller, false)
+}
+
+fn attachment_support_request_with_ack2(
+    op_id: Uuid,
+    session: Uuid,
+    route: OriginHarness,
+    controller: bool,
+    ack2: bool,
+) -> Value {
+    let mut request = json!({
         "v":1,
         "type":"support",
         "op_id":op_id.to_string(),
@@ -2372,7 +2382,33 @@ fn attachment_support_request(
         "route":route.as_str(),
         "cli_version":env!("CARGO_PKG_VERSION"),
         "unsupported_reason":route.unsupported_reason(controller)
-    })
+    });
+    if ack2 {
+        request["ack2"] = Value::Bool(true);
+    }
+    request
+}
+
+fn listener_support_request(
+    op_id: Uuid,
+    session: Uuid,
+    route: OriginHarness,
+    unsupported_reason: Value,
+    ack2: bool,
+) -> Value {
+    let mut request = json!({
+        "v":1,
+        "type":"support",
+        "op_id":op_id.to_string(),
+        "session_handle":session.to_string(),
+        "route":route.as_str(),
+        "cli_version":env!("CARGO_PKG_VERSION"),
+        "unsupported_reason":unsupported_reason
+    });
+    if ack2 {
+        request["ack2"] = Value::Bool(true);
+    }
+    request
 }
 
 fn same_operation_payload(left: &Value, right: &Value) -> bool {
@@ -2445,11 +2481,11 @@ fn handle_operation_error_response(
     announce: bool,
 ) -> Result<Value, CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
-    // OriginWire returns storage_unavailable for all five message commands;
+    // OriginWire returns storage_unavailable for the five message commands and ACK2;
     // its optional ref is only an echoed correlation value, not part of the outcome.
     let message_operation = matches!(
         operation.kind.as_str(),
-        "send" | "revise" | "reply" | "withdraw" | "result"
+        "send" | "revise" | "reply" | "withdraw" | "result" | "ack2"
     );
     if reason == "storage_unavailable"
         && (message_operation
@@ -2588,9 +2624,16 @@ pub fn attach(
     vendor_session_arg: &str,
     route: OriginHarness,
     controller: bool,
+    ack2: bool,
 ) -> Result<(), CommandError> {
+    if ack2 && !controller {
+        return Err(CommandError::new(
+            "--ack2 requires --controller",
+            EXIT_REFUSED,
+        ));
+    }
     if controller {
-        return reconnect::controller_attach(context, session, vendor_session_arg, route);
+        return reconnect::controller_attach(context, session, vendor_session_arg, route, ack2);
     }
     if session.get_version() != Some(Version::Random) {
         return Err(CommandError::new(
@@ -2626,7 +2669,13 @@ pub fn attach(
         ));
     }
 
-    let support_request = attachment_support_request(Uuid::new_v4(), session, route, controller);
+    let support_request = attachment_support_request_with_ack2(
+        Uuid::new_v4(),
+        session,
+        route,
+        controller,
+        ack2,
+    );
     ensure_attach_recovery_compatible(&store, session, vendor_session_id, &support_request)?;
 
     let attachment_request = attachment_update_request(Uuid::new_v4(), session, vendor_session_id);
@@ -2819,6 +2868,105 @@ pub fn ack(context: &CommandContext, session: Uuid, event_id: &str) -> Result<()
         "acted":acted,
         "file_transfers":response.get("file_transfers").cloned().unwrap_or(Value::Null)
     }))
+}
+
+/// Record a receiving-system ACK2 outcome. This intentionally does not call
+/// the agent Seen path or mutate the entry's delivered/acted receipts.
+pub fn ack2(
+    context: &CommandContext,
+    session: Uuid,
+    event_id: &str,
+    agent: Option<&str>,
+    rerouted: bool,
+    not_handed: Option<&str>,
+) -> Result<(), CommandError> {
+    if session.get_version() != Some(Version::Random) {
+        return Err(CommandError::new("session handle must be UUIDv4", EXIT_REFUSED));
+    }
+    validate_event_id(event_id)?;
+    let mut store = context.open_store(session)?;
+    let entry = store
+        .entry_by_event(event_id)
+        .map_err(|error| journal_error(error, 1))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "event is not in the durable journal; receive it before recording ACK2",
+                EXIT_REFUSED,
+            )
+        })?;
+    if entry.session_handle != session
+        || entry.author != "person"
+        || !matches!(entry.kind.as_str(), "discussion" | "terminal")
+    {
+        return Err(CommandError::new(
+            "ACK2 is valid only for a person-authored entry in this origin session",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let op_id = Uuid::new_v4();
+    let request = ack2_request(op_id, event_id, agent, rerouted, not_handed)?;
+    let operation = prepare(&mut store, session, op_id, "ack2", request)?;
+    let response = submit_operation(context, &mut store, operation)?;
+    emit(&json!({
+        "kind":"committed",
+        "operation":"ack2",
+        "op_id":op_id,
+        "session_handle":session,
+        "event_id":event_id,
+        "response":response
+    }))
+}
+
+fn ack2_request(
+    op_id: Uuid,
+    event_id: &str,
+    agent: Option<&str>,
+    rerouted: bool,
+    not_handed: Option<&str>,
+) -> Result<Value, CommandError> {
+    validate_event_id(event_id)?;
+    if agent.is_some_and(|name| name.trim().is_empty()) {
+        return Err(CommandError::new(
+            "--agent requires a nonempty human-readable name",
+            EXIT_REFUSED,
+        ));
+    }
+    if let Some(reason) = not_handed {
+        if rerouted {
+            return Err(CommandError::new(
+                "--rerouted is valid only for a handed ACK2 outcome",
+                EXIT_REFUSED,
+            ));
+        }
+        if reason.trim().is_empty() {
+            return Err(CommandError::new(
+                "--not-handed requires a nonempty reason",
+                EXIT_REFUSED,
+            ));
+        }
+    }
+    let outcome = if not_handed.is_some() {
+        "not_handed"
+    } else {
+        "handed"
+    };
+    let mut request = json!({
+        "v":1,
+        "type":"ack2",
+        "op_id":op_id.to_string(),
+        "event_id":event_id,
+        "outcome":outcome
+    });
+    if let Some(agent) = agent {
+        request["agent"] = Value::String(agent.to_owned());
+    }
+    if let Some(reason) = not_handed {
+        request["reason"] = Value::String(reason.to_owned());
+    } else {
+        request["rerouted"] = Value::Bool(rerouted);
+    }
+    Ok(request)
 }
 
 pub fn file_use(
@@ -3415,7 +3563,14 @@ pub fn listen(
     background_tasks_enabled: bool,
     follow: bool,
     controller: bool,
+    ack2: bool,
 ) -> Result<(), CommandError> {
+    if ack2 && !controller {
+        return Err(CommandError::new(
+            "--ack2 requires --controller",
+            EXIT_REFUSED,
+        ));
+    }
     if controller && !follow {
         return Err(CommandError::new(
             "--controller requires listen --follow",
@@ -3484,15 +3639,13 @@ pub fn listen(
         background_tasks_enabled,
         controller,
     );
-    let arm = json!({
-        "v":1,
-        "type":"support",
-        "op_id":Uuid::new_v4().to_string(),
-        "session_handle":session.to_string(),
-        "route":route.as_str(),
-        "cli_version":env!("CARGO_PKG_VERSION"),
-        "unsupported_reason":unsupported_reason.clone()
-    });
+    let arm = listener_support_request(
+        Uuid::new_v4(),
+        session,
+        route,
+        unsupported_reason.clone(),
+        ack2,
+    );
     let operation = prepare_or_resume_operation(&mut store, session, "support", arm, false)?;
     let arm_response = submit_operation(context, &mut store, operation)?;
     if let Some(reason) = unsupported_reason.as_str() {
@@ -3632,6 +3785,9 @@ fn support_record_matches(status: &Value, request: &Value) -> bool {
     support.get("route") == request.get("route")
         && support.get("cli_version") == request.get("cli_version")
         && support.get("unsupported_reason") == request.get("unsupported_reason")
+        && request
+            .get("ack2")
+            .is_none_or(|expected| support.get("ack2") == Some(expected))
 }
 
 fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
@@ -4304,11 +4460,41 @@ fn submit_operation_inner(
         ));
     }
 
+    if operation.kind == "ack2" && !valid_ack2_response(&response) {
+        if announce {
+            emit(&json!({
+                "kind":"outcome_unknown",
+                "operation":"ack2",
+                "op_id":operation.op_id,
+                "session_handle":operation.session_handle,
+                "event_id":operation.request["event_id"],
+                "retry":"run harklight-agent retry --op-id with this exact key"
+            }))?;
+        }
+        return Err(CommandError::new(
+            "origin did not confirm a valid ACK2 outcome; retry the same operation key",
+            EXIT_OUTCOME_UNKNOWN,
+        ));
+    }
+
     let acted_event = operation.request["in_reply_to"].as_str();
     store
         .settle_operation(operation.op_id, response.clone(), acted_event)
         .map_err(|error| journal_error(error, 1))?;
     Ok(response)
+}
+
+fn valid_ack2_response(response: &Value) -> bool {
+    response["v"] == 1
+        && response["type"] == "ok"
+        && matches!(
+            response["status"].as_str(),
+            Some("recorded" | "already_recorded" | "superseded")
+        )
+        && matches!(
+            response["stage_outcome"].as_str(),
+            Some("handed" | "not_handed")
+        )
 }
 
 fn prepare(
@@ -4756,6 +4942,11 @@ fn retry_committed_result(
         "op_id":op_id,
         "response":response
     });
+    if operation_kind == "ack2"
+        && let Some(event_id) = request["event_id"].as_str()
+    {
+        output["event_id"] = Value::String(event_id.to_owned());
+    }
     if operation_kind == "send" {
         let sender_id = request["message"]["sender_id"]
             .as_str()
@@ -7603,6 +7794,214 @@ mod tests {
             }}),
             &expected
         ));
+    }
+
+    #[test]
+    fn controller_ack2_support_is_opt_in_and_requires_server_confirmation() {
+        let session = Uuid::new_v4();
+        let legacy = attachment_support_request(
+            Uuid::new_v4(),
+            session,
+            OriginHarness::Other,
+            true,
+        );
+        assert!(legacy.get("ack2").is_none());
+
+        let declared = attachment_support_request_with_ack2(
+            Uuid::new_v4(),
+            session,
+            OriginHarness::Other,
+            true,
+            true,
+        );
+        assert_eq!(declared["ack2"], true);
+        let listen_declared = listener_support_request(
+            Uuid::new_v4(),
+            session,
+            OriginHarness::Other,
+            Value::Null,
+            true,
+        );
+        assert_eq!(listen_declared["ack2"], true);
+        assert!(listener_support_request(
+            Uuid::new_v4(),
+            session,
+            OriginHarness::Other,
+            Value::Null,
+            false
+        )
+        .get("ack2")
+        .is_none());
+        let status = json!({
+            "listening_support": {
+                "route":"other",
+                "cli_version":env!("CARGO_PKG_VERSION"),
+                "unsupported_reason":null,
+                "ack2":true
+            }
+        });
+        assert!(support_record_matches(&status, &declared));
+        assert!(support_record_matches(&status, &listen_declared));
+        assert!(!support_record_matches(
+            &json!({"listening_support":{
+                "route":"other",
+                "cli_version":env!("CARGO_PKG_VERSION"),
+                "unsupported_reason":null
+            }}),
+            &declared
+        ));
+    }
+
+    #[test]
+    fn ack2_request_encodes_only_the_selected_outcome_fields() {
+        let op_id = Uuid::new_v4();
+        let handed = ack2_request(op_id, "812", Some("Studio"), true, None).unwrap();
+        assert_eq!(
+            handed,
+            json!({
+                "v":1,
+                "type":"ack2",
+                "op_id":op_id.to_string(),
+                "event_id":"812",
+                "outcome":"handed",
+                "agent":"Studio",
+                "rerouted":true
+            })
+        );
+
+        let not_handed = ack2_request(
+            Uuid::new_v4(),
+            "812",
+            Some("Studio"),
+            false,
+            Some("The receiver could not hand off this entry."),
+        )
+        .unwrap();
+        assert_eq!(not_handed["outcome"], "not_handed");
+        assert_eq!(not_handed["reason"], "The receiver could not hand off this entry.");
+        assert_eq!(not_handed["agent"], "Studio");
+        assert!(not_handed.get("rerouted").is_none());
+
+        assert!(ack2_request(Uuid::new_v4(), "812", None, true, Some("no")).is_err());
+        assert!(ack2_request(Uuid::new_v4(), "812", Some("  "), false, None).is_err());
+        assert!(ack2_request(Uuid::new_v4(), "812", None, false, Some("  ")).is_err());
+        assert!(ack2_request(Uuid::new_v4(), "08", None, false, None).is_err());
+    }
+
+    #[test]
+    fn ack2_unknown_operation_retries_with_the_saved_key_and_request() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = ack2_request(op_id, "812", Some("Studio"), true, None).unwrap();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let operation = prepare(&mut store, session, op_id, "ack2", request.clone()).unwrap();
+        let uncertain = MockTransport::new([Err(ApiError::InvalidResponse(
+            "response was lost".into(),
+        ))]);
+        let error = submit_operation_inner(&uncertain, &mut store, operation, false).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN);
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.kind, "ack2");
+        assert_eq!(saved.state, OperationState::Unknown);
+        assert_eq!(saved.request, request);
+
+        let recovered = MockTransport::new([Ok(json!({
+            "v":1,
+            "type":"ok",
+            "status":"recorded",
+            "stage_outcome":"handed"
+        }))]);
+        let response = submit_operation_inner(&recovered, &mut store, saved, false).unwrap();
+        assert_eq!(response["status"], "recorded");
+        assert_eq!(*recovered.posts.lock().unwrap(), vec![request]);
+        assert_eq!(
+            store.operation(op_id).unwrap().unwrap().state,
+            OperationState::Committed
+        );
+    }
+
+    #[test]
+    fn ack2_storage_unavailable_keeps_unknown_state_for_same_key_retry() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = ack2_request(op_id, "812", None, false, None).unwrap();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .record_entry(JournalEntry::fetched(
+                812,
+                "812".into(),
+                session,
+                "discussion".into(),
+                "person".into(),
+                true,
+                Some("app:test".into()),
+                Some("message-1".into()),
+                Some(1),
+                json!({
+                    "event_id":"812",
+                    "kind":"discussion",
+                    "author":"person",
+                    "sender_id":"app:test",
+                    "message_id":"message-1",
+                    "request_revision":1
+                }),
+            ))
+            .unwrap();
+        let operation = prepare(&mut store, session, op_id, "ack2", request.clone()).unwrap();
+        let server_error = json!({
+            "v":1,
+            "type":"error",
+            "reason":"storage_unavailable"
+        });
+        let success = json!({
+            "v":1,
+            "type":"ok",
+            "status":"recorded",
+            "stage_outcome":"handed"
+        });
+        let transport = MockTransport::new([Ok(server_error), Ok(success)]);
+
+        let error = submit_operation_inner(&transport, &mut store, operation, false).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN);
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.kind, "ack2");
+        assert_eq!(saved.state, OperationState::Unknown);
+        assert_eq!(saved.request, request);
+        assert!(saved.response.is_none());
+        assert_eq!(*transport.posts.lock().unwrap(), vec![request.clone()]);
+
+        let response = submit_operation_inner(&transport, &mut store, saved, false).unwrap();
+        assert_eq!(response["status"], "recorded");
+        assert_eq!(
+            *transport.posts.lock().unwrap(),
+            vec![request.clone(), request.clone()]
+        );
+        let committed = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(committed.op_id, op_id);
+        assert_eq!(committed.state, OperationState::Committed);
+        assert_eq!(committed.request, request);
+        let entry = store.entry_by_event("812").unwrap().unwrap();
+        assert!(entry.delivered_at_ms.is_none());
+        assert!(entry.acted_at_ms.is_none());
+    }
+
+    #[test]
+    fn malformed_ack2_success_response_stays_unknown_for_explicit_retry() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = ack2_request(op_id, "812", None, false, None).unwrap();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let operation = prepare(&mut store, session, op_id, "ack2", request).unwrap();
+        let malformed = MockTransport::new([Ok(json!({"v":1,"type":"ok"}))]);
+        let error = submit_operation_inner(&malformed, &mut store, operation, false).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN);
+        assert_eq!(
+            store.operation(op_id).unwrap().unwrap().state,
+            OperationState::Unknown
+        );
     }
 
     #[test]

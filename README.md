@@ -376,6 +376,40 @@ the CLI records the arm as supported on that basis alone. It still has no
 built-in knowledge of this harness's delivery contract and makes no stronger
 claim than for Claude Code or Codex.
 
+## Receiving-system ACK2
+
+ACK2 is a receiving-system processing outcome, separate from the agent's Seen
+receipt (`ack`) and from any reply or generated text. The published Agent 0.1.6
+binary predates this source change and does not include these flags or command.
+A controller that sends ACK2 can explicitly advertise that capability when
+attaching or listening:
+
+```sh
+harklight-agent attach --session "$HARKLIGHT_SESSION" \
+  --vendor-session-id none --route other --controller --ack2
+harklight-agent listen --follow --controller --ack2 \
+  --session "$HARKLIGHT_SESSION"
+```
+
+The `--ack2` flag adds `ack2:true` to that command's journaled support
+operation. Omitting it keeps the legacy capability declaration. The receiving
+system may submit its processing outcome explicitly:
+
+```sh
+harklight-agent ack2 --session "$HARKLIGHT_SESSION" --event "$HARKLIGHT_EVENT" \
+  --agent "Assistant" --rerouted
+harklight-agent ack2 --session "$HARKLIGHT_SESSION" --event "$HARKLIGHT_EVENT" \
+  --not-handed "The receiving system could not hand off this entry."
+```
+
+Use `--agent` only when the receiving system has the agent's human-readable
+name. `--rerouted` applies only to `handed`; `--not-handed` supplies the reason
+for a negative outcome. This command submits an ACK2 operation only when the
+receiving system explicitly invokes it. It does not mark the agent Seen, infer
+delivery from generated output, or automatically retry an uncertain result.
+After an unknown outcome, retry only the same journaled operation with
+`harklight-agent retry --op-id "$HARKLIGHT_OP_ID"`.
+
 ## Conversation files
 
 Attach files to a new request, reply or revision with `--file`:

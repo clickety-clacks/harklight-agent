@@ -138,6 +138,12 @@ enum Command {
         route: Route,
         #[arg(long)]
         controller: bool,
+        #[arg(
+            long,
+            requires = "controller",
+            help = "Declare that this controller sends system ACK2 for this handle"
+        )]
+        ack2: bool,
     },
     /// Replace this existing origin handle's transport and resume its saved feed.
     Reconnect {
@@ -160,6 +166,22 @@ enum Command {
         session: Uuid,
         #[arg(long)]
         event: String,
+    },
+    #[command(
+        about = "Record a receiving-system ACK2 outcome for a person entry",
+        after_help = "This system-level processing receipt is separate from the agent Seen command `ack`. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same saved operation key."
+    )]
+    Ack2 {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        event: String,
+        #[arg(long, help = "Human-readable name of the agent that received the entry")]
+        agent: Option<String>,
+        #[arg(long, conflicts_with = "not_handed")]
+        rerouted: bool,
+        #[arg(long = "not-handed", value_name = "REASON", conflicts_with = "rerouted")]
+        not_handed: Option<String>,
     },
     Reply {
         #[arg(long)]
@@ -324,6 +346,12 @@ struct ListenArgs {
     next: bool,
     #[arg(long)]
     controller: bool,
+    #[arg(
+        long,
+        requires = "controller",
+        help = "Declare that this controller sends system ACK2 for this handle"
+    )]
+    ack2: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -473,12 +501,14 @@ fn main() {
             vendor_session_id,
             route,
             controller,
+            ack2,
         } => commands::attach(
             &context,
             session,
             &vendor_session_id,
             route.into(),
             controller,
+            ack2,
         ),
         Command::Reconnect {
             session,
@@ -500,9 +530,24 @@ fn main() {
             args.background_tasks_enabled,
             args.follow,
             args.controller,
+            args.ack2,
         ),
         Command::Read { session } => commands::read(&context, session),
         Command::Ack { session, event } => commands::ack(&context, session, &event),
+        Command::Ack2 {
+            session,
+            event,
+            agent,
+            rerouted,
+            not_handed,
+        } => commands::ack2(
+            &context,
+            session,
+            &event,
+            agent.as_deref(),
+            rerouted,
+            not_handed.as_deref(),
+        ),
         Command::Reply {
             session,
             request,
@@ -1131,5 +1176,134 @@ mod tests {
         assert!(revise_help.contains("submit a new revision"));
         assert!(revise_help.contains("unknown outcome (exit 7)"));
         assert!(revise_help.contains("retry --op-id <KEY>"));
+    }
+
+    #[test]
+    fn ack2_is_a_separate_receiver_command_and_controller_capability_is_explicit() {
+        let handle = "123e4567-e89b-42d3-a456-426614174000";
+        let attach = Cli::try_parse_from([
+            "harklight-agent",
+            "attach",
+            "--session",
+            handle,
+            "--vendor-session-id",
+            "none",
+            "--route",
+            "other",
+            "--controller",
+            "--ack2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            attach.command,
+            Command::Attach {
+                controller: true,
+                ack2: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "harklight-agent",
+            "attach",
+            "--session",
+            handle,
+            "--vendor-session-id",
+            "none",
+            "--route",
+            "other",
+            "--ack2",
+        ])
+        .is_err());
+
+        let listen = Cli::try_parse_from([
+            "harklight-agent",
+            "listen",
+            "--session",
+            handle,
+            "--follow",
+            "--controller",
+            "--ack2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            listen.command,
+            Command::Listen(ListenArgs {
+                controller: true,
+                ack2: true,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "harklight-agent",
+            "listen",
+            "--session",
+            handle,
+            "--follow",
+            "--ack2",
+        ])
+        .is_err());
+
+        let handed = Cli::try_parse_from([
+            "harklight-agent",
+            "ack2",
+            "--session",
+            handle,
+            "--event",
+            "812",
+            "--agent",
+            "Studio",
+            "--rerouted",
+        ])
+        .unwrap();
+        assert!(matches!(
+            handed.command,
+            Command::Ack2 {
+                agent: Some(agent),
+                rerouted: true,
+                not_handed: None,
+                ..
+            } if agent == "Studio"
+        ));
+        let not_handed = Cli::try_parse_from([
+            "harklight-agent",
+            "ack2",
+            "--session",
+            handle,
+            "--event",
+            "812",
+            "--not-handed",
+            "The receiver could not hand off this entry.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            not_handed.command,
+            Command::Ack2 {
+                agent: None,
+                rerouted: false,
+                not_handed: Some(reason),
+                ..
+            } if reason == "The receiver could not hand off this entry."
+        ));
+        assert!(Cli::try_parse_from([
+            "harklight-agent",
+            "ack2",
+            "--session",
+            handle,
+            "--event",
+            "812",
+            "--rerouted",
+            "--not-handed",
+            "not available",
+        ])
+        .is_err());
+
+        let mut command = Cli::command();
+        let ack2_help = command
+            .find_subcommand_mut("ack2")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(ack2_help.contains("receiving-system ACK2"));
+        assert!(ack2_help.contains("separate from the agent Seen command `ack`"));
     }
 }
