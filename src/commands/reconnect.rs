@@ -34,6 +34,10 @@ impl SafeReason {
             ),
             "not_found" => ("not_found", "The server did not find this origin handle."),
             "forbidden" => ("forbidden", "The server refused this origin's access."),
+            "revoked" => (
+                "revoked",
+                "The server has revoked this device's enrollment.",
+            ),
             "storage_unavailable" => (
                 "storage_unavailable",
                 "The server could not confirm durable storage.",
@@ -189,6 +193,21 @@ pub fn reconnect_configuration_error(session: Uuid, operation: &str) -> CommandE
     );
     failure.operation = operation.to_owned();
     failure.report(session)
+}
+
+/// A refused stream open exits as refused, not as a transport failure; the
+/// revoked refusal arrives as a plain HTTP error envelope rather than an SSE
+/// content-type mismatch, so it is recognized by its stated reason.
+fn stream_open_exit(error: &ApiError) -> i32 {
+    if matches!(error, ApiError::Refused(reason) if reason == "already_listening") {
+        EXIT_LISTENER_ACTIVE
+    } else if matches!(error, ApiError::Refused(_))
+        || error.refusal_reason().as_deref() == Some("revoked")
+    {
+        EXIT_REFUSED
+    } else {
+        1
+    }
 }
 
 fn stage_for(operation: &OperationRecord) -> &'static str {
@@ -464,13 +483,7 @@ fn reconnect_inner(
     // The local listener lock remains held throughout the real SSE connection.
     // There is no private retry budget in this worker.
     let mut stream = context.api.reconnect_stream(session).map_err(|e| {
-        let exit = if matches!(&e, ApiError::Refused(reason) if reason == "already_listening") {
-            EXIT_LISTENER_ACTIVE
-        } else if matches!(&e, ApiError::Refused(_)) {
-            EXIT_REFUSED
-        } else {
-            1
-        };
+        let exit = stream_open_exit(&e);
         Failure::command("stream", api_error(e, exit))
     })?;
     // Consume the initial change notice before declaring readiness. Its cursor
@@ -674,5 +687,28 @@ mod tests {
         .line(session);
         assert_eq!(line["reason_code"], "unknown");
         assert_eq!(line["reason_source"], "unknown");
+    }
+
+    #[test]
+    fn a_revoked_refusal_is_reported_as_revoked_not_a_transport_error() {
+        let session = Uuid::new_v4();
+        let error = ApiError::Http {
+            status: 403,
+            body: r#"{"v":1,"type":"error","reason":"revoked"}"#.into(),
+        };
+        assert_eq!(error.refusal_reason().as_deref(), Some("revoked"));
+        let exit = stream_open_exit(&error);
+        assert_eq!(exit, EXIT_REFUSED);
+        assert_eq!(
+            stream_open_exit(&ApiError::Http {
+                status: 403,
+                body: "no envelope".into(),
+            }),
+            1
+        );
+        let line = Failure::command("stream", api_error(error, exit)).line(session);
+        assert_eq!(line["kind"], "refused");
+        assert_eq!(line["reason_code"], "revoked");
+        assert_eq!(line["reason_source"], "server");
     }
 }
