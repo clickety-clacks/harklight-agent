@@ -908,6 +908,7 @@ pub struct CommandError {
     pub message: String,
     pub exit_code: i32,
     safe_reason: Option<reconnect::SafeReason>,
+    listener_recovery: bool,
 }
 
 impl CommandError {
@@ -916,11 +917,17 @@ impl CommandError {
             message: message.into(),
             exit_code,
             safe_reason: None,
+            listener_recovery: false,
         }
     }
 
     fn with_reason(mut self, reason: reconnect::SafeReason) -> Self {
         self.safe_reason = Some(reason);
+        self
+    }
+
+    fn with_listener_recovery(mut self) -> Self {
+        self.listener_recovery = true;
         self
     }
 }
@@ -3683,14 +3690,13 @@ pub fn listen(
     let mut offered = BTreeSet::new();
     let mut reconnect_delay = Duration::from_millis(250);
     let max_reconnect_delay = Duration::from_secs(30);
-    loop {
+    'listener: loop {
         let mut stream = match context.api.connect_stream(session) {
             Ok(stream) => {
                 // A reconnect is an interruption boundary. Re-offer all
                 // still-pending entries from the durable journal, preserving
                 // their delivered/acted facts in each line.
                 offered.clear();
-                reconnect_delay = Duration::from_millis(250);
                 stream
             }
             Err(error) if stream_should_reconnect(&error) => {
@@ -3710,9 +3716,22 @@ pub fn listen(
             Err(error) => return Err(api_error(error, EXIT_LISTENER_ACTIVE)),
         };
 
-        reconcile_session(context, &mut store, session)?;
-        fetch_feed(context, &mut store)?;
-        let status = read_status(context, session)?;
+        let status = match refresh_listener_state(context, &mut store, session) {
+            Ok(status) => {
+                reconnect_delay = Duration::from_millis(250);
+                status
+            }
+            Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                eprintln!(
+                    "Harklight origin POST is unavailable or has an unknown outcome; reconnecting in the same process"
+                );
+                drop(stream);
+                thread::sleep(reconnect_delay);
+                reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+                continue 'listener;
+            }
+            Err(error) => return Err(error),
+        };
         if emit_pending(&mut store, session, follow, &mut offered)? {
             return Ok(());
         }
@@ -3728,8 +3747,23 @@ pub fn listen(
                     if notice_cursor <= journal_cursor {
                         continue;
                     }
-                    fetch_feed(context, &mut store)?;
-                    let status = read_status(context, session)?;
+                    let status = match fetch_feed_and_read_status(context, &mut store, session) {
+                        Ok(status) => {
+                            reconnect_delay = Duration::from_millis(250);
+                            status
+                        }
+                        Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                            eprintln!(
+                                "Harklight origin POST is unavailable or has an unknown outcome; reconnecting in the same process"
+                            );
+                            drop(stream);
+                            thread::sleep(reconnect_delay);
+                            reconnect_delay =
+                                reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+                            continue 'listener;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if emit_pending(&mut store, session, follow, &mut offered)? {
                         return Ok(());
                     }
@@ -3746,6 +3780,28 @@ pub fn listen(
         thread::sleep(reconnect_delay);
         reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
     }
+}
+
+fn refresh_listener_state(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    session: Uuid,
+) -> Result<Value, CommandError> {
+    reconcile_session(context, store, session)?;
+    fetch_feed_and_read_status(context, store, session)
+}
+
+fn fetch_feed_and_read_status(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    session: Uuid,
+) -> Result<Value, CommandError> {
+    fetch_feed(context, store)?;
+    read_status(context, session)
+}
+
+fn listener_post_failure_requires_reconnect(error: &CommandError) -> bool {
+    error.listener_recovery || error.exit_code == EXIT_OUTCOME_UNKNOWN
 }
 
 fn listener_unsupported_reason(
@@ -3833,14 +3889,15 @@ fn reconcile_listen_operations(
         .map_err(|error| journal_error(error, 1))?;
     operations.sort_by_key(|operation| (operation.created_at_ms, operation.op_id));
     for operation in operations {
-        // Message operations require an explicit command, even when only prepared.
-        if matches!(
-            operation.state,
-            OperationState::Prepared | OperationState::Unknown
-        ) && matches!(
-            operation.kind.as_str(),
-            "send" | "revise" | "reply" | "withdraw" | "result"
-        ) {
+        // A prepared user operation has not yet been submitted. An unknown
+        // operation may have committed, so retry its exact journaled payload
+        // and key under the server's receipt semantics.
+        if operation.state == OperationState::Prepared
+            && matches!(
+                operation.kind.as_str(),
+                "send" | "revise" | "reply" | "withdraw" | "result"
+            )
+        {
             continue;
         }
         match submit_operation_with_transport(transport, store, operation) {
@@ -3857,6 +3914,15 @@ fn reconcile_listen_operations(
 
 fn acknowledge_event(
     context: &CommandContext,
+    store: &mut JournalStore,
+    event_id: &str,
+    announce: bool,
+) -> Result<Value, CommandError> {
+    acknowledge_event_with_transport(&context.api, store, event_id, announce)
+}
+
+fn acknowledge_event_with_transport(
+    transport: &impl OperationTransport,
     store: &mut JournalStore,
     event_id: &str,
     announce: bool,
@@ -3913,7 +3979,7 @@ fn acknowledge_event(
     store
         .mark_ack_pending(event_id)
         .map_err(|error| journal_error(error, 1))?;
-    let response = match context.api.post(&request) {
+    let response = match transport.post(&request) {
         Ok(response) => response,
         Err(error) if error.outcome_unknown() => {
             if announce {
@@ -3921,12 +3987,27 @@ fn acknowledge_event(
                     &json!({"kind":"outcome_unknown","operation":"ack","event_id":event_id,"retry":"run the same ack --event command"}),
                 )?;
             }
-            return Err(CommandError::new(error.to_string(), EXIT_OUTCOME_UNKNOWN));
+            return Err(api_error(error, EXIT_OUTCOME_UNKNOWN));
         }
         Err(error) => return Err(api_error(error, 1)),
     };
     if response["type"] == "error" {
         let reason = response["reason"].as_str().unwrap_or("refused");
+        if reason == "storage_unavailable" {
+            if announce {
+                emit(&json!({
+                    "kind":"outcome_unknown",
+                    "operation":"ack",
+                    "event_id":event_id,
+                    "reason":reason
+                }))?;
+            }
+            return Err(CommandError::new(
+                "ack outcome is unknown: storage_unavailable; retry the same event acknowledgement",
+                EXIT_OUTCOME_UNKNOWN,
+            )
+            .with_reason(reconnect::SafeReason::server(reason)));
+        }
         if announce {
             emit(
                 &json!({"kind":"refused","operation":"ack","event_id":event_id,"reason":reason,"response":response}),
@@ -3940,8 +4021,8 @@ fn acknowledge_event(
     let status = response["status"].as_str().unwrap_or_default();
     if !matches!(status, "delivered" | "already_delivered") {
         return Err(CommandError::new(
-            "ack response did not contain a delivery status",
-            1,
+            "ack outcome is unknown because the response did not contain a delivery status",
+            EXIT_OUTCOME_UNKNOWN,
         ));
     }
     let transfers = response
@@ -4724,8 +4805,19 @@ fn post_read(context: &CommandContext, request: &Value) -> Result<Value, Command
         .api
         .post(request)
         .map_err(|error| api_error(error, 1))?;
+    post_read_response(response)
+}
+
+fn post_read_response(response: Value) -> Result<Value, CommandError> {
     if response["type"] == "error" {
         let reason = response["reason"].as_str().unwrap_or("refused");
+        if reason == "storage_unavailable" {
+            return Err(
+                CommandError::new("origin read is unavailable: storage_unavailable", 1)
+                    .with_reason(reconnect::SafeReason::server(reason))
+                    .with_listener_recovery(),
+            );
+        }
         return Err(CommandError::new(
             format!("origin refused the request: {reason}"),
             EXIT_REFUSED,
@@ -5006,8 +5098,18 @@ fn write_json_line(value: &Value, output: &mut impl Write) -> Result<(), Command
 }
 
 fn api_error(error: ApiError, exit_code: i32) -> CommandError {
+    let listener_recovery = match &error {
+        ApiError::Transport(_) | ApiError::InvalidResponse(_) => true,
+        ApiError::Http { status, .. } => *status >= 500,
+        _ => false,
+    };
     let reason = reconnect::SafeReason::api(&error);
-    CommandError::new(error.to_string(), exit_code).with_reason(reason)
+    let command_error = CommandError::new(error.to_string(), exit_code).with_reason(reason);
+    if listener_recovery {
+        command_error.with_listener_recovery()
+    } else {
+        command_error
+    }
 }
 
 fn journal_error(error: JournalError, fallback_code: i32) -> CommandError {
@@ -5473,6 +5575,253 @@ mod tests {
             "pending_delivered_unacted":0
         });
         assert!(session_idle(&closed).unwrap());
+    }
+
+    #[test]
+    fn listener_recovery_retries_uncertain_posts_but_preserves_refusals() {
+        assert!(listener_post_failure_requires_reconnect(&api_error(
+            ApiError::InvalidResponse("lost response".into()),
+            1,
+        )));
+        assert!(listener_post_failure_requires_reconnect(&api_error(
+            ApiError::Http {
+                status: 503,
+                body: String::new(),
+            },
+            1,
+        )));
+        assert!(listener_post_failure_requires_reconnect(
+            &CommandError::new("operation outcome unknown", EXIT_OUTCOME_UNKNOWN,)
+        ));
+
+        assert!(!listener_post_failure_requires_reconnect(&api_error(
+            ApiError::Http {
+                status: 403,
+                body: r#"{"v":1,"type":"error","reason":"revoked"}"#.into(),
+            },
+            1,
+        )));
+        assert!(!listener_post_failure_requires_reconnect(
+            &CommandError::new("origin refused the operation", EXIT_REFUSED,)
+        ));
+        assert!(listener_post_failure_requires_reconnect(
+            &post_read_response(json!({
+                "v":1,
+                "type":"error",
+                "reason":"storage_unavailable"
+            }))
+            .unwrap_err()
+        ));
+        assert!(!listener_post_failure_requires_reconnect(
+            &post_read_response(json!({
+                "v":1,
+                "type":"error",
+                "reason":"revoked"
+            }))
+            .unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn listener_failed_feed_read_keeps_the_durable_cursor_and_pending_entry() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .record_entry(JournalEntry::fetched(
+                1,
+                "1".into(),
+                session,
+                "discussion".into(),
+                "person".into(),
+                true,
+                Some("app:test".into()),
+                Some("message-1".into()),
+                Some(1),
+                json!({
+                    "event_id":"1",
+                    "kind":"discussion",
+                    "author":"person",
+                    "sender_id":"app:test",
+                    "message_id":"message-1",
+                    "request_revision":1
+                }),
+            ))
+            .unwrap();
+
+        let error = fetch_feed_with(
+            &mut store,
+            |_request| {
+                Err(api_error(
+                    ApiError::InvalidResponse("origin response was lost".into()),
+                    1,
+                ))
+            },
+            |_raw, _directory| Ok(BTreeMap::new()),
+        )
+        .unwrap_err();
+
+        assert!(listener_post_failure_requires_reconnect(&error));
+        assert_eq!(store.cursor().unwrap(), 1);
+        assert_eq!(store.pending_for(session).unwrap().len(), 1);
+        assert!(
+            store
+                .entry_by_event("1")
+                .unwrap()
+                .unwrap()
+                .delivered_at_ms
+                .is_none()
+        );
+        assert!(
+            store
+                .entry_by_event("1")
+                .unwrap()
+                .unwrap()
+                .acted_at_ms
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn listener_reconciles_unknown_mutation_with_the_saved_operation_identity() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .record_entry(JournalEntry::fetched(
+                1,
+                "1".into(),
+                session,
+                "discussion".into(),
+                "person".into(),
+                true,
+                Some("app:test".into()),
+                Some("message-1".into()),
+                Some(1),
+                json!({
+                    "event_id":"1",
+                    "kind":"discussion",
+                    "author":"person",
+                    "sender_id":"app:test",
+                    "message_id":"message-1",
+                    "request_revision":1
+                }),
+            ))
+            .unwrap();
+        let request = json!({
+            "v":1,
+            "type":"result",
+            "op_id":op_id.to_string(),
+            "sender_id":"app:test",
+            "message_id":"message-1",
+            "in_reply_to":"1",
+            "status":"applied"
+        });
+        let operation = store
+            .prepare_operation(op_id, session, "result".into(), request.clone())
+            .unwrap();
+
+        let failed =
+            MockTransport::new([Err(ApiError::InvalidResponse("response was lost".into()))]);
+        let error = submit_operation_inner(&failed, &mut store, operation, false).unwrap_err();
+        assert!(listener_post_failure_requires_reconnect(&error));
+        let unknown = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(unknown.state, OperationState::Unknown);
+        assert_eq!(unknown.request, request);
+
+        let recovered = MockTransport::new([Ok(json!({"v":1,"type":"ok","seq":2}))]);
+        reconcile_listen_operations(&recovered, &mut store, session).unwrap();
+        assert_eq!(*failed.posts.lock().unwrap(), vec![request.clone()]);
+        assert_eq!(*recovered.posts.lock().unwrap(), vec![request.clone()]);
+        let committed = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(committed.op_id, op_id);
+        assert_eq!(committed.request, request);
+        assert_eq!(committed.state, OperationState::Committed);
+        let source = store.entry_by_event("1").unwrap().unwrap();
+        assert!(source.acted_at_ms.is_some());
+        assert!(store.pending_for(session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn listener_reconciles_ambiguous_ack_with_the_same_event_payload() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .record_entry(JournalEntry::fetched(
+                1,
+                "1".into(),
+                session,
+                "discussion".into(),
+                "person".into(),
+                true,
+                Some("app:test".into()),
+                Some("message-1".into()),
+                Some(1),
+                json!({
+                    "event_id":"1",
+                    "kind":"discussion",
+                    "author":"person",
+                    "sender_id":"app:test",
+                    "message_id":"message-1",
+                    "request_revision":1
+                }),
+            ))
+            .unwrap();
+
+        let failed =
+            MockTransport::new([Err(ApiError::InvalidResponse("response was lost".into()))]);
+        let error = acknowledge_event_with_transport(&failed, &mut store, "1", false).unwrap_err();
+        assert!(listener_post_failure_requires_reconnect(&error));
+        let pending = store.entry_by_event("1").unwrap().unwrap();
+        assert!(pending.ack_pending_at_ms.is_some());
+        assert!(pending.delivered_at_ms.is_none());
+        assert!(pending.acted_at_ms.is_none());
+
+        let malformed = MockTransport::new([Ok(json!({"v":1,"type":"ok"}))]);
+        let error = acknowledge_event_with_transport(&malformed, &mut store, "1", false)
+            .unwrap_err();
+        assert!(listener_post_failure_requires_reconnect(&error));
+
+        let unavailable = MockTransport::new([Ok(json!({
+            "v":1,
+            "type":"error",
+            "reason":"storage_unavailable"
+        }))]);
+        let error =
+            acknowledge_event_with_transport(&unavailable, &mut store, "1", false).unwrap_err();
+        assert!(listener_post_failure_requires_reconnect(&error));
+        assert!(
+            store
+                .entry_by_event("1")
+                .unwrap()
+                .unwrap()
+                .ack_pending_at_ms
+                .is_some()
+        );
+
+        let recovered = MockTransport::new([Ok(json!({
+            "v":1,
+            "type":"ok",
+            "status":"already_delivered"
+        }))]);
+        acknowledge_event_with_transport(&recovered, &mut store, "1", false).unwrap();
+        let failed_posts = failed.posts.lock().unwrap().clone();
+        let malformed_posts = malformed.posts.lock().unwrap().clone();
+        let unavailable_posts = unavailable.posts.lock().unwrap().clone();
+        let recovered_posts = recovered.posts.lock().unwrap().clone();
+        assert_eq!(
+            failed_posts,
+            vec![json!({"v":1,"type":"ack","event_id":"1"})]
+        );
+        assert_eq!(malformed_posts, failed_posts);
+        assert_eq!(unavailable_posts, failed_posts);
+        assert_eq!(recovered_posts, failed_posts);
+        let settled = store.entry_by_event("1").unwrap().unwrap();
+        assert!(settled.ack_pending_at_ms.is_none());
+        assert!(settled.delivered_at_ms.is_some());
+        assert!(settled.acted_at_ms.is_none());
     }
 
     #[test]
@@ -7403,10 +7752,34 @@ mod tests {
     }
 
     #[test]
-    fn standalone_listen_keeps_user_operations_pending_and_reconciles_attachment_support() {
+    fn listener_retries_unknown_operations_and_leaves_prepared_user_operations_alone() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
         let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        for sequence in 1..=2 {
+            let event_id = sequence.to_string();
+            store
+                .record_entry(JournalEntry::fetched(
+                    sequence,
+                    event_id.clone(),
+                    session,
+                    "discussion".into(),
+                    "person".into(),
+                    true,
+                    Some("app:test".into()),
+                    Some("message-1".into()),
+                    Some(1),
+                    json!({
+                        "event_id":event_id,
+                        "kind":"discussion",
+                        "author":"person",
+                        "sender_id":"app:test",
+                        "message_id":"message-1",
+                        "request_revision":1
+                    }),
+                ))
+                .unwrap();
+        }
         let mut message_operations = Vec::new();
 
         for kind in ["send", "revise", "reply", "withdraw", "result"] {
@@ -7437,7 +7810,7 @@ mod tests {
                         "sender_id":"app:test",
                         "message_id":"message-1",
                         "request_revision":1,
-                        "in_reply_to":"event-1",
+                        "in_reply_to":"1",
                         "text":"A reply"
                     }),
                     "withdraw" => json!({
@@ -7453,7 +7826,7 @@ mod tests {
                         "op_id":op_id.to_string(),
                         "sender_id":"app:test",
                         "message_id":"message-1",
-                        "in_reply_to":"event-2",
+                        "in_reply_to":"2",
                         "status":"applied"
                     }),
                     _ => unreachable!(),
@@ -7511,6 +7884,12 @@ mod tests {
         let mut recovery_order = recoverable_operations
             .iter()
             .map(|(kind, _, op_id, _)| (*kind, *op_id))
+            .chain(
+                message_operations
+                    .iter()
+                    .filter(|(_, state, _, _)| *state == OperationState::Unknown)
+                    .map(|(kind, _, op_id, _)| (*kind, *op_id)),
+            )
             .collect::<Vec<_>>();
         recovery_order.sort_by_key(|(_, op_id)| {
             let operation = store.operation(*op_id).unwrap().unwrap();
@@ -7545,18 +7924,32 @@ mod tests {
             .iter()
             .map(|(_, _, _, request)| request.to_string())
             .collect::<Vec<_>>();
+        expected.extend(
+            message_operations
+                .iter()
+                .filter(|(_, state, _, _)| *state == OperationState::Unknown)
+                .map(|(_, _, _, request)| request.to_string()),
+        );
         posted.sort();
         expected.sort();
         assert_eq!(
             posted, expected,
-            "listen should leave user messages alone and preserve other operation recovery"
+            "listen should retry only operations already submitted and preserve their saved requests"
         );
 
         for (kind, state, op_id, request) in &message_operations {
             let saved = store.operation(*op_id).unwrap().unwrap();
             assert_eq!(saved.kind, *kind, "{kind}");
             assert_eq!(saved.op_id, *op_id, "{kind}");
-            assert_eq!(saved.state, *state, "{kind}, {state:?}");
+            assert_eq!(
+                saved.state,
+                if *state == OperationState::Unknown {
+                    OperationState::Committed
+                } else {
+                    OperationState::Prepared
+                },
+                "{kind}, {state:?}"
+            );
             assert_eq!(saved.request, *request, "{kind}");
         }
         for (kind, _, op_id, request) in &recoverable_operations {
