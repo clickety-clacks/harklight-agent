@@ -45,6 +45,19 @@ impl ApiError {
             _ => false,
         }
     }
+
+    /// The server's stated refusal reason, when the response carries a valid
+    /// v1 error envelope.
+    pub fn refusal_reason(&self) -> Option<String> {
+        match self {
+            Self::Refused(reason) => Some(reason.clone()),
+            Self::Http { body, .. } => serde_json::from_str::<Value>(body)
+                .ok()
+                .filter(|value| value["v"] == 1 && value["type"] == "error")
+                .and_then(|value| value["reason"].as_str().map(str::to_owned)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -317,6 +330,42 @@ mod tests {
             decoder.next_change(),
             Err(ApiError::InvalidNotice(_))
         ));
+    }
+
+    #[test]
+    fn refusal_reason_reads_only_valid_v1_error_envelopes() {
+        assert_eq!(
+            ApiError::Refused("revoked".into()).refusal_reason().as_deref(),
+            Some("revoked")
+        );
+        assert_eq!(
+            ApiError::Http {
+                status: 403,
+                body: r#"{"v":1,"type":"error","reason":"revoked"}"#.into(),
+            }
+            .refusal_reason()
+            .as_deref(),
+            Some("revoked")
+        );
+        for body in [
+            "not json",
+            r#"{"v":2,"type":"error","reason":"revoked"}"#,
+            r#"{"v":1,"type":"ok","reason":"revoked"}"#,
+            r#"{"v":1,"type":"error"}"#,
+        ] {
+            assert_eq!(
+                ApiError::Http {
+                    status: 403,
+                    body: body.into(),
+                }
+                .refusal_reason(),
+                None
+            );
+        }
+        assert_eq!(
+            ApiError::InvalidResponse("revoked".into()).refusal_reason(),
+            None
+        );
     }
 
     #[test]

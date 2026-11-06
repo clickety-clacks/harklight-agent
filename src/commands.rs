@@ -4418,7 +4418,12 @@ fn submit_operation_inner(
             store
                 .reject_operation(operation.op_id, saved)
                 .map_err(|error| journal_error(error, 1))?;
-            return Err(api_error(error, 1));
+            let exit = if error.refusal_reason().as_deref() == Some("revoked") {
+                EXIT_REFUSED
+            } else {
+                1
+            };
+            return Err(api_error(error, exit));
         }
     };
 
@@ -8002,6 +8007,38 @@ mod tests {
             store.operation(op_id).unwrap().unwrap().state,
             OperationState::Unknown
         );
+    }
+
+    #[test]
+    fn revoked_device_refusal_exits_refused_instead_of_connection_error() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = ack2_request(op_id, "812", None, false, None).unwrap();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let operation = prepare(&mut store, session, op_id, "ack2", request).unwrap();
+        let transport = MockTransport::new([Err(ApiError::Http {
+            status: 403,
+            body: r#"{"v":1,"type":"error","reason":"revoked"}"#.into(),
+        })]);
+        let error = submit_operation_inner(&transport, &mut store, operation, false).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_REFUSED);
+        assert_eq!(
+            store.operation(op_id).unwrap().unwrap().state,
+            OperationState::Rejected
+        );
+
+        // Any other HTTP refusal without a revoked envelope keeps today's
+        // transport-failure classification.
+        let op_id = Uuid::new_v4();
+        let request = ack2_request(op_id, "813", None, false, None).unwrap();
+        let operation = prepare(&mut store, session, op_id, "ack2", request).unwrap();
+        let transport = MockTransport::new([Err(ApiError::Http {
+            status: 403,
+            body: "forbidden".into(),
+        })]);
+        let error = submit_operation_inner(&transport, &mut store, operation, false).unwrap_err();
+        assert_eq!(error.exit_code, 1);
     }
 
     #[test]
