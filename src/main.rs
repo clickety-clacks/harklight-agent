@@ -114,6 +114,8 @@ enum Command {
         route: Option<Route>,
         #[arg(long)]
         controller: bool,
+        #[arg(long, requires_all = ["route", "controller"])]
+        origin_listener: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
         #[arg(
@@ -138,6 +140,8 @@ enum Command {
         route: Route,
         #[arg(long)]
         controller: bool,
+        #[arg(long, requires_all = ["route", "controller"])]
+        origin_listener: bool,
         #[arg(
             long,
             requires = "controller",
@@ -461,6 +465,7 @@ fn main() {
             vendor_session_id,
             route,
             controller,
+            origin_listener,
             files,
             answer_ui_file,
             prepare,
@@ -492,6 +497,7 @@ fn main() {
                 execute,
                 op_id,
                 &MessageFieldOptions {
+                    origin_listener,
                     message_type,
                     message_kind,
                     reply,
@@ -515,14 +521,16 @@ fn main() {
             vendor_session_id,
             route,
             controller,
+            origin_listener,
             ack2,
-        } => commands::attach(
+        } => commands::attach_with_origin(
             &context,
             session,
             &vendor_session_id,
             route.into(),
             controller,
             ack2,
+            origin_listener,
         ),
         Command::Reconnect {
             session,
@@ -619,6 +627,7 @@ fn main() {
                 &files,
                 op_id,
                 &MessageFieldOptions {
+                    origin_listener: false,
                     message_type,
                     message_kind,
                     reply,
@@ -728,6 +737,28 @@ fn fail(message: String, exit_code: i32) -> ! {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn origin_listener_options_are_exclusive_before_configuration_or_network() {
+        assert!(Cli::try_parse_from(["agent", "listen", "--origin", "--follow"]).is_ok());
+        for extra in ["--controller", "--ack2", "--next"] {
+            assert!(
+                Cli::try_parse_from(["agent", "listen", "--origin", "--follow", extra]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["agent", "listen", "--origin"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "listen",
+                "--origin",
+                "--follow",
+                "--session",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn reconnect_accepts_saved_or_complete_attachment_inputs() {

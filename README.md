@@ -528,3 +528,46 @@ and [interactive mode reference](https://code.claude.com/docs/en/interactive-mod
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### One listener for an external system
+
+Run `harklight-agent listen --origin --follow` to keep one standing notice
+connection for the configured enrollment. Actions such as `ack`, `reply` and
+`result` remain separate short requests, using the emitted `session_handle` and
+`event_id` with the existing commands. Use the same state directory for the
+listener and these commands.
+
+Coverage is explicit. Create a covered conversation with
+`send --session new --route other --controller --origin-listener` (plus the usual
+message fields), or use `attach --route other --controller --origin-listener`
+with the existing handle and vendor-session options. Success requires the server
+to confirm coverage. If a send commits but coverage is unsupported, its normal
+result remains valid: keep that message and operation identity; do not send it
+again. Upgrade the server before enabling coverage.
+
+To move an existing supported route-other handle without a listening gap:
+
+1. Start the origin listener while the existing per-handle listener stays up.
+2. Run `cover --session <handle>`. This preserves the handle's current ACK2 and
+   advisory capability declarations and takes no per-handle listener lease.
+3. After the origin listener has taken over the handle's pending events, stop the
+   old per-handle listener. During overlap, deduplicate actions by `event_id`.
+
+Coverage survives server and listener restarts. Restarting a **per-handle**
+`listen` on a covered handle replaces its support declaration and **withdraws
+origin coverage**. Avoid restarting per-handle listeners for handles that should
+remain covered. A declaration without `origin_listener: true` also withdraws
+coverage; the origin listener updates its set on the server's coverage notice.
+
+The origin listener stays connected when no requests remain open. On reconnect,
+it offers still-pending entries again with their existing `delivered` and `acted`
+facts. Deduplicate by `event_id`; a feed cursor records fetch progress, not action
+completion. There is one local origin listener lease per enrollment state
+directory, independent of handle leases. A replacement connection for the same
+enrollment makes the displaced listener exit with listener-active code 6 instead
+of reconnecting. An unsupported server produces exit code 5.
+
+The scope is the enrolled identity, including conversations it opened through its
+granted senders. Separate systems that need separate aggregation use separate
+enrollments; sharing an enrollment shares its scope. There is no sender filter,
+all-messages feed, automatic migration, or automatic resend.

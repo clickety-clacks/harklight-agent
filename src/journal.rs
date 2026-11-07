@@ -2150,6 +2150,27 @@ mod tests {
     }
 
     #[test]
+    fn origin_lease_is_exclusive_and_independent_of_handle_leases() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut origin = open(&root, Uuid::nil());
+        origin.acquire_origin_listener().unwrap();
+        let mut second = open(&root, Uuid::nil());
+        assert!(matches!(
+            second.acquire_origin_listener(),
+            Err(JournalError::ListenerActive(_))
+        ));
+        let mut handle = open(&root, session);
+        handle.acquire_listener().unwrap();
+        handle.record_entry(entry(session, 1, "pending")).unwrap();
+        assert_eq!(origin.cursor().unwrap(), 1);
+        assert_eq!(origin.pending_for(session).unwrap().len(), 1);
+        drop(origin);
+        second.acquire_origin_listener().unwrap();
+        assert_eq!(second.pending_for(session).unwrap().len(), 1);
+    }
+
+    #[test]
     fn listener_lease_blocks_only_another_listener() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
