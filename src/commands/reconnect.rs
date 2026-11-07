@@ -330,6 +330,7 @@ fn attach_locked(
     route: OriginHarness,
     controller: bool,
     ack2: bool,
+    origin_listener: bool,
 ) -> Result<Value, Failure> {
     if vendor.is_empty() || (controller && route != OriginHarness::Other) {
         return Err(Failure::local(
@@ -340,13 +341,11 @@ fn attach_locked(
         ));
     }
     let vendor = (vendor != "none").then_some(vendor);
-    let support = attachment_support_request_with_ack2(
-        Uuid::new_v4(),
-        session,
-        route,
-        controller,
-        ack2,
-    );
+    let mut support =
+        attachment_support_request_with_ack2(Uuid::new_v4(), session, route, controller, ack2);
+    if origin_listener {
+        support["origin_listener"] = Value::Bool(true);
+    }
     ensure_attach_recovery_compatible(store, session, vendor, &support)
         .map_err(|e| Failure::command("attachment", e))?;
     let operation = prepare_or_resume_operation(
@@ -430,11 +429,21 @@ pub(super) fn controller_attach(
     vendor: &str,
     route: OriginHarness,
     ack2: bool,
+    origin_listener: bool,
 ) -> Result<(), CommandError> {
     let result = (|| {
         let mut store = open_locked(context, session)?;
         recover_attachment(&context.api, &mut store, session)?;
-        let attached = attach_locked(context, &mut store, session, vendor, route, true, ack2)?;
+        let attached = attach_locked(
+            context,
+            &mut store,
+            session,
+            vendor,
+            route,
+            true,
+            ack2,
+            origin_listener,
+        )?;
         emit(&attached).map_err(|e| Failure::command("attachment", e))
     })();
     result.map_err(|e: Failure| e.report(session))
@@ -471,7 +480,9 @@ fn reconnect_inner(
             ));
         }
     };
-    let attached = attach_locked(context, &mut store, session, &vendor, route, controller, false)?;
+    let attached = attach_locked(
+        context, &mut store, session, &vendor, route, controller, false, false,
+    )?;
     if attached["ready_for_listen"] != true {
         return Err(Failure::local(
             "support",

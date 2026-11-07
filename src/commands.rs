@@ -31,11 +31,14 @@ pub const EXIT_UNSUPPORTED: i32 = 5;
 pub const EXIT_LISTENER_ACTIVE: i32 = 6;
 pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
 
+mod origin;
+pub use origin::{cover, listen_origin};
 mod reconnect;
 pub use reconnect::{reconnect, reconnect_configuration_error};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageFieldOptions {
+    pub origin_listener: bool,
     pub message_type: Option<String>,
     pub message_kind: Option<String>,
     pub reply: bool,
@@ -56,7 +59,8 @@ pub struct MessageFieldOptions {
 
 impl MessageFieldOptions {
     fn has_any(&self) -> bool {
-        self.message_type.is_some()
+        self.origin_listener
+            || self.message_type.is_some()
             || self.message_kind.is_some()
             || self.reply
             || self.importance.is_some()
@@ -83,6 +87,9 @@ impl MessageFieldOptions {
             "choice_styles":self.choice_styles,
             "clear_default":self.clear_default
         });
+        if self.origin_listener {
+            identity["origin_listener"] = Value::Bool(true);
+        }
         if let Some(display_name) = &self.display_name {
             identity["display_name"] = Value::String(display_name.clone());
         }
@@ -1765,6 +1772,14 @@ pub fn send_with_fields(
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route, controller)?;
+    if fields.origin_listener
+        && (session_arg != "new" || route != Some(OriginHarness::Other) || !controller)
+    {
+        return Err(CommandError::new(
+            "--origin-listener requires --session new --route other --controller",
+            EXIT_REFUSED,
+        ));
+    }
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
@@ -1825,7 +1840,24 @@ pub fn send_with_fields(
     )?;
     let response = submit_operation(context, &mut store, operation)?;
     validate_send_response_session(&response, &expected_session)?;
-    emit(&send_result(sender_id, &message_id, session, &response))
+    emit(&send_result(sender_id, &message_id, session, &response))?;
+    confirm_origin_coverage(fields.origin_listener, &response, "send")
+}
+
+fn confirm_origin_coverage(
+    requested: bool,
+    response: &Value,
+    operation: &str,
+) -> Result<(), CommandError> {
+    if requested && response["listening_support"]["origin_listener"] != true {
+        let reason = if operation == "send" {
+            "message committed; origin-listener coverage is unsupported. Keep this message and operation identity; do not send again"
+        } else {
+            "server did not confirm origin-listener coverage"
+        };
+        return unsupported(operation, reason);
+    }
+    Ok(())
 }
 
 fn validate_send_response_session(
@@ -1927,6 +1959,9 @@ fn build_send_request_with_fields(
         request["route"] = Value::String(route.as_str().to_owned());
         request["cli_version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
         request["unsupported_reason"] = route.unsupported_reason(controller);
+    }
+    if fields.origin_listener {
+        request["origin_listener"] = Value::Bool(true);
     }
     if let Some(vendor_session_id) = vendor_session_id {
         request["vendor_session_id"] = Value::String(vendor_session_id.to_owned());
@@ -2067,6 +2102,14 @@ pub fn prepare_send_with_fields(
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let route = validate_send_route(session_arg, route, controller)?;
+    if fields.origin_listener
+        && (session_arg != "new" || route != Some(OriginHarness::Other) || !controller)
+    {
+        return Err(CommandError::new(
+            "--origin-listener requires --session new --route other --controller",
+            EXIT_REFUSED,
+        ));
+    }
     let global = context.open_global_store()?;
 
     if let Some(existing) = global
@@ -2299,7 +2342,12 @@ pub fn execute_send(context: &CommandContext, op_id: Uuid) -> Result<(), Command
                 .clone()
                 .ok_or_else(|| CommandError::new("committed operation has no saved response", 1))?;
             validate_send_response_session(&response, &operation.session_handle.to_string())?;
-            emit_committed("send", op_id, response)
+            emit_committed("send", op_id, response.clone())?;
+            confirm_origin_coverage(
+                operation.request["origin_listener"] == true,
+                &response,
+                "send",
+            )
         }
         OperationState::Rejected => refused(
             "send",
@@ -2309,7 +2357,12 @@ pub fn execute_send(context: &CommandContext, op_id: Uuid) -> Result<(), Command
         OperationState::Prepared | OperationState::Unknown => {
             let response = submit_operation(context, &mut store, operation.clone())?;
             validate_send_response_session(&response, &operation.session_handle.to_string())?;
-            emit_committed("send", op_id, response)
+            emit_committed("send", op_id, response.clone())?;
+            confirm_origin_coverage(
+                operation.request["origin_listener"] == true,
+                &response,
+                "send",
+            )
         }
     }
 }
@@ -2632,6 +2685,32 @@ pub fn attach(
     controller: bool,
     ack2: bool,
 ) -> Result<(), CommandError> {
+    attach_with_origin(
+        context,
+        session,
+        vendor_session_arg,
+        route,
+        controller,
+        ack2,
+        false,
+    )
+}
+
+pub fn attach_with_origin(
+    context: &CommandContext,
+    session: Uuid,
+    vendor_session_arg: &str,
+    route: OriginHarness,
+    controller: bool,
+    ack2: bool,
+    origin_listener: bool,
+) -> Result<(), CommandError> {
+    if origin_listener && (!controller || route != OriginHarness::Other) {
+        return Err(CommandError::new(
+            "--origin-listener requires --route other --controller",
+            EXIT_REFUSED,
+        ));
+    }
     if ack2 && !controller {
         return Err(CommandError::new(
             "--ack2 requires --controller",
@@ -2639,7 +2718,14 @@ pub fn attach(
         ));
     }
     if controller {
-        return reconnect::controller_attach(context, session, vendor_session_arg, route, ack2);
+        return reconnect::controller_attach(
+            context,
+            session,
+            vendor_session_arg,
+            route,
+            ack2,
+            origin_listener,
+        );
     }
     if session.get_version() != Some(Version::Random) {
         return Err(CommandError::new(
@@ -2675,13 +2761,8 @@ pub fn attach(
         ));
     }
 
-    let support_request = attachment_support_request_with_ack2(
-        Uuid::new_v4(),
-        session,
-        route,
-        controller,
-        ack2,
-    );
+    let support_request =
+        attachment_support_request_with_ack2(Uuid::new_v4(), session, route, controller, ack2);
     ensure_attach_recovery_compatible(&store, session, vendor_session_id, &support_request)?;
 
     let attachment_request = attachment_update_request(Uuid::new_v4(), session, vendor_session_id);
@@ -2887,7 +2968,10 @@ pub fn ack2(
     not_handed: Option<&str>,
 ) -> Result<(), CommandError> {
     if session.get_version() != Some(Version::Random) {
-        return Err(CommandError::new("session handle must be UUIDv4", EXIT_REFUSED));
+        return Err(CommandError::new(
+            "session handle must be UUIDv4",
+            EXIT_REFUSED,
+        ));
     }
     validate_event_id(event_id)?;
     let mut store = context.open_store(session)?;
@@ -3507,8 +3591,13 @@ pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> 
                     op_id,
                     &operation.kind,
                     &operation.request,
-                    response,
-                )?)
+                    response.clone(),
+                )?)?;
+                confirm_origin_coverage(
+                    operation.request["origin_listener"] == true,
+                    &response,
+                    &operation.kind,
+                )
             }
         }
         OperationState::Rejected => refused(
@@ -3528,8 +3617,13 @@ pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> 
                     op_id,
                     &operation.kind,
                     &operation.request,
-                    response,
-                )?)
+                    response.clone(),
+                )?)?;
+                confirm_origin_coverage(
+                    operation.request["origin_listener"] == true,
+                    &response,
+                    &operation.kind,
+                )
             }
         }
     }
@@ -3840,6 +3934,9 @@ fn support_record_matches(status: &Value, request: &Value) -> bool {
     support.get("route") == request.get("route")
         && support.get("cli_version") == request.get("cli_version")
         && support.get("unsupported_reason") == request.get("unsupported_reason")
+        && request
+            .get("origin_listener")
+            .is_none_or(|expected| support.get("origin_listener") == Some(expected))
         && request
             .get("ack2")
             .is_none_or(|expected| support.get("ack2") == Some(expected))
@@ -5226,6 +5323,36 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_coverage_keeps_the_committed_send_and_recovery_identity() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let mut store = JournalStore::open(&root.0, "fixture-origin", session).unwrap();
+        let request = json!({"v":1,"type":"send","op_id":op_id,"session_handle":session,
+            "origin_listener":true,"message":{"sender_id":"app:test","message_id":"fixed-message"}});
+        store
+            .prepare_operation(op_id, session, "send".into(), request.clone())
+            .unwrap();
+        let response = json!({"v":1,"type":"ok","session_handle":session,"seq":1});
+        store
+            .settle_operation(op_id, response.clone(), None)
+            .unwrap();
+        let error = confirm_origin_coverage(true, &response, "send").unwrap_err();
+        assert_eq!(error.exit_code, EXIT_UNSUPPORTED);
+        assert!(error.message.contains("do not send again"));
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Committed);
+        assert_eq!(saved.request, request);
+        assert_eq!(saved.response, Some(response));
+        let plain = MessageFieldOptions::default();
+        let covered = MessageFieldOptions {
+            origin_listener: true,
+            ..plain.clone()
+        };
+        assert_ne!(plain.identity(), covered.identity());
+    }
+
+    #[test]
     fn answer_ui_file_preserves_large_integers_and_rejects_nested_duplicate_names() {
         let scratch = Scratch::new();
         let path = scratch.0.join("cover.json");
@@ -5809,8 +5936,8 @@ mod tests {
         assert!(pending.acted_at_ms.is_none());
 
         let malformed = MockTransport::new([Ok(json!({"v":1,"type":"ok"}))]);
-        let error = acknowledge_event_with_transport(&malformed, &mut store, "1", false)
-            .unwrap_err();
+        let error =
+            acknowledge_event_with_transport(&malformed, &mut store, "1", false).unwrap_err();
         assert!(listener_post_failure_requires_reconnect(&error));
 
         let unavailable = MockTransport::new([Ok(json!({
@@ -7588,9 +7715,8 @@ mod tests {
             "ref":"reply-ref"
         });
 
-        let error =
-            handle_operation_error_response(&mut store, &operation, response.clone(), true)
-                .unwrap_err();
+        let error = handle_operation_error_response(&mut store, &operation, response.clone(), true)
+            .unwrap_err();
 
         assert_eq!(error.message, CLOSED_REPLY_MESSAGE);
         assert_eq!(
@@ -8338,12 +8464,8 @@ mod tests {
     #[test]
     fn controller_ack2_support_is_opt_in_and_requires_server_confirmation() {
         let session = Uuid::new_v4();
-        let legacy = attachment_support_request(
-            Uuid::new_v4(),
-            session,
-            OriginHarness::Other,
-            true,
-        );
+        let legacy =
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::Other, true);
         assert!(legacy.get("ack2").is_none());
 
         let declared = attachment_support_request_with_ack2(
@@ -8362,15 +8484,17 @@ mod tests {
             true,
         );
         assert_eq!(listen_declared["ack2"], true);
-        assert!(listener_support_request(
-            Uuid::new_v4(),
-            session,
-            OriginHarness::Other,
-            Value::Null,
-            false
-        )
-        .get("ack2")
-        .is_none());
+        assert!(
+            listener_support_request(
+                Uuid::new_v4(),
+                session,
+                OriginHarness::Other,
+                Value::Null,
+                false
+            )
+            .get("ack2")
+            .is_none()
+        );
         let status = json!({
             "listening_support": {
                 "route":"other",
@@ -8417,7 +8541,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(not_handed["outcome"], "not_handed");
-        assert_eq!(not_handed["reason"], "The receiver could not hand off this entry.");
+        assert_eq!(
+            not_handed["reason"],
+            "The receiver could not hand off this entry."
+        );
         assert_eq!(not_handed["agent"], "Studio");
         assert!(not_handed.get("rerouted").is_none());
 
@@ -8435,9 +8562,8 @@ mod tests {
         let request = ack2_request(op_id, "812", Some("Studio"), true, None).unwrap();
         let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
         let operation = prepare(&mut store, session, op_id, "ack2", request.clone()).unwrap();
-        let uncertain = MockTransport::new([Err(ApiError::InvalidResponse(
-            "response was lost".into(),
-        ))]);
+        let uncertain =
+            MockTransport::new([Err(ApiError::InvalidResponse("response was lost".into()))]);
         let error = submit_operation_inner(&uncertain, &mut store, operation, false).unwrap_err();
         assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN);
         let saved = store.operation(op_id).unwrap().unwrap();
