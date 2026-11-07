@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -622,6 +622,30 @@ impl JournalStore {
             "SELECT payload FROM entries WHERE session_handle=?1 AND pending_active=1 ORDER BY feed_seq",
             &session_handle.to_string(),
         ))
+    }
+
+    /// One read of the active subset, regardless of how many old handles remain covered.
+    pub fn pending_for_coverage(
+        &self,
+        covered: &BTreeSet<Uuid>,
+    ) -> Result<Vec<JournalEntry>, JournalError> {
+        self.with_read(|connection| {
+            // The partial index keeps closed history out of this scan. Ordering by
+            // feed_seq may sort the active subset, never the lifetime journal.
+            let mut statement = connection.prepare(
+                "SELECT payload FROM entries INDEXED BY entries_pending_by_session \
+                 WHERE pending_active=1 ORDER BY feed_seq",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let entry: JournalEntry = serde_json::from_str(&row?)?;
+                if covered.contains(&entry.session_handle) {
+                    pending.push(entry);
+                }
+            }
+            Ok(pending)
+        })
     }
 
     pub fn pending_acknowledgements_for(
@@ -2147,6 +2171,47 @@ mod tests {
             true
         );
         assert!(snapshot.pending_for(session).is_empty());
+    }
+
+    #[test]
+    fn origin_pending_read_filters_coverage_and_scans_only_active_entries() {
+        let root = Scratch::new();
+        let selected = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut store = open(&root, selected);
+        store.record_entry(entry(selected, 1, "acted")).unwrap();
+        store.record_entry(entry(other, 2, "not covered")).unwrap();
+        store
+            .record_entry(entry(selected, 3, "delivered pending"))
+            .unwrap();
+        store.record_entry(entry(selected, 4, "pending")).unwrap();
+        store.mark_acted("1").unwrap();
+        store.mark_delivered("3").unwrap();
+        let mut covered: BTreeSet<_> = (0..2000).map(|_| Uuid::new_v4()).collect();
+        covered.insert(selected);
+        let pending = store.pending_for_coverage(&covered).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|entry| entry.feed_seq)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(pending[0].delivered_at_ms.is_some());
+        assert!(
+            store
+                .pending_for_coverage(&BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        store.with_read(|connection| {
+            let plan: String = connection.query_row(
+                "EXPLAIN QUERY PLAN SELECT payload FROM entries INDEXED BY entries_pending_by_session WHERE pending_active=1 ORDER BY feed_seq",
+                [], |row| row.get(3),
+            )?;
+            assert!(plan.contains("entries_pending_by_session"), "{plan}");
+            Ok(())
+        }).unwrap();
     }
 
     #[test]

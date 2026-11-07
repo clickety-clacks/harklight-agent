@@ -54,15 +54,9 @@ fn emit_covered(
     covered: &BTreeSet<Uuid>,
     offered: &mut BTreeSet<String>,
 ) -> Result<(), CommandError> {
-    let mut pending = Vec::new();
-    for handle in covered {
-        pending.extend(
-            store
-                .pending_for(*handle)
-                .map_err(|error| journal_error(error, 1))?,
-        );
-    }
-    pending.sort_by_key(|entry| entry.feed_seq);
+    let pending = store
+        .pending_for_coverage(covered)
+        .map_err(|error| journal_error(error, 1))?;
     for (index, entry) in pending.iter().enumerate() {
         if !offered.contains(&entry.event_id) {
             emit(&event_line(entry, pending.len().saturating_sub(index + 1)))?;
