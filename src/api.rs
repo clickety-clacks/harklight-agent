@@ -174,7 +174,15 @@ impl OriginClient {
     fn open_stream(&self, session: Uuid, reconnect: bool) -> Result<SseStream, ApiError> {
         let suffix = if reconnect { "&reconnect=1" } else { "" };
         let path = format!("/origin/v1/stream?session={session}{suffix}");
-        let url = self.identity.origin_url(self.port, &path)?;
+        self.open_stream_path(&path)
+    }
+
+    pub fn connect_origin_stream(&self) -> Result<SseStream, ApiError> {
+        self.open_stream_path("/origin/v1/stream?scope=origin&reconnect=1")
+    }
+
+    fn open_stream_path(&self, path: &str) -> Result<SseStream, ApiError> {
+        let url = self.identity.origin_url(self.port, path)?;
         let response = self.client.get(url).send()?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -229,6 +237,13 @@ fn parse_post_response_body(status: u16, body: &str) -> Result<Value, ApiError> 
     Ok(value)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum OriginNotice {
+    Change(u64),
+    Coverage,
+    Replaced,
+}
+
 pub struct SseStream {
     decoder: SseDecoder<BufReader<Response>>,
 }
@@ -251,6 +266,10 @@ impl SseStream {
     pub fn next_change(&mut self) -> Result<u64, ApiError> {
         self.decoder.next_change()
     }
+
+    pub fn next_notice(&mut self) -> Result<OriginNotice, ApiError> {
+        self.decoder.next_notice()
+    }
 }
 
 impl<R: BufRead> SseDecoder<R> {
@@ -263,6 +282,14 @@ impl<R: BufRead> SseDecoder<R> {
     }
 
     pub fn next_change(&mut self) -> Result<u64, ApiError> {
+        loop {
+            if let OriginNotice::Change(cursor) = self.next_notice()? {
+                return Ok(cursor);
+            }
+        }
+    }
+
+    pub fn next_notice(&mut self) -> Result<OriginNotice, ApiError> {
         loop {
             let mut line = String::new();
             let read = self.reader.read_line(&mut line)?;
@@ -279,10 +306,18 @@ impl<R: BufRead> SseDecoder<R> {
                         .ok_or_else(|| ApiError::InvalidNotice(data.clone()))?;
                     self.event.clear();
                     self.data.clear();
-                    return Ok(cursor);
+                    return Ok(OriginNotice::Change(cursor));
                 }
+                let control = match self.event.as_str() {
+                    "coverage" => Some(OriginNotice::Coverage),
+                    "replaced" => Some(OriginNotice::Replaced),
+                    _ => None,
+                };
                 self.event.clear();
                 self.data.clear();
+                if let Some(notice) = control {
+                    return Ok(notice);
+                }
                 continue;
             }
             if line.starts_with(':') {
@@ -303,6 +338,14 @@ impl<R: BufRead> SseDecoder<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn origin_notices_preserve_control_events() {
+        let mut decoder = SseDecoder::new(Cursor::new(b"event: coverage\ndata: {}\n\nevent: change\ndata: {\"cursor\":7}\n\nevent: replaced\ndata: {}\n\n"));
+        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Coverage);
+        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Change(7));
+        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Replaced);
+    }
 
     #[test]
     fn one_cursor_subscription_reads_multiple_change_notices() {
@@ -335,7 +378,9 @@ mod tests {
     #[test]
     fn refusal_reason_reads_only_valid_v1_error_envelopes() {
         assert_eq!(
-            ApiError::Refused("revoked".into()).refusal_reason().as_deref(),
+            ApiError::Refused("revoked".into())
+                .refusal_reason()
+                .as_deref(),
             Some("revoked")
         );
         assert_eq!(

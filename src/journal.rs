@@ -668,6 +668,15 @@ impl JournalStore {
             .join(op_id.to_string())
     }
 
+    pub fn acquire_origin_listener(&mut self) -> Result<(), JournalError> {
+        self.listener_lock_path = self
+            .journal_path
+            .parent()
+            .expect("journal directory")
+            .join("origin.listener.lock");
+        self.acquire_listener()
+    }
+
     pub fn acquire_listener(&mut self) -> Result<(), JournalError> {
         if self.listener_lock.is_some() {
             return Ok(());

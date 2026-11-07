@@ -157,6 +157,11 @@ enum Command {
         controller: bool,
     },
     Listen(ListenArgs),
+    /// Move an existing supported route-other handle under the origin listener.
+    Cover {
+        #[arg(long)]
+        session: Uuid,
+    },
     Read {
         #[arg(long)]
         session: Uuid,
@@ -176,11 +181,18 @@ enum Command {
         session: Uuid,
         #[arg(long)]
         event: String,
-        #[arg(long, help = "Human-readable name of the agent that received the entry")]
+        #[arg(
+            long,
+            help = "Human-readable name of the agent that received the entry"
+        )]
         agent: Option<String>,
         #[arg(long, conflicts_with = "not_handed")]
         rerouted: bool,
-        #[arg(long = "not-handed", value_name = "REASON", conflicts_with = "rerouted")]
+        #[arg(
+            long = "not-handed",
+            value_name = "REASON",
+            conflicts_with = "rerouted"
+        )]
         not_handed: Option<String>,
     },
     Reply {
@@ -332,8 +344,10 @@ enum Command {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("mode").required(true).multiple(false).args(["follow", "next"]))) ]
 struct ListenArgs {
-    #[arg(long)]
-    session: Uuid,
+    #[arg(long, required_unless_present = "origin", conflicts_with = "origin")]
+    session: Option<Uuid>,
+    #[arg(long, requires = "follow", conflicts_with_all = ["next", "controller", "ack2", "session"])]
+    origin: bool,
     #[arg(long, value_enum)]
     session_context: Option<SessionContext>,
     #[arg(long)]
@@ -522,9 +536,11 @@ fn main() {
             route.map(Into::into),
             controller,
         ),
+        Command::Cover { session } => commands::cover(&context, session),
+        Command::Listen(args) if args.origin => commands::listen_origin(&context),
         Command::Listen(args) => commands::listen(
             &context,
-            args.session,
+            args.session.expect("session required without --origin"),
             args.session_context.map(Into::into),
             args.claude_code_version.as_deref(),
             args.background_tasks_enabled,
@@ -1202,18 +1218,20 @@ mod tests {
                 ..
             }
         ));
-        assert!(Cli::try_parse_from([
-            "harklight-agent",
-            "attach",
-            "--session",
-            handle,
-            "--vendor-session-id",
-            "none",
-            "--route",
-            "other",
-            "--ack2",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "attach",
+                "--session",
+                handle,
+                "--vendor-session-id",
+                "none",
+                "--route",
+                "other",
+                "--ack2",
+            ])
+            .is_err()
+        );
 
         let listen = Cli::try_parse_from([
             "harklight-agent",
@@ -1233,15 +1251,17 @@ mod tests {
                 ..
             })
         ));
-        assert!(Cli::try_parse_from([
-            "harklight-agent",
-            "listen",
-            "--session",
-            handle,
-            "--follow",
-            "--ack2",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "listen",
+                "--session",
+                handle,
+                "--follow",
+                "--ack2",
+            ])
+            .is_err()
+        );
 
         let handed = Cli::try_parse_from([
             "harklight-agent",
@@ -1284,18 +1304,20 @@ mod tests {
                 ..
             } if reason == "The receiver could not hand off this entry."
         ));
-        assert!(Cli::try_parse_from([
-            "harklight-agent",
-            "ack2",
-            "--session",
-            handle,
-            "--event",
-            "812",
-            "--rerouted",
-            "--not-handed",
-            "not available",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "ack2",
+                "--session",
+                handle,
+                "--event",
+                "812",
+                "--rerouted",
+                "--not-handed",
+                "not available",
+            ])
+            .is_err()
+        );
 
         let mut command = Cli::command();
         let ack2_help = command
