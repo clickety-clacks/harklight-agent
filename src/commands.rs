@@ -26,6 +26,7 @@ use crate::{
 };
 
 pub const EXIT_REFUSED: i32 = 2;
+const CLOSED_REPLY_MESSAGE: &str = "This request's chat is closed. Your message was not sent.";
 pub const EXIT_UNSUPPORTED: i32 = 5;
 pub const EXIT_LISTENER_ACTIVE: i32 = 6;
 pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
@@ -2488,6 +2489,7 @@ fn handle_operation_error_response(
     announce: bool,
 ) -> Result<Value, CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+    let message = refusal_message(&operation.kind, &response);
     // OriginWire returns storage_unavailable for the five message commands and ACK2;
     // its optional ref is only an echoed correlation value, not part of the outcome.
     let message_operation = matches!(
@@ -2527,11 +2529,8 @@ fn handle_operation_error_response(
     if announce {
         refused(&operation.kind, Some(operation.op_id), response)?;
     }
-    Err(CommandError::new(
-        format!("{} refused: {reason}", operation.kind),
-        EXIT_REFUSED,
-    )
-    .with_reason(reconnect::SafeReason::server(&reason)))
+    Err(CommandError::new(message, EXIT_REFUSED)
+        .with_reason(reconnect::SafeReason::server(&reason)))
 }
 
 fn attachment_update_response_matches(request: &Value, response: &Value) -> bool {
@@ -3099,7 +3098,7 @@ pub fn reply(
         .request_snapshot(session, request_id, Some(in_reply_to))
         .map_err(|error| journal_error(error, 1))?;
     let request = request_context(&snapshot, session, request_id)?;
-    ensure_request_open(&snapshot, session, &request)?;
+    ensure_reply_chat_open(&snapshot, session, &request)?;
     let event = delivered_event(
         &snapshot,
         session,
@@ -4942,12 +4941,7 @@ fn ensure_request_open(
     session: Uuid,
     request: &RequestContext,
 ) -> Result<(), CommandError> {
-    let closed_by = journal.entries.values().find(|entry| {
-        entry.session_handle == session
-            && entry.kind == "terminal"
-            && entry.sender_id.as_deref() == Some(request.sender_id.as_str())
-            && entry.request_id.as_deref() == Some(request.message_id.as_str())
-    });
+    let closed_by = request_terminal(journal, session, request);
     if let Some(terminal) = closed_by {
         return Err(CommandError::new(
             format!(
@@ -4958,6 +4952,30 @@ fn ensure_request_open(
         ));
     }
     Ok(())
+}
+
+fn ensure_reply_chat_open(
+    journal: &Journal,
+    session: Uuid,
+    request: &RequestContext,
+) -> Result<(), CommandError> {
+    if request_terminal(journal, session, request).is_some() {
+        return Err(CommandError::new(CLOSED_REPLY_MESSAGE, EXIT_REFUSED));
+    }
+    Ok(())
+}
+
+fn request_terminal<'a>(
+    journal: &'a Journal,
+    session: Uuid,
+    request: &RequestContext,
+) -> Option<&'a JournalEntry> {
+    journal.entries.values().find(|entry| {
+        entry.session_handle == session
+            && entry.kind == "terminal"
+            && entry.sender_id.as_deref() == Some(request.sender_id.as_str())
+            && entry.request_id.as_deref() == Some(request.message_id.as_str())
+    })
 }
 
 fn ensure_current_revision(
@@ -5066,6 +5084,7 @@ fn retry_committed_result(
 
 fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), CommandError> {
     let reason = response["reason"].as_str().unwrap_or("refused").to_owned();
+    let message = refusal_message(operation, &response);
     let mut output = Map::new();
     output.insert("kind".into(), Value::String("refused".into()));
     output.insert("operation".into(), Value::String(operation.into()));
@@ -5075,10 +5094,20 @@ fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), 
     output.insert("reason".into(), Value::String(reason.clone()));
     output.insert("response".into(), response);
     emit(&Value::Object(output))?;
-    Err(CommandError::new(
-        format!("{operation} refused: {reason}"),
-        EXIT_REFUSED,
-    ))
+    Err(CommandError::new(message, EXIT_REFUSED))
+}
+
+fn refusal_message(operation: &str, response: &Value) -> String {
+    let reason = response["reason"].as_str().unwrap_or("refused");
+    if operation == "reply"
+        && response["v"] == 1
+        && response["type"] == "error"
+        && reason == "closed"
+    {
+        CLOSED_REPLY_MESSAGE.to_owned()
+    } else {
+        format!("{operation} refused: {reason}")
+    }
 }
 
 fn emit(value: &Value) -> Result<(), CommandError> {
@@ -7534,6 +7563,118 @@ mod tests {
     }
 
     #[test]
+    fn closed_reply_refusal_uses_the_plain_message_and_records_rejection() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = json!({
+            "v":1,
+            "type":"reply",
+            "op_id":op_id.to_string(),
+            "sender_id":"app:example",
+            "message_id":"message-1",
+            "request_revision":1,
+            "in_reply_to":"1",
+            "text":"A reply"
+        });
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        prepare(&mut store, session, op_id, "reply", request.clone()).unwrap();
+        store.mark_operation_unknown(op_id).unwrap();
+        let operation = store.operation(op_id).unwrap().unwrap();
+        let response = json!({
+            "v":1,
+            "type":"error",
+            "reason":"closed",
+            "ref":"reply-ref"
+        });
+
+        let error =
+            handle_operation_error_response(&mut store, &operation, response.clone(), true)
+                .unwrap_err();
+
+        assert_eq!(error.message, CLOSED_REPLY_MESSAGE);
+        assert_eq!(
+            error.message,
+            "This request's chat is closed. Your message was not sent."
+        );
+        assert_eq!(refusal_message("reply", &response), CLOSED_REPLY_MESSAGE);
+        assert_eq!(error.exit_code, EXIT_REFUSED);
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Rejected);
+        assert_eq!(saved.request, request);
+        assert_eq!(saved.response, Some(response));
+    }
+
+    #[test]
+    fn reply_timeout_stays_uncertain_and_retry_can_recover_the_saved_receipt() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = json!({
+            "v":1,
+            "type":"reply",
+            "op_id":op_id.to_string(),
+            "sender_id":"app:example",
+            "message_id":"message-1",
+            "request_revision":1,
+            "in_reply_to":"1",
+            "text":"A reply"
+        });
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .record_entry(JournalEntry::fetched(
+                1,
+                "1".into(),
+                session,
+                "discussion".into(),
+                "person".into(),
+                true,
+                Some("app:example".into()),
+                Some("message-1".into()),
+                Some(1),
+                json!({
+                    "event_id":"1",
+                    "session_handle":session.to_string(),
+                    "kind":"discussion",
+                    "author":"person",
+                    "sender_id":"app:example",
+                    "message_id":"message-1",
+                    "request_revision":1,
+                    "text":"A question"
+                }),
+            ))
+            .unwrap();
+        let operation = prepare(&mut store, session, op_id, "reply", request.clone()).unwrap();
+        let lost_response =
+            MockTransport::new([Err(ApiError::InvalidResponse("response was lost".into()))]);
+
+        let error =
+            submit_operation_inner(&lost_response, &mut store, operation, false).unwrap_err();
+        assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN);
+        assert_ne!(error.message, CLOSED_REPLY_MESSAGE);
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Unknown);
+        assert_eq!(saved.request, request);
+        assert!(saved.response.is_none());
+
+        let recovered = MockTransport::new([Ok(json!({
+            "v":1,
+            "type":"ok",
+            "seq":9,
+            "event_id":"9",
+            "duplicate":true
+        }))]);
+        let response = submit_operation_inner(&recovered, &mut store, saved, false).unwrap();
+
+        assert_eq!(response["duplicate"], true);
+        assert_eq!(*recovered.posts.lock().unwrap(), vec![request.clone()]);
+        let saved = store.operation(op_id).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Committed);
+        assert_eq!(saved.request, request);
+        assert_eq!(saved.response, Some(response));
+    }
+
+    #[test]
     fn ref_bearing_storage_unavailable_keeps_send_unknown_and_retries_saved_operation() {
         for kind in ["send", "revise"] {
             for with_ref in [false, true] {
@@ -8613,6 +8754,75 @@ mod tests {
         assert!(ensure_current_revision(request.revision, Some(1)).is_err());
         assert!(ensure_current_revision(request.revision, Some(2)).is_ok());
         assert!(ensure_request_open(&snapshot, session, &request).is_err());
+    }
+
+    #[test]
+    fn answer_and_no_comment_report_the_definite_closed_chat_message() {
+        for terminal_kind in ["answer", "no_comment"] {
+            let scratch = Scratch::new();
+            let session = Uuid::new_v4();
+            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+            store
+                .record_entry(JournalEntry::fetched(
+                    1,
+                    "1".into(),
+                    session,
+                    "revision".into(),
+                    "origin".into(),
+                    false,
+                    Some("app:example".into()),
+                    Some("message-1".into()),
+                    Some(1),
+                    json!({
+                        "event_id":"1",
+                        "session_handle":session.to_string(),
+                        "kind":"revision",
+                        "author":"origin",
+                        "sender_id":"app:example",
+                        "message_id":"message-1",
+                        "request_revision":1,
+                        "message":{"sender_id":"app:example","message_id":"message-1","title":"Request"}
+                    }),
+                ))
+                .unwrap();
+
+            let mut terminal = json!({
+                "event_id":"2",
+                "session_handle":session.to_string(),
+                "kind":"terminal",
+                "author":"person",
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "terminal_state":"answered"
+            });
+            if terminal_kind == "no_comment" {
+                terminal["terminal_kind"] = json!("no_comment");
+            }
+            store
+                .record_entry(JournalEntry::fetched(
+                    2,
+                    "2".into(),
+                    session,
+                    "terminal".into(),
+                    "person".into(),
+                    false,
+                    Some("app:example".into()),
+                    Some("message-1".into()),
+                    Some(1),
+                    terminal,
+                ))
+                .unwrap();
+
+            let snapshot = store.snapshot().unwrap();
+            let request = request_context(&snapshot, session, "message-1").unwrap();
+            let error = ensure_reply_chat_open(&snapshot, session, &request).unwrap_err();
+            assert_eq!(
+                error.message,
+                "This request's chat is closed. Your message was not sent."
+            );
+            assert_eq!(error.exit_code, EXIT_REFUSED);
+        }
     }
 
     #[test]
