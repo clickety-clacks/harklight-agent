@@ -7589,7 +7589,7 @@ mod tests {
         });
 
         let error =
-            handle_operation_error_response(&mut store, &operation, response.clone(), false)
+            handle_operation_error_response(&mut store, &operation, response.clone(), true)
                 .unwrap_err();
 
         assert_eq!(error.message, CLOSED_REPLY_MESSAGE);
