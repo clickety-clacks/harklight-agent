@@ -54,7 +54,9 @@ The CLI reads the existing device enrollment files `server.json`,
 `enrollment.json`, `identity.pem` and `identity.key` from a private identity
 directory. It verifies the configured CA fingerprint and authenticates with the
 enrolled device certificate. The sender ID still needs its existing grant.
-The CLI creates no identity, grant or trust root.
+The message commands do not create an identity, grant or trust root. Use the
+enrollment commands below to create the same identity files the message
+commands already read.
 
 Set the identity directory and CA file with either command-line options or
 environment variables:
@@ -72,6 +74,74 @@ The origin HTTPS port is separate from the relay port. Set it in the enrolled
 server operator must configure and expose the origin endpoint. Agent messages
 use this origin session route; the relay endpoint is not a message submission
 route.
+
+## Enroll a device
+
+Provide the identity directory and CA file explicitly for every enrollment
+command, using the global options or their existing environment variables.
+Enrollment also needs the connect address (an IP address or DNS name), TLS name
+and enrollment port supplied by the Harklight dashboard or self-host operator.
+DNS names stay in `server.json` and are resolved with the platform resolver on
+each new connection. The TLS name and CA trust remain separate inputs.
+
+| Command | Command-specific inputs |
+| --- | --- |
+| `enroll start` | `--connect`, `--name`, `--port`, `--label`; optional `--origin-port` |
+| `enroll retry` | `--connect`, `--name`, `--port`, `--label` |
+| `enroll status` | `--connect`, `--name`, `--port` |
+
+All three also require `--identity-dir` and `--ca-file` (or their environment
+variables above). The label must contain 1 to 256 UTF-8 bytes.
+
+```sh
+harklight-agent --identity-dir "$HOME/Library/Application Support/Harklight/Identity" \
+  --ca-file "$HOME/Library/Application Support/Harklight/ca.pem" \
+  enroll start --connect app.harklight.net --name app.harklight.net \
+  --port 18444 --label "Work laptop"
+
+harklight-agent --identity-dir "$HOME/Library/Application Support/Harklight/Identity" \
+  --ca-file "$HOME/Library/Application Support/Harklight/ca.pem" \
+  enroll status --connect app.harklight.net --name app.harklight.net --port 18444
+```
+
+`start` creates a private identity directory, generates the device key and
+certificate locally, and prints an approval code. Approve that code in the
+dashboard and enter the sender ID the device will use there. Then run `status`
+once to write `enrollment.json`. Enrollment does not grant a sender ID. Use the
+existing `send` command for the first relay/origin proof.
+
+If a reply to `start` is lost, keep the same directory and run `enroll retry`
+with its original inputs. The Server may report `key_pending` until the request's
+24-hour lifetime expires; wait up to 24 hours for that expiry, then retry with
+the same private key. Starting in a new directory is also available when the
+earlier request's code cannot be recovered.
+
+Suggested locations (the CA file is beside, not inside, the identity directory):
+
+| Platform | Identity directory | CA file |
+| --- | --- | --- |
+| macOS | `~/Library/Application Support/Harklight/Identity` | `~/Library/Application Support/Harklight/ca.pem` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/harklight-agent/identity` | `${XDG_DATA_HOME:-~/.local/share}/harklight-agent/ca.pem` |
+
+Use `enroll start` only with a new identity directory; it refuses an existing
+one. `enroll retry` reuses the existing key and `enroll status` makes one
+status request without polling.
+
+Enrollment failures use these exit codes:
+
+| Server answer or failure | Exit | What to do |
+| --- | ---: | --- |
+| `409 key_pending` | 2 | Keep this directory and retry after the earlier request expires (its pending lifetime is 24 hours), or start in a new directory. The earlier approval code cannot be recovered. |
+| `409 key_in_use` | 2 | Check `enroll status`, or start in a new directory. |
+| `400 invalid_request` | 2 | Check the label and certificate inputs. |
+| `404 not_found` | 2 | Run `enroll retry`; if status readback ended, local approved identity data is reported. |
+| `503 capacity` or `unavailable` | 2 | The Server did not accept the request; run `enroll retry` later. |
+| Other HTTP status or malformed response | 5 | The response is not supported by this Agent. |
+| Connection, TLS or timeout failure before a request is sent | 1 | Check the connect address, TLS name and CA file. |
+| Request sent without a complete response | 7 | The outcome is unknown. Keep this directory and run `enroll retry`. |
+
+Successful commands print one JSON object to stdout. Approval instructions and
+local errors are printed to stderr.
 
 The journal defaults to `~/Library/Application Support/Harklight/Agent` on
 macOS, `$XDG_STATE_HOME/harklight-agent` when `XDG_STATE_HOME` is set on Linux,

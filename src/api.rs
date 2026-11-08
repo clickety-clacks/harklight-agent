@@ -6,7 +6,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
@@ -19,6 +19,12 @@ pub enum ApiError {
     Config(#[from] ConfigError),
     #[error("origin request failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("origin request via configured address {address} failed: {source}")]
+    TransportAddress {
+        address: String,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("origin returned HTTP {status}: {body}")]
     Http { status: u16, body: String },
     #[error("origin response was not a valid v1 JSON envelope: {0}")]
@@ -40,7 +46,7 @@ impl ApiError {
     /// back. Such calls must retain and retry the same operation key.
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::InvalidResponse(_) => true,
+            Self::Transport(_) | Self::TransportAddress { .. } | Self::InvalidResponse(_) => true,
             Self::Http { status, .. } => *status >= 500,
             _ => false,
         }
@@ -88,16 +94,23 @@ impl OriginClient {
         &self.identity.device_id
     }
 
+    fn send(&self, request: RequestBuilder) -> Result<Response, ApiError> {
+        request.send().map_err(|source| ApiError::TransportAddress {
+            address: self.identity.address.clone(),
+            source,
+        })
+    }
+
     pub fn post(&self, command: &Value) -> Result<Value, ApiError> {
         let url = self.identity.origin_url(self.port, "/origin/v1")?;
-        let response = self
-            .client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .timeout(Duration::from_secs(30))
-            .json(command)
-            .send()?;
-        parse_post_response(response)
+        let response = self.send(
+            self.client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .timeout(Duration::from_secs(30))
+                .json(command),
+        )?;
+        parse_post_response(response, &self.identity.address)
     }
 
     pub fn upload_file(
@@ -126,25 +139,25 @@ impl OriginClient {
             )));
         }
         let encoded_name = URL_SAFE_NO_PAD.encode(name.as_bytes());
-        let response = self
-            .client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(reqwest::header::CONTENT_LENGTH, size)
-            .header("X-Harklight-Op-Id", op_id.to_string())
-            .header("X-Harklight-Sender-Id", sender_id)
-            .header("X-Harklight-Message-Id", message_id)
-            .header("X-Harklight-Request-Revision", request_revision.to_string())
-            .header("X-Harklight-File-Name", encoded_name)
-            .body(reqwest::blocking::Body::new(file))
-            .send()?;
-        parse_post_response(response)
+        let response = self.send(
+            self.client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .header(reqwest::header::CONTENT_LENGTH, size)
+                .header("X-Harklight-Op-Id", op_id.to_string())
+                .header("X-Harklight-Sender-Id", sender_id)
+                .header("X-Harklight-Message-Id", message_id)
+                .header("X-Harklight-Request-Revision", request_revision.to_string())
+                .header("X-Harklight-File-Name", encoded_name)
+                .body(reqwest::blocking::Body::new(file)),
+        )?;
+        parse_post_response(response, &self.identity.address)
     }
 
     pub fn download_file(&self, upload_id: Uuid) -> Result<DownloadedFile, ApiError> {
         let path = format!("/origin/v1/files/{upload_id}");
         let url = self.identity.origin_url(self.port, &path)?;
-        let response = self.client.get(url).send()?;
+        let response = self.send(self.client.get(url))?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
@@ -183,7 +196,7 @@ impl OriginClient {
 
     fn open_stream_path(&self, path: &str) -> Result<SseStream, ApiError> {
         let url = self.identity.origin_url(self.port, path)?;
-        let response = self.client.get(url).send()?;
+        let response = self.send(self.client.get(url))?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
@@ -214,21 +227,27 @@ impl OriginClient {
     }
 }
 
-fn parse_post_response(response: Response) -> Result<Value, ApiError> {
+fn parse_post_response(response: Response, address: &str) -> Result<Value, ApiError> {
     let status = response.status().as_u16();
-    let body = response.text()?;
+    let body = response
+        .bytes()
+        .map_err(|source| ApiError::TransportAddress {
+            address: address.to_owned(),
+            source,
+        })?;
     parse_post_response_body(status, &body)
 }
 
-fn parse_post_response_body(status: u16, body: &str) -> Result<Value, ApiError> {
+fn parse_post_response_body(status: u16, body: impl AsRef<[u8]>) -> Result<Value, ApiError> {
+    let body = body.as_ref();
     if !(200..300).contains(&status) {
         return Err(ApiError::Http {
             status,
-            body: body.to_owned(),
+            body: String::from_utf8_lossy(body).into_owned(),
         });
     }
-    let value: Value =
-        serde_json::from_str(body).map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| ApiError::InvalidResponse(error.to_string()))?;
     if value["v"] != 1 || !matches!(value["type"].as_str(), Some("ok" | "error")) {
         return Err(ApiError::InvalidResponse(
             "missing v:1 or type ok/error".into(),
