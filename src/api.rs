@@ -46,8 +46,7 @@ impl ApiError {
     /// back. Such calls must retain and retry the same operation key.
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            Self::Transport(_) | Self::InvalidResponse(_) => true,
-            Self::TransportAddress { source, .. } => !source.is_connect(),
+            Self::Transport(_) | Self::TransportAddress { .. } | Self::InvalidResponse(_) => true,
             Self::Http { status, .. } => *status >= 500,
             _ => false,
         }

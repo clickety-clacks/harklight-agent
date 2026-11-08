@@ -154,4 +154,30 @@ mod tests {
         let error = resolved_addresses(&resolver).unwrap_err();
         assert!(error.contains("no-such-name.invalid"));
     }
+
+    #[test]
+    fn address_named_connect_errors_keep_the_existing_unknown_outcome_classification() {
+        let resolver = ConnectAddressResolver::with_lookup(
+            "no-such-name.invalid",
+            "harklight.example",
+            Arc::new(|_| Err(io::Error::new(io::ErrorKind::NotFound, "not found"))),
+        );
+        let client = reqwest::blocking::Client::builder()
+            .dns_resolver(Arc::new(resolver))
+            .build()
+            .unwrap();
+        let source = client
+            .post("http://harklight.example/origin/v1")
+            .body("request")
+            .send()
+            .unwrap_err();
+        assert!(source.is_connect());
+
+        let error = crate::api::ApiError::TransportAddress {
+            address: "no-such-name.invalid".into(),
+            source,
+        };
+        assert!(error.outcome_unknown());
+        assert!(error.to_string().contains("no-such-name.invalid"));
+    }
 }
