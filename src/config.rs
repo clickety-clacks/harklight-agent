@@ -1,7 +1,7 @@
 use std::{
     fs,
-    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[cfg(unix)]
@@ -11,6 +11,8 @@ use reqwest::{Certificate, Identity, Url, blocking::Client};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::connect::ConnectAddressResolver;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -129,8 +131,7 @@ impl EnrolledIdentity {
 
     /// Build a client that uses only the enrolled CA and device certificate.
     /// The endpoint route and port are supplied by the confirmed server wire.
-    pub fn client_for_port(&self, port: u16) -> Result<Client, ConfigError> {
-        let address = self.socket_addr(port)?;
+    pub fn client_for_port(&self, _port: u16) -> Result<Client, ConfigError> {
         let mut identity_pem = self.certificate_pem.clone();
         if !identity_pem.ends_with(b"\n") {
             identity_pem.push(b'\n');
@@ -143,7 +144,10 @@ impl EnrolledIdentity {
             .tls_backend_rustls()
             .tls_certs_only([ca])
             .identity(identity)
-            .resolve_to_addrs(&self.name, &[address])
+            .dns_resolver(Arc::new(ConnectAddressResolver::new(
+                self.address.clone(),
+                self.name.clone(),
+            )))
             .tls_version_min(reqwest::tls::Version::TLS_1_3)
             .tls_version_max(reqwest::tls::Version::TLS_1_3)
             .https_only(true)
@@ -161,15 +165,6 @@ impl EnrolledIdentity {
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         url.set_fragment(None);
         Ok(url)
-    }
-
-    /// Parse the enrolled address for HTTP client's explicit resolver mapping.
-    pub fn socket_addr(&self, port: u16) -> Result<SocketAddr, ConfigError> {
-        let address: IpAddr = self
-            .address
-            .parse()
-            .map_err(|error: std::net::AddrParseError| ConfigError::Invalid(error.to_string()))?;
-        Ok(SocketAddr::new(address, port))
     }
 }
 

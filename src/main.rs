@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
-use harklight_agent::commands::{self, CommandContext, MessageFieldOptions};
+use harklight_agent::{
+    commands::{self, CommandContext, MessageFieldOptions},
+    enrollment,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,6 +51,10 @@ fn send_cli_warnings(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Enroll {
+        #[command(subcommand)]
+        action: EnrollCommand,
+    },
     #[command(
         after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --route claude-code --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
     )]
@@ -345,6 +352,37 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum EnrollCommand {
+    Start(EnrollStartArgs),
+    Retry(EnrollStartArgs),
+    Status(EnrollStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct EnrollEndpointArgs {
+    #[arg(long)]
+    connect: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    port: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EnrollStartArgs {
+    #[command(flatten)]
+    endpoint: EnrollEndpointArgs,
+    #[arg(long)]
+    label: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EnrollStatusArgs {
+    #[command(flatten)]
+    endpoint: EnrollEndpointArgs,
+}
+
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("mode").required(true).multiple(false).args(["follow", "next"]))) ]
 struct ListenArgs {
@@ -416,6 +454,39 @@ impl From<ResultStatus> for &'static str {
 
 fn main() {
     let cli = Cli::parse();
+    if let Command::Enroll { action } = &cli.command {
+        let result = match action {
+            EnrollCommand::Start(args) => enrollment::start(
+                cli.identity_dir.as_deref(),
+                cli.ca_file.as_deref(),
+                args.endpoint.connect.as_deref(),
+                args.endpoint.name.as_deref(),
+                args.endpoint.port.as_deref(),
+                args.label.as_deref(),
+                cli.origin_port,
+            ),
+            EnrollCommand::Retry(args) => enrollment::retry(
+                cli.identity_dir.as_deref(),
+                cli.ca_file.as_deref(),
+                args.endpoint.connect.as_deref(),
+                args.endpoint.name.as_deref(),
+                args.endpoint.port.as_deref(),
+                args.label.as_deref(),
+            ),
+            EnrollCommand::Status(args) => enrollment::status(
+                cli.identity_dir.as_deref(),
+                cli.ca_file.as_deref(),
+                args.endpoint.connect.as_deref(),
+                args.endpoint.name.as_deref(),
+                args.endpoint.port.as_deref(),
+            ),
+        };
+        if let Err(error) = result {
+            fail(error.message, error.exit_code);
+        }
+        return;
+    }
+
     let context = match CommandContext::load(
         cli.identity_dir.as_deref(),
         cli.ca_file.as_deref(),
@@ -442,6 +513,7 @@ fn main() {
     };
 
     let result = match cli.command {
+        Command::Enroll { .. } => unreachable!("enroll was dispatched before loading an identity"),
         Command::Send {
             session,
             sender_id,
@@ -803,6 +875,62 @@ mod tests {
                 handle,
                 "--vendor-session-id",
                 "none"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn enrollment_cli_keeps_required_inputs_for_local_validation() {
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "enroll",
+                "start",
+                "--connect",
+                "192.0.2.7",
+                "--name",
+                "harklight.example",
+                "--label",
+                "Work laptop"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "enroll",
+                "start",
+                "--identity-dir",
+                "/tmp/harklight-test-identity",
+                "--ca-file",
+                "/tmp/harklight-test-ca.pem",
+                "--connect",
+                "harklight.example",
+                "--name",
+                "harklight.example",
+                "--port",
+                "18444",
+                "--origin-port",
+                "18450",
+                "--label",
+                "Work laptop"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "enroll",
+                "status",
+                "--connect",
+                "harklight.example",
+                "--name",
+                "harklight.example",
+                "--port",
+                "18444",
+                "--label",
+                "not-accepted"
             ])
             .is_err()
         );

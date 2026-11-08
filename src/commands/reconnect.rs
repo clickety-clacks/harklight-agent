@@ -77,6 +77,12 @@ impl SafeReason {
             ApiError::Transport(_) => {
                 Self::local("transport_error", "The origin transport request failed.")
             }
+            ApiError::TransportAddress { source, .. } if source.is_timeout() => {
+                Self::local("timeout", "The origin request timed out.")
+            }
+            ApiError::TransportAddress { .. } => {
+                Self::local("transport_error", "The origin transport request failed.")
+            }
             ApiError::StreamEnded => Self::local(
                 "stream_ended",
                 "The origin stream ended before the conversation became idle.",

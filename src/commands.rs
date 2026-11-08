@@ -4946,8 +4946,10 @@ fn session_idle(status: &Value) -> Result<bool, CommandError> {
 }
 
 fn stream_should_reconnect(error: &ApiError) -> bool {
-    matches!(error, ApiError::Transport(_) | ApiError::StreamIo(_))
-        || matches!(error, ApiError::Http { status, .. } if *status >= 500)
+    matches!(
+        error,
+        ApiError::Transport(_) | ApiError::TransportAddress { .. } | ApiError::StreamIo(_)
+    ) || matches!(error, ApiError::Http { status, .. } if *status >= 500)
 }
 
 struct RequestContext {
@@ -5225,7 +5227,9 @@ fn write_json_line(value: &Value, output: &mut impl Write) -> Result<(), Command
 
 fn api_error(error: ApiError, exit_code: i32) -> CommandError {
     let listener_recovery = match &error {
-        ApiError::Transport(_) | ApiError::InvalidResponse(_) => true,
+        ApiError::Transport(_)
+        | ApiError::TransportAddress { .. }
+        | ApiError::InvalidResponse(_) => true,
         ApiError::Http { status, .. } => *status >= 500,
         _ => false,
     };
