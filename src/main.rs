@@ -177,6 +177,15 @@ enum Command {
         #[arg(long)]
         session: Uuid,
     },
+    /// Read one of this origin's messages from the authoritative Server state.
+    MessageGet {
+        #[arg(long)]
+        sender_id: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        revision: Option<u64>,
+    },
     Ack {
         #[arg(long)]
         session: Uuid,
@@ -629,6 +638,11 @@ fn main() {
             args.ack2,
         ),
         Command::Read { session } => commands::read(&context, session),
+        Command::MessageGet {
+            sender_id,
+            message_id,
+            revision,
+        } => commands::message_get(&context, &sender_id, &message_id, revision),
         Command::Ack { session, event } => commands::ack(&context, session, &event),
         Command::Ack2 {
             session,
@@ -1125,6 +1139,40 @@ mod tests {
                 "--session",
                 "123e4567-e89b-42d3-a456-426614174000",
                 "--controller",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn message_get_parses_exact_identity_and_optional_revision() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "message-get",
+            "--sender-id",
+            "app:example",
+            "--message-id",
+            "message-1",
+            "--revision",
+            "3",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::MessageGet {
+                sender_id,
+                message_id,
+                revision: Some(3)
+            } if sender_id == "app:example" && message_id == "message-1"
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "message-get",
+                "--sender-id",
+                "app:example",
             ])
             .is_err()
         );

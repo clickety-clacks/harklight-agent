@@ -3534,6 +3534,189 @@ pub fn status(context: &CommandContext, session: Uuid) -> Result<(), CommandErro
     emit(&response)
 }
 
+/// Read one authoritative message directly, without opening or changing a journal.
+pub fn message_get(
+    context: &CommandContext,
+    sender_id: &str,
+    message_id: &str,
+    revision: Option<u64>,
+) -> Result<(), CommandError> {
+    if !message_get_sender_id_valid(sender_id) {
+        return Err(CommandError::new(
+            "message-get requires a valid sender ID",
+            EXIT_REFUSED,
+        ));
+    }
+    if message_id.is_empty() {
+        return Err(CommandError::new(
+            "message-get requires a message ID",
+            EXIT_REFUSED,
+        ));
+    }
+    if revision == Some(0) {
+        return Err(CommandError::new(
+            "message-get revision must be a positive integer",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let mut request = json!({
+        "v":1,
+        "type":"message_get",
+        "sender_id":sender_id,
+        "message_id":message_id
+    });
+    if let Some(revision) = revision {
+        request["request_revision"] = json!(revision);
+    }
+
+    let response = match context.api.post(&request) {
+        Ok(response) => response,
+        Err(ApiError::Http { status, body }) => match serde_json::from_str::<Value>(&body) {
+            Ok(response) if response["v"] == 1 && response["type"] == "error" => response,
+            _ => {
+                return Err(CommandError::new(
+                    format!("origin message read failed with HTTP {status}"),
+                    1,
+                ));
+            }
+        },
+        Err(error) => return Err(api_error(error, 1)),
+    };
+
+    emit(&validate_message_get_response(
+        response, sender_id, message_id, revision,
+    )?)
+}
+
+fn message_get_sender_id_valid(value: &str) -> bool {
+    let Some((namespace, rest)) = value.split_once(':') else {
+        return false;
+    };
+
+    !rest.is_empty()
+        && namespace
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_lowercase())
+        && namespace.chars().skip(1).all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '+' | '.' | '-')
+        })
+        && !rest
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+}
+
+fn validate_message_get_response(
+    response: Value,
+    sender_id: &str,
+    message_id: &str,
+    requested_revision: Option<u64>,
+) -> Result<Value, CommandError> {
+    if response["v"] != 1 {
+        return Err(CommandError::new(
+            "origin returned an invalid message read response",
+            1,
+        ));
+    }
+
+    if response["type"] == "error" {
+        let Some(reason) = response["reason"].as_str() else {
+            return Err(CommandError::new(
+                "origin returned an invalid message read error",
+                1,
+            ));
+        };
+
+        if reason == "invalid_field" && response["field"] == "type" {
+            return Err(CommandError::new(
+                "the Server does not support message-get",
+                EXIT_UNSUPPORTED,
+            ));
+        }
+        if reason == "storage_unavailable" {
+            return Err(CommandError::new(
+                "origin message read is unavailable: storage_unavailable",
+                1,
+            )
+            .with_reason(reconnect::SafeReason::server(reason)));
+        }
+
+        return Err(
+            CommandError::new(format!("message-get refused: {reason}"), EXIT_REFUSED)
+                .with_reason(reconnect::SafeReason::server(reason)),
+        );
+    }
+
+    if response["type"] != "ok" {
+        return Err(CommandError::new(
+            "origin returned an invalid message read response",
+            1,
+        ));
+    }
+
+    let Some(item) = response.get("item").and_then(Value::as_object) else {
+        return Err(CommandError::new(
+            "origin returned an incomplete message read",
+            1,
+        ));
+    };
+    let item = Value::Object(item.clone());
+    let selected_revision = item["request_revision"].as_u64();
+    let current_revision = item["current_revision"].as_u64();
+    let message = item.get("message").and_then(Value::as_object);
+    let current_state = item["current_state"].as_str();
+
+    let valid_terminal = match (current_state, item.get("current_terminal")) {
+        (Some("open"), Some(Value::Null)) => true,
+        (Some(state), Some(Value::Object(terminal))) => {
+            let at = &terminal["at"];
+            let valid_at = at.is_i64() || at.is_u64();
+            terminal["state"].as_str() == Some(state)
+                && valid_at
+                && terminal["seq"].as_u64().is_some_and(|seq| seq > 0)
+                && terminal["kind"]
+                    .as_str()
+                    .is_some_and(|kind| !kind.is_empty())
+                && terminal["answer_present"]
+                    .as_bool()
+                    .is_some_and(|present| terminal.contains_key("answer") == present)
+        }
+        _ => false,
+    };
+
+    let valid_files = item.get("files").is_none_or(|files| files.is_array());
+    let valid_identity = item["sender_id"].as_str() == Some(sender_id)
+        && item["message_id"].as_str() == Some(message_id)
+        && message.is_some_and(|message| {
+            message["sender_id"].as_str() == Some(sender_id)
+                && message["message_id"].as_str() == Some(message_id)
+        });
+    let valid_revisions = match (selected_revision, current_revision, requested_revision) {
+        (Some(selected), Some(current), Some(requested)) => {
+            selected == requested && selected > 0 && current >= selected
+        }
+        (Some(selected), Some(current), None) => selected > 0 && selected == current,
+        _ => false,
+    };
+
+    if !valid_identity
+        || !valid_revisions
+        || current_state.is_none_or(str::is_empty)
+        || !valid_terminal
+        || !valid_files
+    {
+        return Err(CommandError::new(
+            "origin returned an incomplete or mismatched message read",
+            1,
+        ));
+    }
+
+    Ok(response)
+}
+
 /// Fetch and display pending entries once from this session's origin feed.
 /// This path intentionally does not inspect or mutate listening support and
 /// does not attach to the change-notice stream.
@@ -5308,6 +5491,150 @@ mod tests {
     use super::*;
     use sha2::Digest;
     use std::{cell::Cell, collections::VecDeque, sync::Mutex};
+
+    #[test]
+    fn message_get_preserves_full_latest_and_exact_revision_objects() {
+        let latest = json!({
+            "v":1,
+            "type":"ok",
+            "item":{
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":2,
+                "current_revision":2,
+                "message":{
+                    "sender_id":"app:example",
+                    "message_id":"message-1",
+                    "progress":{"segments":[{"percent":40,"note":null}]},
+                    "future_field":{"preserved":[true,7]}
+                },
+                "current_state":"open",
+                "current_terminal":null,
+                "files":[{"name":"latest.txt","data_base64":"bGF0ZXN0"}]
+            }
+        });
+        assert_eq!(
+            validate_message_get_response(latest.clone(), "app:example", "message-1", None)
+                .unwrap(),
+            latest
+        );
+
+        let historical = json!({
+            "v":1,
+            "type":"ok",
+            "item":{
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":1,
+                "current_revision":2,
+                "message":{
+                    "sender_id":"app:example",
+                    "message_id":"message-1",
+                    "progress":{"segments":[{"percent":10}]}
+                },
+                "files":[{"name":"initial.txt","data_base64":"aW5pdGlhbA=="}],
+                "current_state":"retracted",
+                "current_terminal":{
+                    "state":"retracted",
+                    "at":123,
+                    "seq":9,
+                    "kind":"lifecycle",
+                    "answer_present":false
+                }
+            }
+        });
+        assert_eq!(
+            validate_message_get_response(historical.clone(), "app:example", "message-1", Some(1))
+                .unwrap(),
+            historical
+        );
+    }
+
+    #[test]
+    fn message_get_rejects_mismatched_or_latest_fallback_responses() {
+        let mut response = json!({
+            "v":1,
+            "type":"ok",
+            "item":{
+                "sender_id":"app:example",
+                "message_id":"message-1",
+                "request_revision":2,
+                "current_revision":2,
+                "message":{"sender_id":"app:example","message_id":"message-1"},
+                "current_state":"open",
+                "current_terminal":null
+            }
+        });
+        assert_eq!(
+            validate_message_get_response(response.clone(), "app:example", "message-1", Some(1))
+                .unwrap_err()
+                .exit_code,
+            1
+        );
+
+        response["item"]["request_revision"] = json!(1);
+        response["item"]["current_revision"] = json!(2);
+        assert_eq!(
+            validate_message_get_response(response.clone(), "app:example", "message-1", None)
+                .unwrap_err()
+                .exit_code,
+            1
+        );
+
+        response["item"]["request_revision"] = json!(2);
+        response["item"]["current_revision"] = json!(2);
+        response["item"]["sender_id"] = json!("app:other");
+        assert_eq!(
+            validate_message_get_response(response, "app:example", "message-1", None)
+                .unwrap_err()
+                .exit_code,
+            1
+        );
+    }
+
+    #[test]
+    fn message_get_maps_only_the_pinned_unsupported_type_error_to_exit_five() {
+        let unsupported = json!({
+            "v":1,"type":"error","reason":"invalid_field","field":"type"
+        });
+        assert_eq!(
+            validate_message_get_response(unsupported, "app:example", "message-1", None)
+                .unwrap_err()
+                .exit_code,
+            EXIT_UNSUPPORTED
+        );
+
+        let invalid_input = json!({
+            "v":1,"type":"error","reason":"invalid_field","field":"request_revision"
+        });
+        assert_eq!(
+            validate_message_get_response(invalid_input, "app:example", "message-1", Some(1))
+                .unwrap_err()
+                .exit_code,
+            EXIT_REFUSED
+        );
+
+        let unavailable = json!({
+            "v":1,"type":"error","reason":"storage_unavailable"
+        });
+        assert_eq!(
+            validate_message_get_response(unavailable, "app:example", "message-1", None)
+                .unwrap_err()
+                .exit_code,
+            1
+        );
+    }
+
+    #[test]
+    fn message_get_sender_validation_matches_origin_message_shape() {
+        assert!(message_get_sender_id_valid("app:example"));
+        assert!(message_get_sender_id_valid("com.example+tool:with:colon"));
+        assert!(!message_get_sender_id_valid(":missing-namespace"));
+        assert!(!message_get_sender_id_valid("1app:invalid-first-character"));
+        assert!(!message_get_sender_id_valid(".app:invalid-first-character"));
+        assert!(!message_get_sender_id_valid("App:uppercase"));
+        assert!(!message_get_sender_id_valid("app:contains whitespace"));
+    }
 
     struct Scratch(PathBuf);
 
