@@ -36,6 +36,25 @@ pub enum JournalError {
     FeedGap { cursor: u64, sequence: u64 },
     #[error("feed sequence {sequence} was replayed with different content")]
     FeedConflict { sequence: u64 },
+    #[error(
+        "advisory sequence {sequence} does not follow cursor {cursor} for session {session_handle}"
+    )]
+    AdvisoryGap {
+        session_handle: Uuid,
+        cursor: u64,
+        sequence: u64,
+    },
+    #[error(
+        "advisory sequence {sequence} was replayed with different content for session {session_handle}"
+    )]
+    AdvisoryConflict { session_handle: Uuid, sequence: u64 },
+    #[error("advisory {advisory_id} is not in the durable journal for session {session_handle}")]
+    MissingAdvisory {
+        session_handle: Uuid,
+        advisory_id: Uuid,
+    },
+    #[error("advisory journal contains invalid id {0}")]
+    InvalidAdvisoryId(String),
     #[error("operation key {0} was already used with different content")]
     OperationConflict(Uuid),
     #[error("journal has no operation with key {0}")]
@@ -213,6 +232,42 @@ impl JournalEntry {
     }
 }
 
+/// One immutable advisory payload plus local delivery bookkeeping. Advisory
+/// sequence and receipt state are stored separately from ordinary feed rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvisoryEntry {
+    pub session_handle: Uuid,
+    pub advisory_seq: u64,
+    pub advisory_id: Uuid,
+    pub origin_cursor_at_decision: u64,
+    pub raw: Value,
+    pub journaled_at_ms: u64,
+    pub emitted_at_ms: Option<u64>,
+    pub delivered: bool,
+}
+
+impl AdvisoryEntry {
+    pub fn fetched(
+        session_handle: Uuid,
+        advisory_seq: u64,
+        advisory_id: Uuid,
+        origin_cursor_at_decision: u64,
+        raw: Value,
+        delivered: bool,
+    ) -> Self {
+        Self {
+            session_handle,
+            advisory_seq,
+            advisory_id,
+            origin_cursor_at_decision,
+            raw,
+            journaled_at_ms: now_ms(),
+            emitted_at_ms: None,
+            delivered,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileTransfer {
     pub path: Option<PathBuf>,
@@ -343,6 +398,17 @@ impl JournalStore {
                 kind TEXT NOT NULL, state TEXT NOT NULL, message_id TEXT,
                 request_revision INTEGER, in_reply_to TEXT, payload TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS advisory_cursors (
+                session_handle TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS advisories (
+                session_handle TEXT NOT NULL, advisory_seq TEXT NOT NULL,
+                advisory_id TEXT NOT NULL, origin_cursor_at_decision TEXT NOT NULL,
+                delivered INTEGER NOT NULL DEFAULT 0, emitted_at_ms INTEGER,
+                journaled_at_ms INTEGER NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(session_handle, advisory_seq),
+                UNIQUE(session_handle, advisory_id)
+             );
              CREATE INDEX IF NOT EXISTS operations_by_session_message
                 ON operations(session_handle, message_id, op_id);
              CREATE INDEX IF NOT EXISTS operations_pending_by_session
@@ -471,6 +537,195 @@ impl JournalStore {
 
     pub fn cursor(&self) -> Result<u64, JournalError> {
         self.with_read(read_cursor)
+    }
+
+    pub fn advisory_cursor(&self, session_handle: Uuid) -> Result<u64, JournalError> {
+        self.with_read(|connection| read_advisory_cursor(connection, session_handle))
+    }
+
+    /// Persist a complete advisory-feed response and its cursor atomically.
+    /// The ordinary feed cursor is deliberately untouched.
+    pub fn record_advisory_batch(
+        &mut self,
+        session_handle: Uuid,
+        since: u64,
+        high_water: u64,
+        entries: &[AdvisoryEntry],
+    ) -> Result<(), JournalError> {
+        self.with_transaction(|tx| {
+            let cursor = read_advisory_cursor(tx, session_handle)?;
+            if since > cursor || high_water < since {
+                return Err(JournalError::InvalidCursor);
+            }
+
+            let mut expected = since.checked_add(1);
+            let mut stored_cursor = cursor;
+            for entry in entries {
+                if entry.session_handle != session_handle || expected != Some(entry.advisory_seq) {
+                    return Err(JournalError::AdvisoryGap {
+                        session_handle,
+                        cursor: expected.map_or(since, |value| value.saturating_sub(1)),
+                        sequence: entry.advisory_seq,
+                    });
+                }
+                expected = entry.advisory_seq.checked_add(1);
+
+                if entry.advisory_seq <= cursor {
+                    let existing = read_advisory_by_seq(tx, session_handle, entry.advisory_seq)?
+                        .ok_or(JournalError::AdvisoryConflict {
+                            session_handle,
+                            sequence: entry.advisory_seq,
+                        })?;
+                    if existing.advisory_id != entry.advisory_id
+                        || existing.origin_cursor_at_decision != entry.origin_cursor_at_decision
+                        || existing.raw != entry.raw
+                    {
+                        return Err(JournalError::AdvisoryConflict {
+                            session_handle,
+                            sequence: entry.advisory_seq,
+                        });
+                    }
+                    if entry.delivered && !existing.delivered {
+                        tx.execute(
+                            "UPDATE advisories SET delivered=1
+                             WHERE session_handle=?1 AND advisory_seq=?2",
+                            params![session_handle.to_string(), entry.advisory_seq.to_string()],
+                        )?;
+                    }
+                    continue;
+                }
+
+                if stored_cursor.checked_add(1) != Some(entry.advisory_seq) {
+                    return Err(JournalError::AdvisoryGap {
+                        session_handle,
+                        cursor: stored_cursor,
+                        sequence: entry.advisory_seq,
+                    });
+                }
+                let payload = serde_json::to_string(&entry.raw)?;
+                tx.execute(
+                    "INSERT INTO advisories(
+                        session_handle, advisory_seq, advisory_id,
+                        origin_cursor_at_decision, delivered, emitted_at_ms,
+                        journaled_at_ms, payload
+                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        session_handle.to_string(),
+                        entry.advisory_seq.to_string(),
+                        entry.advisory_id.to_string(),
+                        entry.origin_cursor_at_decision.to_string(),
+                        i64::from(entry.delivered),
+                        entry.emitted_at_ms,
+                        entry.journaled_at_ms as i64,
+                        payload
+                    ],
+                )?;
+                stored_cursor = entry.advisory_seq;
+            }
+
+            if expected.map_or(high_water != since, |next| {
+                next.checked_sub(1) != Some(high_water)
+            }) {
+                return Err(JournalError::AdvisoryGap {
+                    session_handle,
+                    cursor: since,
+                    sequence: high_water,
+                });
+            }
+            if high_water > cursor {
+                write_advisory_cursor(tx, session_handle, high_water)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn pending_advisories_for(
+        &self,
+        session_handle: Uuid,
+    ) -> Result<Vec<AdvisoryEntry>, JournalError> {
+        self.with_read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT session_handle, advisory_seq, advisory_id,
+                        origin_cursor_at_decision, delivered, emitted_at_ms,
+                        journaled_at_ms, payload
+                 FROM advisories
+                 WHERE session_handle=?1 AND delivered=0",
+            )?;
+            let rows = statement.query_map([session_handle.to_string()], advisory_row)?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut entries = rows
+                .into_iter()
+                .map(parse_advisory_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.advisory_seq);
+            Ok(entries)
+        })
+    }
+
+    pub fn advisory_by_id(
+        &self,
+        session_handle: Uuid,
+        advisory_id: Uuid,
+    ) -> Result<Option<AdvisoryEntry>, JournalError> {
+        self.with_read(|connection| {
+            let row = connection
+                .query_row(
+                    "SELECT session_handle, advisory_seq, advisory_id,
+                            origin_cursor_at_decision, delivered, emitted_at_ms,
+                            journaled_at_ms, payload
+                     FROM advisories WHERE session_handle=?1 AND advisory_id=?2",
+                    params![session_handle.to_string(), advisory_id.to_string()],
+                    advisory_row,
+                )
+                .optional()?;
+            row.map(parse_advisory_row).transpose()
+        })
+    }
+
+    pub fn mark_advisory_emitted(
+        &mut self,
+        session_handle: Uuid,
+        advisory_id: Uuid,
+    ) -> Result<(), JournalError> {
+        let changed = self.with_transaction(|tx| {
+            Ok(tx.execute(
+                "UPDATE advisories SET emitted_at_ms=COALESCE(emitted_at_ms,?3)
+                 WHERE session_handle=?1 AND advisory_id=?2",
+                params![
+                    session_handle.to_string(),
+                    advisory_id.to_string(),
+                    now_ms() as i64
+                ],
+            )?)
+        })?;
+        if changed == 0 {
+            return Err(JournalError::MissingAdvisory {
+                session_handle,
+                advisory_id,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn mark_advisory_delivered(
+        &mut self,
+        session_handle: Uuid,
+        advisory_id: Uuid,
+    ) -> Result<(), JournalError> {
+        let changed = self.with_transaction(|tx| {
+            Ok(tx.execute(
+                "UPDATE advisories SET delivered=1
+                 WHERE session_handle=?1 AND advisory_id=?2",
+                params![session_handle.to_string(), advisory_id.to_string()],
+            )?)
+        })?;
+        if changed == 0 {
+            return Err(JournalError::MissingAdvisory {
+                session_handle,
+                advisory_id,
+            });
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> Result<Journal, JournalError> {
@@ -1196,6 +1451,106 @@ fn read_cursor(connection: &Connection) -> Result<u64, JournalError> {
         .map_err(|_| JournalError::InvalidCursor)
 }
 
+fn read_advisory_cursor(
+    connection: &Connection,
+    session_handle: Uuid,
+) -> Result<u64, JournalError> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT cursor FROM advisory_cursors WHERE session_handle=?1",
+            [session_handle.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| value.parse().map_err(|_| JournalError::InvalidCursor))
+        .unwrap_or(Ok(0))
+}
+
+fn write_advisory_cursor(
+    tx: &Transaction<'_>,
+    session_handle: Uuid,
+    cursor: u64,
+) -> Result<(), JournalError> {
+    tx.execute(
+        "INSERT INTO advisory_cursors(session_handle,cursor) VALUES(?1,?2)
+         ON CONFLICT(session_handle) DO UPDATE SET cursor=excluded.cursor",
+        params![session_handle.to_string(), cursor.to_string()],
+    )?;
+    Ok(())
+}
+
+type AdvisoryRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    i64,
+    String,
+);
+
+fn advisory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdvisoryRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn parse_advisory_row(row: AdvisoryRow) -> Result<AdvisoryEntry, JournalError> {
+    let (session, sequence, id, origin_cursor, delivered, emitted_at, journaled_at, payload) = row;
+    let session_handle =
+        Uuid::parse_str(&session).map_err(|_| JournalError::InvalidAdvisoryId(session.clone()))?;
+    let advisory_id =
+        Uuid::parse_str(&id).map_err(|_| JournalError::InvalidAdvisoryId(id.clone()))?;
+    let parse_u64 = |value: &str| value.parse().map_err(|_| JournalError::InvalidCursor);
+    let parse_time = |value: Option<i64>| {
+        value
+            .map(|value| u64::try_from(value).map_err(|_| JournalError::InvalidCursor))
+            .transpose()
+    };
+    let delivered = match delivered {
+        0 => false,
+        1 => true,
+        _ => return Err(JournalError::InvalidCursor),
+    };
+    Ok(AdvisoryEntry {
+        session_handle,
+        advisory_seq: parse_u64(&sequence)?,
+        advisory_id,
+        origin_cursor_at_decision: parse_u64(&origin_cursor)?,
+        raw: serde_json::from_str(&payload)?,
+        journaled_at_ms: u64::try_from(journaled_at).map_err(|_| JournalError::InvalidCursor)?,
+        emitted_at_ms: parse_time(emitted_at)?,
+        delivered,
+    })
+}
+
+fn read_advisory_by_seq(
+    connection: &Connection,
+    session_handle: Uuid,
+    advisory_seq: u64,
+) -> Result<Option<AdvisoryEntry>, JournalError> {
+    let row = connection
+        .query_row(
+            "SELECT session_handle, advisory_seq, advisory_id,
+                    origin_cursor_at_decision, delivered, emitted_at_ms,
+                    journaled_at_ms, payload
+             FROM advisories WHERE session_handle=?1 AND advisory_seq=?2",
+            params![session_handle.to_string(), advisory_seq.to_string()],
+            advisory_row,
+        )
+        .optional()?;
+    row.map(parse_advisory_row).transpose()
+}
+
 fn write_cursor(tx: &Transaction<'_>, cursor: u64) -> Result<(), JournalError> {
     tx.execute(
         "INSERT INTO meta(key,value) VALUES('cursor',?1)
@@ -1812,6 +2167,101 @@ mod tests {
 
     fn open(root: &Scratch, session: Uuid) -> JournalStore {
         JournalStore::open(&root.0, "enrolled-device", session).unwrap()
+    }
+
+    fn advisory(
+        session: Uuid,
+        sequence: u64,
+        id: Uuid,
+        origin_cursor: u64,
+        delivered: bool,
+    ) -> AdvisoryEntry {
+        AdvisoryEntry::fetched(
+            session,
+            sequence,
+            id,
+            origin_cursor,
+            json!({
+                "kind":"advisory",
+                "advisory_type":"unseen_interval_elapsed",
+                "author":"server",
+                "session_handle":session,
+                "advisory_id":id,
+                "advisory_seq":sequence,
+                "origin_cursor_at_decision":origin_cursor,
+                "text":"No record shows that you opened this message."
+            }),
+            delivered,
+        )
+    }
+
+    #[test]
+    fn advisory_cursor_and_durable_pending_journal_are_independent_of_feed_cursor() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let mut store = open(&root, session);
+
+        store
+            .record_advisory_batch(session, 0, 1, &[advisory(session, 1, id, 3, false)])
+            .unwrap();
+        assert_eq!(store.cursor().unwrap(), 0);
+        assert_eq!(store.advisory_cursor(session).unwrap(), 1);
+        assert_eq!(
+            store.pending_advisories_for(session).unwrap()[0].advisory_id,
+            id
+        );
+
+        drop(store);
+        let mut store = open(&root, session);
+        let pending = store.pending_advisories_for(session).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].origin_cursor_at_decision, 3);
+        assert_eq!(pending[0].emitted_at_ms, None);
+
+        store.mark_advisory_emitted(session, id).unwrap();
+        assert_eq!(store.pending_advisories_for(session).unwrap().len(), 1);
+        store.mark_advisory_delivered(session, id).unwrap();
+        assert!(store.pending_advisories_for(session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn advisory_batch_gap_rolls_back_entries_and_cursor_together() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = open(&root, session);
+        let entries = [
+            advisory(session, 1, Uuid::new_v4(), 0, false),
+            advisory(session, 3, Uuid::new_v4(), 0, false),
+        ];
+
+        assert!(matches!(
+            store.record_advisory_batch(session, 0, 3, &entries),
+            Err(JournalError::AdvisoryGap { .. })
+        ));
+        assert_eq!(store.advisory_cursor(session).unwrap(), 0);
+        assert!(store.pending_advisories_for(session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn advisory_replay_updates_only_the_remote_delivery_projection() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let mut store = open(&root, session);
+        let first = advisory(session, 1, id, 2, false);
+        store
+            .record_advisory_batch(session, 0, 1, &[first.clone()])
+            .unwrap();
+        assert_eq!(store.pending_advisories_for(session).unwrap().len(), 1);
+
+        let delivered = advisory(session, 1, id, 2, true);
+        store
+            .record_advisory_batch(session, 0, 1, &[delivered])
+            .unwrap();
+        assert!(store.pending_advisories_for(session).unwrap().is_empty());
+        assert_eq!(store.advisory_cursor(session).unwrap(), 1);
+        assert_eq!(store.cursor().unwrap(), 0);
     }
 
     #[test]

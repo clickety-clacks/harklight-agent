@@ -16,7 +16,7 @@ use thiserror::Error;
 use uuid::{Uuid, Version};
 
 use crate::{
-    api::{ApiError, OriginClient},
+    api::{ApiError, OriginClient, OriginNotice, SseStream},
     config::{EnrolledIdentity, default_state_root},
     files::{self, PreparedFiles, ServerFileLimits},
     journal::{
@@ -33,6 +33,9 @@ pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
 
 mod origin;
 pub use origin::{cover, listen_origin};
+mod advisory;
+pub use advisory::ack_advisory;
+use advisory::{emit_pending_advisories, fetch_advisories};
 mod reconnect;
 pub use reconnect::{reconnect, reconnect_configuration_error};
 
@@ -2456,6 +2459,7 @@ fn listener_support_request(
     route: OriginHarness,
     unsupported_reason: Value,
     ack2: bool,
+    advisory_v1: Option<bool>,
 ) -> Value {
     let mut request = json!({
         "v":1,
@@ -2469,7 +2473,37 @@ fn listener_support_request(
     if ack2 {
         request["ack2"] = Value::Bool(true);
     }
+    if let Some(advisory_v1) = advisory_v1 {
+        request["advisory_v1"] = Value::Bool(advisory_v1);
+    }
     request
+}
+
+fn declare_advisory_support(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    session: Uuid,
+    route: OriginHarness,
+    ack2: bool,
+) -> Result<(), CommandError> {
+    let request = listener_support_request(
+        Uuid::new_v4(),
+        session,
+        route,
+        Value::Null,
+        ack2,
+        Some(true),
+    );
+    let operation = prepare_or_resume_operation(store, session, "support", request.clone(), false)?;
+    submit_operation(context, store, operation)?;
+    let status = read_status(context, session)?;
+    if !support_record_matches(&status, &request) {
+        return Err(CommandError::new(
+            "origin did not confirm advisory_v1 support after a successful advisory fetch",
+            EXIT_UNSUPPORTED,
+        ));
+    }
+    Ok(())
 }
 
 fn same_operation_payload(left: &Value, right: &Value) -> bool {
@@ -3928,6 +3962,7 @@ pub fn listen(
         route,
         unsupported_reason.clone(),
         ack2,
+        None,
     );
     let operation = prepare_or_resume_operation(&mut store, session, "support", arm, false)?;
     let arm_response = submit_operation(context, &mut store, operation)?;
@@ -3964,16 +3999,18 @@ pub fn listen(
     }
 
     let mut offered = BTreeSet::new();
+    let mut offered_advisories = BTreeSet::new();
     let mut reconnect_delay = Duration::from_millis(250);
     let max_reconnect_delay = Duration::from_secs(30);
     'listener: loop {
-        let mut stream = match context.api.connect_stream(session) {
-            Ok(stream) => {
+        let (mut stream, advisory_stream) = match connect_listener_stream(context, session) {
+            Ok(connected) => {
                 // A reconnect is an interruption boundary. Re-offer all
                 // still-pending entries from the durable journal, preserving
                 // their delivered/acted facts in each line.
                 offered.clear();
-                stream
+                offered_advisories.clear();
+                connected
             }
             Err(error) if stream_should_reconnect(&error) => {
                 eprintln!(
@@ -4008,21 +4045,130 @@ pub fn listen(
             }
             Err(error) => return Err(error),
         };
+        if advisory_stream {
+            match fetch_advisories(context, &mut store, session) {
+                Ok(true) => declare_advisory_support(context, &mut store, session, route, ack2)?,
+                Ok(false) => {}
+                Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                    eprintln!(
+                        "Harklight advisory feed is unavailable; reconnecting in the same process"
+                    );
+                    drop(stream);
+                    thread::sleep(reconnect_delay);
+                    reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+                    continue 'listener;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if emit_pending(&mut store, session, follow, &mut offered)? {
             return Ok(());
         }
-        if session_idle(&status)? {
+        let ordinary_cursor = store.cursor().map_err(|error| journal_error(error, 1))?;
+        if emit_pending_advisories(
+            &mut store,
+            session,
+            follow,
+            ordinary_cursor,
+            &mut offered_advisories,
+        )? {
+            return Ok(());
+        }
+        let advisories_pending = !store
+            .pending_advisories_for(session)
+            .map_err(|error| journal_error(error, 1))?
+            .is_empty();
+        if session_idle(&status, advisories_pending)? {
             emit(&json!({"kind":"idle","open_requests":0}))?;
             return Ok(());
         }
 
         loop {
-            match stream.next_change() {
-                Ok(notice_cursor) => {
+            match stream.next_notice() {
+                Ok(OriginNotice::Change(notice_cursor)) => {
                     let journal_cursor = store.cursor().map_err(|error| journal_error(error, 1))?;
-                    if notice_cursor <= journal_cursor {
+                    let status = match if notice_cursor > journal_cursor {
+                        fetch_feed_and_read_status(context, &mut store, session)
+                    } else {
+                        read_status(context, session)
+                    } {
+                        Ok(status) => {
+                            reconnect_delay = Duration::from_millis(250);
+                            status
+                        }
+                        Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                            eprintln!(
+                                "Harklight origin POST is unavailable or has an unknown outcome; reconnecting in the same process"
+                            );
+                            drop(stream);
+                            thread::sleep(reconnect_delay);
+                            reconnect_delay =
+                                reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+                            continue 'listener;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if emit_pending(&mut store, session, follow, &mut offered)? {
+                        return Ok(());
+                    }
+                    let ordinary_cursor =
+                        store.cursor().map_err(|error| journal_error(error, 1))?;
+                    if emit_pending_advisories(
+                        &mut store,
+                        session,
+                        follow,
+                        ordinary_cursor,
+                        &mut offered_advisories,
+                    )? {
+                        return Ok(());
+                    }
+                    let advisories_pending = !store
+                        .pending_advisories_for(session)
+                        .map_err(|error| journal_error(error, 1))?
+                        .is_empty();
+                    if session_idle(&status, advisories_pending)? {
+                        emit(&json!({"kind":"idle","open_requests":0}))?;
+                        return Ok(());
+                    }
+                }
+                Ok(OriginNotice::AdvisoryChange {
+                    session_handle,
+                    cursor,
+                }) => {
+                    if !advisory_stream || session_handle != session {
                         continue;
                     }
+                    let local_cursor = store
+                        .advisory_cursor(session)
+                        .map_err(|error| journal_error(error, 1))?;
+                    if cursor > local_cursor {
+                        match fetch_advisories(context, &mut store, session) {
+                            Ok(true) => {
+                                declare_advisory_support(
+                                    context, &mut store, session, route, ack2,
+                                )?;
+                            }
+                            Ok(false) => {
+                                eprintln!(
+                                    "Harklight advisory hint could not be confirmed by its feed"
+                                );
+                            }
+                            Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                                eprintln!(
+                                    "Harklight advisory feed is unavailable; reconnecting in the same process"
+                                );
+                                drop(stream);
+                                thread::sleep(reconnect_delay);
+                                reconnect_delay =
+                                    reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+                                continue 'listener;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+
+                    // The advisory's ordinary prefix is independent of its
+                    // sequence. Fetch the ordinary domain before offering it.
                     let status = match fetch_feed_and_read_status(context, &mut store, session) {
                         Ok(status) => {
                             reconnect_delay = Duration::from_millis(250);
@@ -4043,10 +4189,32 @@ pub fn listen(
                     if emit_pending(&mut store, session, follow, &mut offered)? {
                         return Ok(());
                     }
-                    if session_idle(&status)? {
+                    let ordinary_cursor =
+                        store.cursor().map_err(|error| journal_error(error, 1))?;
+                    if emit_pending_advisories(
+                        &mut store,
+                        session,
+                        follow,
+                        ordinary_cursor,
+                        &mut offered_advisories,
+                    )? {
+                        return Ok(());
+                    }
+                    let advisories_pending = !store
+                        .pending_advisories_for(session)
+                        .map_err(|error| journal_error(error, 1))?
+                        .is_empty();
+                    if session_idle(&status, advisories_pending)? {
                         emit(&json!({"kind":"idle","open_requests":0}))?;
                         return Ok(());
                     }
+                }
+                Ok(OriginNotice::Coverage) => {}
+                Ok(OriginNotice::Replaced) => {
+                    return Err(CommandError::new(
+                        "origin session listener replaced",
+                        EXIT_LISTENER_ACTIVE,
+                    ));
                 }
                 Err(ApiError::StreamEnded | ApiError::StreamIo(_)) => break,
                 Err(error) => return Err(api_error(error, 1)),
@@ -4055,6 +4223,55 @@ pub fn listen(
         eprintln!("Harklight origin stream disconnected; reconnecting");
         thread::sleep(reconnect_delay);
         reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+    }
+}
+
+fn connect_listener_stream(
+    context: &CommandContext,
+    session: Uuid,
+) -> Result<(SseStream, bool), ApiError> {
+    match context.api.connect_advisory_stream(session) {
+        Ok(stream) => Ok((stream, true)),
+        Err(error) if advisory_stream_unsupported(&error) => context
+            .api
+            .connect_stream(session)
+            .map(|stream| (stream, false)),
+        Err(error) => Err(error),
+    }
+}
+
+fn connect_reconnect_stream(
+    context: &CommandContext,
+    session: Uuid,
+) -> Result<(SseStream, bool), ApiError> {
+    match context.api.reconnect_advisory_stream(session) {
+        Ok(stream) => Ok((stream, true)),
+        Err(error) if advisory_stream_unsupported(&error) => context
+            .api
+            .reconnect_stream(session)
+            .map(|stream| (stream, false)),
+        Err(error) => Err(error),
+    }
+}
+
+fn advisory_stream_unsupported(error: &ApiError) -> bool {
+    match error {
+        // Older servers may reject the optional query parameter as a bad
+        // request, or may not expose this stream route at all. In either
+        // case, retry the established ordinary stream before failing listen.
+        ApiError::Http {
+            status: 400 | 404, ..
+        } => true,
+        ApiError::Refused(reason) => matches!(
+            reason.as_str(),
+            "invalid_field"
+                | "not_found"
+                | "not_supported"
+                | "unknown_field"
+                | "unknown_parameter"
+                | "unsupported"
+        ),
+        _ => false,
     }
 }
 
@@ -4123,6 +4340,9 @@ fn support_record_matches(status: &Value, request: &Value) -> bool {
         && request
             .get("ack2")
             .is_none_or(|expected| support.get("ack2") == Some(expected))
+        && request
+            .get("advisory_v1")
+            .is_none_or(|expected| support.get("advisory_v1") == Some(expected))
 }
 
 fn version_at_least(version: &str, minimum: [u64; 3]) -> bool {
@@ -5106,7 +5326,7 @@ fn post_read_response(response: Value) -> Result<Value, CommandError> {
     Ok(response)
 }
 
-fn session_idle(status: &Value) -> Result<bool, CommandError> {
+fn session_idle(status: &Value, advisories_pending: bool) -> Result<bool, CommandError> {
     let open_requests = status["open_requests"]
         .as_u64()
         .ok_or_else(|| CommandError::new("status response has no open_requests count", 1))?;
@@ -5125,7 +5345,10 @@ fn session_idle(status: &Value) -> Result<bool, CommandError> {
             .ok_or_else(|| {
                 CommandError::new("status response has no pending_delivered_unacted count", 1)
             })?;
-    Ok(open_chats == 0 && pending_undelivered == 0 && pending_delivered_unacted == 0)
+    Ok(open_chats == 0
+        && pending_undelivered == 0
+        && pending_delivered_unacted == 0
+        && !advisories_pending)
 }
 
 fn stream_should_reconnect(error: &ApiError) -> bool {
@@ -6053,7 +6276,7 @@ mod tests {
             "pending_undelivered":0,
             "pending_delivered_unacted":0
         });
-        assert!(!session_idle(&status).unwrap());
+        assert!(!session_idle(&status, false).unwrap());
 
         let closed = json!({
             "open_requests":0,
@@ -6061,7 +6284,8 @@ mod tests {
             "pending_undelivered":0,
             "pending_delivered_unacted":0
         });
-        assert!(session_idle(&closed).unwrap());
+        assert!(session_idle(&closed, false).unwrap());
+        assert!(!session_idle(&closed, true).unwrap());
     }
 
     #[test]
@@ -8813,6 +9037,7 @@ mod tests {
             OriginHarness::Other,
             Value::Null,
             true,
+            None,
         );
         assert_eq!(listen_declared["ack2"], true);
         assert!(
@@ -8821,7 +9046,8 @@ mod tests {
                 session,
                 OriginHarness::Other,
                 Value::Null,
-                false
+                false,
+                None,
             )
             .get("ack2")
             .is_none()
@@ -8844,6 +9070,52 @@ mod tests {
             }}),
             &declared
         ));
+    }
+
+    #[test]
+    fn advisory_support_is_declared_only_as_an_explicit_per_handle_capability() {
+        let session = Uuid::new_v4();
+        let request = listener_support_request(
+            Uuid::new_v4(),
+            session,
+            OriginHarness::Other,
+            Value::Null,
+            false,
+            Some(true),
+        );
+        assert_eq!(request["advisory_v1"], true);
+        let confirmed = json!({
+            "listening_support": {
+                "route":"other",
+                "cli_version":env!("CARGO_PKG_VERSION"),
+                "unsupported_reason":null,
+                "advisory_v1":true
+            }
+        });
+        assert!(support_record_matches(&confirmed, &request));
+        let missing = json!({
+            "listening_support": {
+                "route":"other",
+                "cli_version":env!("CARGO_PKG_VERSION"),
+                "unsupported_reason":null
+            }
+        });
+        assert!(!support_record_matches(&missing, &request));
+        assert!(advisory_stream_unsupported(&ApiError::Refused(
+            "invalid_field".into()
+        )));
+        assert!(advisory_stream_unsupported(&ApiError::Http {
+            status: 404,
+            body: String::new()
+        }));
+        assert!(advisory_stream_unsupported(&ApiError::Http {
+            status: 400,
+            body: String::new()
+        }));
+        assert!(!advisory_stream_unsupported(&ApiError::Http {
+            status: 500,
+            body: String::new()
+        }));
     }
 
     #[test]

@@ -499,46 +499,137 @@ fn reconnect_inner(
     }
     // The local listener lock remains held throughout the real SSE connection.
     // There is no private retry budget in this worker.
-    let mut stream = context.api.reconnect_stream(session).map_err(|e| {
-        let exit = stream_open_exit(&e);
-        Failure::command("stream", api_error(e, exit))
-    })?;
-    // Consume the initial change notice before declaring readiness. Its cursor
-    // is only a trigger; the durable journal cursor comes from the feed.
-    stream
-        .next_change()
-        .map_err(|e| Failure::command("stream", api_error(e, 1)))?;
+    let (mut stream, advisory_stream) =
+        connect_reconnect_stream(context, session).map_err(|e| {
+            let exit = stream_open_exit(&e);
+            Failure::command("stream", api_error(e, exit))
+        })?;
+    // The stream is open before catch-up, so changes during startup remain
+    // observable. The initial hint is only a trigger; both durable cursors
+    // come from their respective feeds.
+    if matches!(
+        stream
+            .next_notice()
+            .map_err(|e| Failure::command("stream", api_error(e, 1)))?,
+        OriginNotice::Replaced
+    ) {
+        return Err(Failure::local(
+            "stream",
+            "listener_replaced",
+            "The origin session listener was replaced.",
+            EXIT_LISTENER_ACTIVE,
+        ));
+    }
     fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
+    if advisory_stream
+        && fetch_advisories(context, &mut store, session)
+            .map_err(|e| Failure::command("advisory_feed", e))?
+    {
+        declare_advisory_support(context, &mut store, session, route, false)
+            .map_err(|e| Failure::command("advisory_support", e))?;
+    }
     let status = read_status(context, session).map_err(|e| Failure::command("feed", e))?;
     let mut offered = BTreeSet::new();
-    if session_idle(&status).map_err(|e| Failure::command("feed", e))? {
+    let mut offered_advisories = BTreeSet::new();
+    let ordinary_cursor = store
+        .cursor()
+        .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
+    let advisories_pending = !store
+        .pending_advisories_for(session)
+        .map_err(|e| Failure::command("journal", journal_error(e, 1)))?
+        .is_empty();
+    if session_idle(&status, advisories_pending).map_err(|e| Failure::command("feed", e))? {
         emit_pending(&mut store, session, true, &mut offered)
             .map_err(|e| Failure::command("feed", e))?;
+        emit_pending_advisories(
+            &mut store,
+            session,
+            true,
+            ordinary_cursor,
+            &mut offered_advisories,
+        )
+        .map_err(|e| Failure::command("advisory_feed", e))?;
         return emit(&json!({"kind":"idle","open_requests":0}))
             .map_err(|e| Failure::command("feed", e));
     }
-    let cursor = store
-        .cursor()
-        .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
+    let cursor = ordinary_cursor;
     emit(&json!({"kind":"reconnected","session_handle":session,"feed_cursor":cursor}))
         .map_err(|e| Failure::command("feed", e))?;
     emit_pending(&mut store, session, true, &mut offered)
         .map_err(|e| Failure::command("feed", e))?;
+    emit_pending_advisories(
+        &mut store,
+        session,
+        true,
+        ordinary_cursor,
+        &mut offered_advisories,
+    )
+    .map_err(|e| Failure::command("advisory_feed", e))?;
     loop {
-        let notice = stream
-            .next_change()
-            .map_err(|e| Failure::command("stream", api_error(e, 1)))?;
-        let cursor = store
-            .cursor()
-            .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
-        if notice <= cursor {
-            continue;
+        match stream
+            .next_notice()
+            .map_err(|e| Failure::command("stream", api_error(e, 1)))?
+        {
+            OriginNotice::Change(notice) => {
+                let cursor = store
+                    .cursor()
+                    .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
+                if notice <= cursor {
+                    continue;
+                }
+                fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
+            }
+            OriginNotice::AdvisoryChange {
+                session_handle,
+                cursor,
+            } => {
+                if session_handle != session {
+                    continue;
+                }
+                let local_cursor = store
+                    .advisory_cursor(session)
+                    .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
+                if advisory_stream && cursor > local_cursor {
+                    if fetch_advisories(context, &mut store, session)
+                        .map_err(|e| Failure::command("advisory_feed", e))?
+                    {
+                        declare_advisory_support(context, &mut store, session, route, false)
+                            .map_err(|e| Failure::command("advisory_support", e))?;
+                    }
+                }
+                // A committed advisory names an ordinary-feed prefix. Fetch
+                // that cursor domain before offering any pending advisory.
+                fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
+            }
+            OriginNotice::Coverage => continue,
+            OriginNotice::Replaced => {
+                return Err(Failure::local(
+                    "stream",
+                    "listener_replaced",
+                    "The origin session listener was replaced.",
+                    EXIT_LISTENER_ACTIVE,
+                ));
+            }
         }
-        fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
         let status = read_status(context, session).map_err(|e| Failure::command("feed", e))?;
         emit_pending(&mut store, session, true, &mut offered)
             .map_err(|e| Failure::command("feed", e))?;
-        if session_idle(&status).map_err(|e| Failure::command("feed", e))? {
+        let ordinary_cursor = store
+            .cursor()
+            .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
+        emit_pending_advisories(
+            &mut store,
+            session,
+            true,
+            ordinary_cursor,
+            &mut offered_advisories,
+        )
+        .map_err(|e| Failure::command("advisory_feed", e))?;
+        let advisories_pending = !store
+            .pending_advisories_for(session)
+            .map_err(|e| Failure::command("journal", journal_error(e, 1)))?
+            .is_empty();
+        if session_idle(&status, advisories_pending).map_err(|e| Failure::command("feed", e))? {
             return emit(&json!({"kind":"idle","open_requests":0}))
                 .map_err(|e| Failure::command("feed", e));
         }

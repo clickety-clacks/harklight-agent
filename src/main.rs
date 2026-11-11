@@ -189,8 +189,14 @@ enum Command {
     Ack {
         #[arg(long)]
         session: Uuid,
-        #[arg(long)]
-        event: String,
+        #[arg(
+            long,
+            required_unless_present = "advisory",
+            conflicts_with = "advisory"
+        )]
+        event: Option<String>,
+        #[arg(long, required_unless_present = "event", conflicts_with = "event")]
+        advisory: Option<Uuid>,
     },
     #[command(
         about = "Record a receiving-system ACK2 outcome for a person entry",
@@ -643,7 +649,15 @@ fn main() {
             message_id,
             revision,
         } => commands::message_get(&context, &sender_id, &message_id, revision),
-        Command::Ack { session, event } => commands::ack(&context, session, &event),
+        Command::Ack {
+            session,
+            event,
+            advisory,
+        } => match (event, advisory) {
+            (Some(event), None) => commands::ack(&context, session, &event),
+            (None, Some(advisory)) => commands::ack_advisory(&context, session, advisory),
+            _ => unreachable!("clap requires exactly one acknowledgment target"),
+        },
         Command::Ack2 {
             session,
             event,
@@ -823,6 +837,54 @@ fn fail(message: String, exit_code: i32) -> ! {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn ack_accepts_exactly_one_ordinary_event_or_advisory_id() {
+        let session = "123e4567-e89b-42d3-a456-426614174000";
+        let advisory = "123e4567-e89b-42d3-a456-426614174001";
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "ack",
+                "--session",
+                session,
+                "--event",
+                "17"
+            ])
+            .is_ok()
+        );
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "ack",
+            "--session",
+            session,
+            "--advisory",
+            advisory,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ack {
+                event: None,
+                advisory: Some(_),
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["harklight-agent", "ack", "--session", session]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "ack",
+                "--session",
+                session,
+                "--event",
+                "17",
+                "--advisory",
+                advisory,
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn origin_listener_options_are_exclusive_before_configuration_or_network() {
