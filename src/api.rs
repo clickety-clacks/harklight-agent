@@ -283,6 +283,7 @@ fn parse_post_response_body(status: u16, body: impl AsRef<[u8]>) -> Result<Value
 pub enum OriginNotice {
     Change(u64),
     AdvisoryChange { session_handle: Uuid, cursor: u64 },
+    AdvisoryUnavailable,
     Coverage,
     Replaced,
 }
@@ -350,21 +351,22 @@ impl<R: BufRead> SseDecoder<R> {
                             .ok_or_else(|| ApiError::InvalidNotice(data.clone()))?;
                         Some(OriginNotice::Change(cursor))
                     }
-                    "advisory_change" if !self.data.is_empty() => {
-                        let value = serde_json::from_str::<Value>(&data)
-                            .map_err(|_| ApiError::InvalidNotice(data.clone()))?;
-                        let session_handle = value["session_handle"]
-                            .as_str()
-                            .and_then(|value| Uuid::parse_str(value).ok())
-                            .filter(|value| value.get_version_num() == 4)
-                            .ok_or_else(|| ApiError::InvalidNotice(data.clone()))?;
-                        let cursor = value["advisory_cursor"]
-                            .as_u64()
-                            .ok_or_else(|| ApiError::InvalidNotice(data.clone()))?;
-                        Some(OriginNotice::AdvisoryChange {
-                            session_handle,
-                            cursor,
-                        })
+                    "advisory_change" => {
+                        let notice = serde_json::from_str::<Value>(&data)
+                            .ok()
+                            .and_then(|value| {
+                                let session_handle = value["session_handle"]
+                                    .as_str()
+                                    .and_then(|value| Uuid::parse_str(value).ok())
+                                    .filter(|value| value.get_version_num() == 4)?;
+                                let cursor = value["advisory_cursor"].as_u64()?;
+                                Some(OriginNotice::AdvisoryChange {
+                                    session_handle,
+                                    cursor,
+                                })
+                            })
+                            .unwrap_or(OriginNotice::AdvisoryUnavailable);
+                        Some(notice)
                     }
                     "coverage" => Some(OriginNotice::Coverage),
                     "replaced" => Some(OriginNotice::Replaced),
@@ -433,23 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn advisory_change_requires_a_uuidv4_session_and_integer_cursor() {
-        let frames = "event: advisory_change\ndata: {\"session_handle\":\"not-a-session\",\"advisory_cursor\":1}\n\n";
-        let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
-        assert!(matches!(
-            decoder.next_notice(),
-            Err(ApiError::InvalidNotice(_))
-        ));
-
+    fn malformed_advisory_change_is_unavailable_and_does_not_block_ordinary_changes() {
         let session = Uuid::new_v4();
         let frames = format!(
-            "event: advisory_change\ndata: {{\"session_handle\":\"{session}\",\"advisory_cursor\":\"1\"}}\n\n"
+            "event: advisory_change\ndata: {{\"session_handle\":\"{session}\",\"advisory_cursor\":\"1\"}}\n\nevent: change\ndata: {{\"cursor\":41}}\n\n"
         );
         let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
-        assert!(matches!(
-            decoder.next_notice(),
-            Err(ApiError::InvalidNotice(_))
-        ));
+        assert_eq!(
+            decoder.next_notice().unwrap(),
+            OriginNotice::AdvisoryUnavailable
+        );
+        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Change(41));
     }
 
     #[test]

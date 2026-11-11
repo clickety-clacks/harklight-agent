@@ -7,6 +7,7 @@ pub(super) struct SafeReason {
     code: &'static str,
     text: &'static str,
     source: &'static str,
+    http_status: Option<u16>,
 }
 
 impl SafeReason {
@@ -15,6 +16,7 @@ impl SafeReason {
             code,
             text,
             source: "agent",
+            http_status: None,
         }
     }
 
@@ -23,6 +25,7 @@ impl SafeReason {
             code: "unknown",
             text: "The attempt failed without a recognized safe diagnostic.",
             source: "unknown",
+            http_status: None,
         }
     }
 
@@ -50,6 +53,11 @@ impl SafeReason {
                 "invalid_field",
                 "The server rejected an attachment or support field.",
             ),
+            "unknown_type" | "unknown_field" | "unknown_parameter" | "not_supported"
+            | "unsupported" => (
+                "optional_field_unrecognized",
+                "The server did not recognize an optional support capability.",
+            ),
             "unsupported_version" => (
                 "unsupported_version",
                 "The server does not support this protocol version.",
@@ -60,17 +68,38 @@ impl SafeReason {
             code,
             text,
             source: "server",
+            http_status: None,
         }
+    }
+
+    pub(super) fn is_optional_support_rejection(&self) -> bool {
+        self.source == "server"
+            && (self.code == "invalid_field"
+                || self.code == "optional_field_unrecognized"
+                || matches!(self.http_status, Some(400 | 404)))
     }
 
     pub(super) fn api(error: &ApiError) -> Self {
         match error {
             ApiError::Refused(reason) => Self::server(reason),
-            ApiError::Http { body, .. } => serde_json::from_str::<Value>(body)
-                .ok()
-                .filter(|v| v["v"] == 1 && v["type"] == "error")
-                .and_then(|v| v["reason"].as_str().map(Self::server))
-                .unwrap_or_else(Self::unknown),
+            ApiError::Http { status, body } => {
+                let reason = serde_json::from_str::<Value>(body)
+                    .ok()
+                    .filter(|v| v["v"] == 1 && v["type"] == "error")
+                    .and_then(|v| v["reason"].as_str().map(Self::server));
+                reason.unwrap_or_else(|| {
+                    if (400..500).contains(status) {
+                        Self {
+                            code: "http_rejection",
+                            text: "The origin rejected the request.",
+                            source: "server",
+                            http_status: Some(*status),
+                        }
+                    } else {
+                        Self::unknown()
+                    }
+                })
+            }
             ApiError::Transport(error) if error.is_timeout() => {
                 Self::local("timeout", "The origin request timed out.")
             }
@@ -328,6 +357,36 @@ fn saved_attachment(
     ))
 }
 
+fn saved_attachment_support_flags(
+    store: &JournalStore,
+    session: Uuid,
+    route: OriginHarness,
+    controller: bool,
+) -> Result<ListenerSupportFlags, Failure> {
+    if route != OriginHarness::Other || !controller {
+        return Ok(ListenerSupportFlags::default());
+    }
+    let operations = store
+        .operations_for_session(session)
+        .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
+    let Some(support) = operations
+        .iter()
+        .rev()
+        .find(|operation| operation.kind == "attachment_support")
+    else {
+        return Ok(ListenerSupportFlags::default());
+    };
+    if support.request["route"].as_str() != Some(route.as_str())
+        || !support.request["unsupported_reason"].is_null()
+    {
+        return Ok(ListenerSupportFlags::default());
+    }
+    Ok(ListenerSupportFlags {
+        ack2: support.request["ack2"] == true,
+        origin_listener: support.request["origin_listener"] == true,
+    })
+}
+
 fn attach_locked(
     context: &CommandContext,
     store: &mut JournalStore,
@@ -486,8 +545,16 @@ fn reconnect_inner(
             ));
         }
     };
+    let flags = saved_attachment_support_flags(&store, session, route, controller)?;
     let attached = attach_locked(
-        context, &mut store, session, &vendor, route, controller, false, false,
+        context,
+        &mut store,
+        session,
+        &vendor,
+        route,
+        controller,
+        flags.ack2,
+        flags.origin_listener,
     )?;
     if attached["ready_for_listen"] != true {
         return Err(Failure::local(
@@ -497,10 +564,12 @@ fn reconnect_inner(
             EXIT_UNSUPPORTED,
         ));
     }
+    let advisory_enabled = declare_listener_support(context, &mut store, session, route, flags)
+        .map_err(|e| Failure::command("support", e))?;
     // The local listener lock remains held throughout the real SSE connection.
     // There is no private retry budget in this worker.
     let (mut stream, advisory_stream) =
-        connect_reconnect_stream(context, session).map_err(|e| {
+        connect_reconnect_stream(context, session, advisory_enabled).map_err(|e| {
             let exit = stream_open_exit(&e);
             Failure::command("stream", api_error(e, exit))
         })?;
@@ -521,12 +590,16 @@ fn reconnect_inner(
         ));
     }
     fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
-    if advisory_stream
-        && fetch_advisories(context, &mut store, session)
-            .map_err(|e| Failure::command("advisory_feed", e))?
-    {
-        declare_advisory_support(context, &mut store, session, route, false)
-            .map_err(|e| Failure::command("advisory_support", e))?;
+    if advisory_stream {
+        match fetch_advisories(context, &mut store, session) {
+            Ok(_) => {}
+            Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                eprintln!(
+                    "Harklight advisory feed request failed; retaining its cursor and continuing ordinary reconnect"
+                );
+            }
+            Err(error) => return Err(Failure::command("advisory_feed", error)),
+        }
     }
     let status = read_status(context, session).map_err(|e| Failure::command("feed", e))?;
     let mut offered = BTreeSet::new();
@@ -590,16 +663,26 @@ fn reconnect_inner(
                     .advisory_cursor(session)
                     .map_err(|e| Failure::command("journal", journal_error(e, 1)))?;
                 if advisory_stream && cursor > local_cursor {
-                    if fetch_advisories(context, &mut store, session)
-                        .map_err(|e| Failure::command("advisory_feed", e))?
-                    {
-                        declare_advisory_support(context, &mut store, session, route, false)
-                            .map_err(|e| Failure::command("advisory_support", e))?;
+                    match fetch_advisories(context, &mut store, session) {
+                        Ok(_) => {}
+                        Err(error) if listener_post_failure_requires_reconnect(&error) => {
+                            eprintln!(
+                                "Harklight advisory feed request failed; retaining its cursor and continuing ordinary reconnect"
+                            );
+                        }
+                        Err(error) => {
+                            return Err(Failure::command("advisory_feed", error));
+                        }
                     }
                 }
                 // A committed advisory names an ordinary-feed prefix. Fetch
                 // that cursor domain before offering any pending advisory.
                 fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
+            }
+            OriginNotice::AdvisoryUnavailable => {
+                eprintln!(
+                    "Harklight advisory stream hint is malformed or unavailable; continuing ordinary reconnect"
+                );
             }
             OriginNotice::Coverage => continue,
             OriginNotice::Replaced => {

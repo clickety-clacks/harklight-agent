@@ -118,14 +118,26 @@ fn fetch_advisories_with(
     });
     let response = match post(&request) {
         Ok(response) => response,
-        Err(error) if advisory_feed_unsupported(&error) => return Ok(false),
+        Err(
+            error @ ApiError::Http {
+                status: 401 | 403, ..
+            },
+        ) => {
+            return Err(api_error(error, EXIT_REFUSED));
+        }
+        Err(ApiError::Http { .. } | ApiError::InvalidResponse(_)) => {
+            return advisory_unavailable("the optional feed response was not usable");
+        }
+        Err(ApiError::Refused(reason)) if !advisory_refusal_is_auth_or_session(&reason) => {
+            return advisory_unavailable("the origin refused the optional feed");
+        }
         Err(error) => return Err(api_error(error, 1)),
     };
 
     if response["type"] == "error" {
         let reason = response["reason"].as_str().unwrap_or("unspecified");
-        if advisory_reason_unsupported(reason) {
-            return Ok(false);
+        if !advisory_refusal_is_auth_or_session(reason) {
+            return advisory_unavailable("the origin refused the optional feed");
         }
         return Err(CommandError::new(
             format!("origin refused advisory feed: {reason}"),
@@ -133,122 +145,113 @@ fn fetch_advisories_with(
         ));
     }
     if response["type"] != "ok" || response["advisory_v1"] != true {
-        return Ok(false);
+        return advisory_unavailable("the origin did not confirm advisory feed support");
     }
     if response["session_handle"].as_str() != Some(session.to_string().as_str()) {
-        return Err(CommandError::new(
-            "origin advisory feed named a different session",
-            EXIT_REFUSED,
-        ));
+        return advisory_unavailable("the response did not match this session");
     }
 
-    let high_water = response["cursor"]
-        .as_u64()
-        .ok_or_else(|| CommandError::new("advisory feed has no integer cursor", 1))?;
+    let Some(high_water) = response["cursor"].as_u64() else {
+        return advisory_unavailable("the response had no integer cursor");
+    };
     if high_water < since {
-        return Err(CommandError::new(
-            format!("advisory cursor regressed from {since} to {high_water}"),
-            1,
-        ));
+        return advisory_unavailable("the advisory cursor regressed");
     }
-    let entries = response["entries"]
-        .as_array()
-        .ok_or_else(|| CommandError::new("advisory feed has no entries array", 1))?;
+    let Some(entries) = response["entries"].as_array() else {
+        return advisory_unavailable("the response had no entries array");
+    };
     if usize::try_from(high_water - since).ok() != Some(entries.len()) {
-        return Err(CommandError::new(
-            "advisory feed omitted or added entries within its cursor range",
-            1,
-        ));
+        return advisory_unavailable("the entries did not cover the cursor range");
     }
 
     let mut journal_entries = Vec::with_capacity(entries.len());
     let mut expected = since.checked_add(1);
     for raw in entries {
-        let sequence = raw["advisory_seq"]
-            .as_u64()
-            .ok_or_else(|| CommandError::new("advisory entry has no integer sequence", 1))?;
+        let Some(sequence) = raw["advisory_seq"].as_u64() else {
+            return advisory_unavailable("an advisory entry had no integer sequence");
+        };
         if expected != Some(sequence) {
-            return Err(CommandError::new(
-                "advisory feed sequence is not contiguous",
-                1,
-            ));
+            return advisory_unavailable("the advisory sequence was not contiguous");
         }
         expected = sequence.checked_add(1);
-        journal_entries.push(parse_advisory(raw, session, sequence)?);
+        match parse_advisory(raw, session, sequence) {
+            Ok(entry) => journal_entries.push(entry),
+            Err(reason) => return advisory_unavailable(reason),
+        }
     }
     if entries.is_empty() && high_water != since
         || !entries.is_empty() && expected.and_then(|next| next.checked_sub(1)) != Some(high_water)
     {
-        return Err(CommandError::new(
-            "advisory feed cursor does not match its entries",
-            1,
-        ));
+        return advisory_unavailable("the advisory cursor did not match its entries");
     }
 
-    store
-        .record_advisory_batch(session, since, high_water, &journal_entries)
-        .map_err(|error| journal_error(error, 1))?;
+    if let Err(error) = store.record_advisory_batch(session, since, high_water, &journal_entries) {
+        match error {
+            JournalError::InvalidCursor
+            | JournalError::AdvisoryGap { .. }
+            | JournalError::AdvisoryConflict { .. } => {
+                return advisory_unavailable("the journal rejected the advisory cursor or batch");
+            }
+            error => return Err(journal_error(error, 1)),
+        }
+    }
     Ok(true)
 }
 
-fn advisory_feed_unsupported(error: &ApiError) -> bool {
-    match error {
-        ApiError::Http { status: 404, .. } => true,
-        ApiError::Refused(reason) => advisory_reason_unsupported(reason),
-        _ => false,
-    }
+fn advisory_unavailable(reason: &'static str) -> Result<bool, CommandError> {
+    eprintln!("Harklight advisory feed unavailable: {reason}");
+    Ok(false)
 }
 
-fn advisory_reason_unsupported(reason: &str) -> bool {
-    matches!(reason, "unknown_type" | "not_supported" | "unsupported")
+fn advisory_refusal_is_auth_or_session(reason: &str) -> bool {
+    matches!(
+        reason,
+        "forbidden"
+            | "revoked"
+            | "unauthorized"
+            | "invalid_session"
+            | "session_mismatch"
+            | "already_listening"
+            | "gone"
+    ) || reason.contains("auth")
+        || reason.contains("session")
+        || reason.contains("revoked")
 }
 
 fn parse_advisory(
     raw: &Value,
     session: Uuid,
     expected_sequence: u64,
-) -> Result<AdvisoryEntry, CommandError> {
+) -> Result<AdvisoryEntry, &'static str> {
     if raw["kind"] != "advisory"
         || raw["advisory_type"] != "unseen_interval_elapsed"
         || raw["author"] != "server"
     {
-        return Err(CommandError::new(
-            "origin returned an unsupported advisory kind",
-            EXIT_REFUSED,
-        ));
+        return Err("the response contained an unsupported advisory kind");
     }
     let session_handle = raw["session_handle"]
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok())
         .filter(|value| value.get_version() == Some(Version::Random))
-        .ok_or_else(|| CommandError::new("advisory has an invalid session handle", 1))?;
+        .ok_or("an advisory entry had an invalid session handle")?;
     if session_handle != session {
-        return Err(CommandError::new(
-            "origin advisory belongs to a different session",
-            EXIT_REFUSED,
-        ));
+        return Err("an advisory entry named a different session");
     }
     let advisory_id = raw["advisory_id"]
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok())
         .filter(|value| value.get_version() == Some(Version::Random))
-        .ok_or_else(|| CommandError::new("advisory has an invalid id", 1))?;
+        .ok_or("an advisory entry had an invalid id")?;
     let sequence = raw["advisory_seq"]
         .as_u64()
         .filter(|sequence| *sequence > 0)
-        .ok_or_else(|| CommandError::new("advisory has an invalid sequence", 1))?;
+        .ok_or("an advisory entry had an invalid sequence")?;
     if sequence != expected_sequence {
-        return Err(CommandError::new(
-            "advisory sequence changed during validation",
-            EXIT_REFUSED,
-        ));
+        return Err("an advisory entry sequence changed during validation");
     }
     for field in ["sender_id", "message_id", "level_name", "text"] {
         if raw[field].as_str().is_none() {
-            return Err(CommandError::new(
-                format!("advisory has no string {field}"),
-                1,
-            ));
+            return Err("an advisory entry had a non-string field");
         }
     }
     for field in [
@@ -260,21 +263,15 @@ fn parse_advisory(
         "origin_cursor_at_decision",
     ] {
         if raw[field].as_u64().is_none() {
-            return Err(CommandError::new(
-                format!("advisory has no integer {field}"),
-                1,
-            ));
+            return Err("an advisory entry had a non-integer field");
         }
     }
     if raw["request_revision"].as_u64() == Some(0) {
-        return Err(CommandError::new(
-            "advisory has an invalid request revision",
-            1,
-        ));
+        return Err("an advisory entry had an invalid request revision");
     }
     let delivered = raw["delivered"]
         .as_bool()
-        .ok_or_else(|| CommandError::new("advisory has no delivered projection", 1))?;
+        .ok_or("an advisory entry had no delivered projection")?;
     let origin_cursor = raw["origin_cursor_at_decision"]
         .as_u64()
         .expect("validated above");
@@ -498,6 +495,51 @@ mod tests {
         );
         assert_eq!(journal.advisory_cursor(session).unwrap(), 0);
         assert_eq!(journal.cursor().unwrap(), 0);
+    }
+
+    #[test]
+    fn refused_and_malformed_advisory_reads_preserve_both_cursors_and_pending_entries() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let mut journal = store(&root, session);
+        let first = advisory_response(session, first_id);
+        assert!(fetch_advisories_with(&mut journal, session, |_| Ok(first.clone())).unwrap());
+
+        let not_found = json!({"v":1,"type":"error","reason":"not_found"});
+        assert!(!fetch_advisories_with(&mut journal, session, |_| Ok(not_found.clone())).unwrap());
+        assert!(
+            !fetch_advisories_with(&mut journal, session, |_| {
+                Err(ApiError::Refused("unknown_type".into()))
+            })
+            .unwrap()
+        );
+        assert!(
+            !fetch_advisories_with(&mut journal, session, |_| {
+                Err(ApiError::InvalidResponse("bad optional response".into()))
+            })
+            .unwrap()
+        );
+
+        let mut malformed = advisory_response(session, second_id);
+        malformed["cursor"] = json!(2);
+        malformed["entries"][0]["advisory_seq"] = json!(2);
+        malformed["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("text");
+        assert!(
+            !fetch_advisories_with(&mut journal, session, |_| { Ok(malformed.clone()) }).unwrap()
+        );
+
+        let forbidden = json!({"v":1,"type":"error","reason":"forbidden"});
+        assert!(fetch_advisories_with(&mut journal, session, |_| Ok(forbidden.clone())).is_err());
+        assert_eq!(journal.advisory_cursor(session).unwrap(), 1);
+        assert_eq!(journal.cursor().unwrap(), 0);
+        let pending = journal.pending_advisories_for(session).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].advisory_id, first_id);
     }
 
     #[test]
