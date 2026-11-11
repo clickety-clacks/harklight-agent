@@ -177,16 +177,28 @@ impl OriginClient {
     }
 
     pub fn connect_stream(&self, session: Uuid) -> Result<SseStream, ApiError> {
-        self.open_stream(session, false)
+        self.open_stream(session, false, false)
+    }
+
+    pub fn connect_advisory_stream(&self, session: Uuid) -> Result<SseStream, ApiError> {
+        self.open_stream(session, false, true)
     }
 
     pub fn reconnect_stream(&self, session: Uuid) -> Result<SseStream, ApiError> {
-        self.open_stream(session, true)
+        self.open_stream(session, true, false)
     }
 
-    fn open_stream(&self, session: Uuid, reconnect: bool) -> Result<SseStream, ApiError> {
-        let suffix = if reconnect { "&reconnect=1" } else { "" };
-        let path = format!("/origin/v1/stream?session={session}{suffix}");
+    pub fn reconnect_advisory_stream(&self, session: Uuid) -> Result<SseStream, ApiError> {
+        self.open_stream(session, true, true)
+    }
+
+    fn open_stream(
+        &self,
+        session: Uuid,
+        reconnect: bool,
+        advisory_v1: bool,
+    ) -> Result<SseStream, ApiError> {
+        let path = origin_stream_path(session, reconnect, advisory_v1);
         self.open_stream_path(&path)
     }
 
@@ -227,6 +239,17 @@ impl OriginClient {
     }
 }
 
+fn origin_stream_path(session: Uuid, reconnect: bool, advisory_v1: bool) -> String {
+    let mut path = format!("/origin/v1/stream?session={session}");
+    if advisory_v1 {
+        path.push_str("&advisory_v1=1");
+    }
+    if reconnect {
+        path.push_str("&reconnect=1");
+    }
+    path
+}
+
 fn parse_post_response(response: Response, address: &str) -> Result<Value, ApiError> {
     let status = response.status().as_u16();
     let body = response
@@ -259,6 +282,8 @@ fn parse_post_response_body(status: u16, body: impl AsRef<[u8]>) -> Result<Value
 #[derive(Debug, PartialEq, Eq)]
 pub enum OriginNotice {
     Change(u64),
+    AdvisoryChange { session_handle: Uuid, cursor: u64 },
+    AdvisoryUnavailable,
     Coverage,
     Replaced,
 }
@@ -317,24 +342,39 @@ impl<R: BufRead> SseDecoder<R> {
             }
             let line = line.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
-                if self.event == "change" && !self.data.is_empty() {
-                    let data = self.data.join("\n");
-                    let cursor = serde_json::from_str::<Value>(&data)
-                        .ok()
-                        .and_then(|value| value["cursor"].as_u64())
-                        .ok_or_else(|| ApiError::InvalidNotice(data.clone()))?;
-                    self.event.clear();
-                    self.data.clear();
-                    return Ok(OriginNotice::Change(cursor));
-                }
-                let control = match self.event.as_str() {
+                let data = self.data.join("\n");
+                let notice = match self.event.as_str() {
+                    "change" if !self.data.is_empty() => {
+                        let cursor = serde_json::from_str::<Value>(&data)
+                            .ok()
+                            .and_then(|value| value["cursor"].as_u64())
+                            .ok_or_else(|| ApiError::InvalidNotice(data.clone()))?;
+                        Some(OriginNotice::Change(cursor))
+                    }
+                    "advisory_change" => {
+                        let notice = serde_json::from_str::<Value>(&data)
+                            .ok()
+                            .and_then(|value| {
+                                let session_handle = value["session_handle"]
+                                    .as_str()
+                                    .and_then(|value| Uuid::parse_str(value).ok())
+                                    .filter(|value| value.get_version_num() == 4)?;
+                                let cursor = value["advisory_cursor"].as_u64()?;
+                                Some(OriginNotice::AdvisoryChange {
+                                    session_handle,
+                                    cursor,
+                                })
+                            })
+                            .unwrap_or(OriginNotice::AdvisoryUnavailable);
+                        Some(notice)
+                    }
                     "coverage" => Some(OriginNotice::Coverage),
                     "replaced" => Some(OriginNotice::Replaced),
                     _ => None,
                 };
                 self.event.clear();
                 self.data.clear();
-                if let Some(notice) = control {
+                if let Some(notice) = notice {
                     return Ok(notice);
                 }
                 continue;
@@ -359,11 +399,53 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn advisory_stream_opt_in_preserves_session_and_reconnect_parameters() {
+        let session = Uuid::new_v4();
+        assert_eq!(
+            origin_stream_path(session, false, true),
+            format!("/origin/v1/stream?session={session}&advisory_v1=1")
+        );
+        assert_eq!(
+            origin_stream_path(session, true, true),
+            format!("/origin/v1/stream?session={session}&advisory_v1=1&reconnect=1")
+        );
+        assert_eq!(
+            origin_stream_path(session, true, false),
+            format!("/origin/v1/stream?session={session}&reconnect=1")
+        );
+    }
+
+    #[test]
     fn origin_notices_preserve_control_events() {
-        let mut decoder = SseDecoder::new(Cursor::new(b"event: coverage\ndata: {}\n\nevent: change\ndata: {\"cursor\":7}\n\nevent: replaced\ndata: {}\n\n"));
+        let session = Uuid::new_v4();
+        let frames = format!(
+            "event: coverage\ndata: {{}}\n\nevent: change\ndata: {{\"cursor\":7}}\n\nevent: advisory_change\ndata: {{\"session_handle\":\"{session}\",\"advisory_cursor\":3}}\n\nevent: replaced\ndata: {{}}\n\n"
+        );
+        let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
         assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Coverage);
         assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Change(7));
+        assert_eq!(
+            decoder.next_notice().unwrap(),
+            OriginNotice::AdvisoryChange {
+                session_handle: session,
+                cursor: 3
+            }
+        );
         assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Replaced);
+    }
+
+    #[test]
+    fn malformed_advisory_change_is_unavailable_and_does_not_block_ordinary_changes() {
+        let session = Uuid::new_v4();
+        let frames = format!(
+            "event: advisory_change\ndata: {{\"session_handle\":\"{session}\",\"advisory_cursor\":\"1\"}}\n\nevent: change\ndata: {{\"cursor\":41}}\n\n"
+        );
+        let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
+        assert_eq!(
+            decoder.next_notice().unwrap(),
+            OriginNotice::AdvisoryUnavailable
+        );
+        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Change(41));
     }
 
     #[test]

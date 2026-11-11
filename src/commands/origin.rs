@@ -13,7 +13,7 @@ pub fn cover(context: &CommandContext, session: Uuid) -> Result<(), CommandError
     let mut request = json!({"v":1,"type":"support","op_id":Uuid::new_v4(),
         "session_handle":session,"route":"other","cli_version":env!("CARGO_PKG_VERSION"),
         "unsupported_reason":null,"origin_listener":true});
-    for key in ["ack2", "advisory_v1"] {
+    for key in ["ack2"] {
         if let Some(value) = support.get(key) {
             request[key] = value.clone();
         }
@@ -111,6 +111,8 @@ pub fn listen_origin(context: &CommandContext) -> Result<(), CommandError> {
                             fetch_feed(context, &mut store)?;
                         }
                     }
+                    Some(OriginNotice::AdvisoryChange { .. }) => {}
+                    Some(OriginNotice::AdvisoryUnavailable) => {}
                     Some(OriginNotice::Replaced) => {
                         return Err(CommandError::new(
                             "origin listener replaced",
