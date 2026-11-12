@@ -3797,7 +3797,11 @@ fn focus_follow(context: &CommandContext) -> Result<(), CommandError> {
     let mut reconnect_delay = Duration::from_millis(250);
 
     loop {
-        let mut stream = match context.api.connect_focus_stream() {
+        let mut stream = match connect_focus_stream_with_retry(
+            &mut reconnect_delay,
+            || context.api.connect_focus_stream(),
+            thread::sleep,
+        ) {
             Ok(stream) => stream,
             Err(ApiError::Refused(reason)) if reason == "forbidden" => {
                 return Err(CommandError::new(
@@ -5652,6 +5656,28 @@ fn stream_should_reconnect(error: &ApiError) -> bool {
     ) || matches!(error, ApiError::Http { status, .. } if *status >= 500)
 }
 
+fn connect_focus_stream_with_retry<T, C, S>(
+    reconnect_delay: &mut Duration,
+    mut connect: C,
+    mut sleep: S,
+) -> Result<T, ApiError>
+where
+    C: FnMut() -> Result<T, ApiError>,
+    S: FnMut(Duration),
+{
+    let max_reconnect_delay = Duration::from_secs(30);
+
+    loop {
+        match connect() {
+            Err(error) if stream_should_reconnect(&error) => {
+                sleep(*reconnect_delay);
+                *reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+            }
+            result => return result,
+        }
+    }
+}
+
 struct RequestContext {
     sender_id: String,
     message_id: String,
@@ -6012,6 +6038,41 @@ mod tests {
         collections::VecDeque,
         sync::Mutex,
     };
+
+    #[test]
+    fn focus_follow_retries_transient_stream_attach_errors_with_listen_backoff() {
+        let mut reconnect_delay = Duration::from_millis(250);
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+
+        let result: Result<(), ApiError> = connect_focus_stream_with_retry(
+            &mut reconnect_delay,
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(ApiError::Http {
+                        status: 503,
+                        body: "temporarily unavailable".into(),
+                    })
+                } else {
+                    Err(ApiError::Refused("forbidden".into()))
+                }
+            },
+            |delay| delays.push(delay),
+        );
+
+        assert!(matches!(result, Err(ApiError::Refused(reason)) if reason == "forbidden"));
+        assert_eq!(attempts, 4);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1)
+            ]
+        );
+        assert_eq!(reconnect_delay, Duration::from_secs(2));
+    }
 
     #[test]
     fn focus_and_show_responses_keep_contract_output_and_refusals() {
