@@ -186,6 +186,24 @@ enum Command {
         #[arg(long)]
         revision: Option<u64>,
     },
+    /// Read the latest reported focus, or follow focus changes.
+    Focus {
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Ask a Harklight client to open a message or its chat.
+    Show {
+        #[arg(long)]
+        sender_id: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        chat: bool,
+        #[arg(long, conflicts_with = "client")]
+        device: Option<String>,
+        #[arg(long, conflicts_with = "device")]
+        client: Option<String>,
+    },
     Ack {
         #[arg(long)]
         session: Uuid,
@@ -649,6 +667,21 @@ fn main() {
             message_id,
             revision,
         } => commands::message_get(&context, &sender_id, &message_id, revision),
+        Command::Focus { follow } => commands::focus(&context, follow),
+        Command::Show {
+            sender_id,
+            message_id,
+            chat,
+            device,
+            client,
+        } => commands::show(
+            &context,
+            &sender_id,
+            &message_id,
+            chat,
+            device.as_deref(),
+            client.as_deref(),
+        ),
         Command::Ack {
             session,
             event,
@@ -1235,6 +1268,53 @@ mod tests {
                 "message-get",
                 "--sender-id",
                 "app:example",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn focus_and_show_parse_their_contract_arguments() {
+        let focus = Cli::try_parse_from(["harklight-agent", "focus", "--follow"]).unwrap();
+        assert!(matches!(focus.command, Command::Focus { follow: true }));
+
+        let show = Cli::try_parse_from([
+            "harklight-agent",
+            "show",
+            "--sender-id",
+            "app:example",
+            "--message-id",
+            "message-1",
+            "--chat",
+            "--device",
+            "Owner's iPhone",
+        ])
+        .unwrap();
+        assert!(matches!(
+            show.command,
+            Command::Show {
+                sender_id,
+                message_id,
+                chat: true,
+                device: Some(device),
+                client: None,
+            } if sender_id == "app:example"
+                && message_id == "message-1"
+                && device == "Owner's iPhone"
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "show",
+                "--sender-id",
+                "app:example",
+                "--message-id",
+                "message-1",
+                "--device",
+                "iPhone",
+                "--client",
+                "a".repeat(64).as_str(),
             ])
             .is_err()
         );

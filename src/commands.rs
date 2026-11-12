@@ -3726,6 +3726,189 @@ pub fn message_get(
     )?)
 }
 
+/// Read focus without opening or changing a journal.
+pub fn focus(context: &CommandContext, follow: bool) -> Result<(), CommandError> {
+    if follow {
+        focus_follow(context)
+    } else {
+        let response = context
+            .api
+            .post(&json!({"v":1,"type":"focus_get"}))
+            .map_err(|error| api_error(error, 1))?;
+        let output = validate_focus_get_response(response)?;
+        emit(&output)
+    }
+}
+
+fn validate_focus_get_response(response: Value) -> Result<Value, CommandError> {
+    match response["type"].as_str() {
+        Some("ok") => {
+            let clients = response
+                .get("clients")
+                .filter(|value| value.is_array())
+                .cloned()
+                .ok_or_else(|| CommandError::new("focus response has no clients list", 1))?;
+            Ok(json!({"clients":clients}))
+        }
+        Some("error") => {
+            focus_refusal(&response, "focus", "See what you're looking at").map(|_| Value::Null)
+        }
+        _ => Err(CommandError::new(
+            "origin returned an invalid focus response",
+            1,
+        )),
+    }
+}
+
+fn focus_refusal(
+    response: &Value,
+    operation: &str,
+    permission: &str,
+) -> Result<Value, CommandError> {
+    let reason = response["reason"].as_str().unwrap_or("unspecified");
+    let field = response["field"].as_str();
+
+    match (reason, field) {
+        ("forbidden", _) => Err(CommandError::new(
+            format!("not allowed; turn on {permission}"),
+            EXIT_REFUSED,
+        )),
+        ("not_found", Some("message_id")) => Err(CommandError::new(
+            "no such message in this account",
+            EXIT_REFUSED,
+        )),
+        ("not_found", Some("target_client")) => {
+            Err(CommandError::new("no matching active device", EXIT_REFUSED))
+        }
+        ("invalid_field", Some("type")) => {
+            unsupported(operation, "server does not support this operation").map(|_| Value::Null)
+        }
+        ("invalid_field", Some(field)) => Err(CommandError::new(
+            format!("invalid field: {field}"),
+            EXIT_REFUSED,
+        )),
+        ("invalid_field", None) => Err(CommandError::new("invalid field", EXIT_REFUSED)),
+        _ => Err(CommandError::new(reason, EXIT_REFUSED)),
+    }
+}
+
+fn focus_follow(context: &CommandContext) -> Result<(), CommandError> {
+    let max_reconnect_delay = Duration::from_secs(30);
+    let mut reconnect_delay = Duration::from_millis(250);
+
+    loop {
+        let mut stream = match connect_focus_stream_with_retry(
+            &mut reconnect_delay,
+            || context.api.connect_focus_stream(),
+            thread::sleep,
+        ) {
+            Ok(stream) => stream,
+            Err(ApiError::Refused(reason)) if reason == "forbidden" => {
+                return Err(CommandError::new(
+                    "not allowed; turn on See what you're looking at",
+                    EXIT_REFUSED,
+                ));
+            }
+            Err(ApiError::Http { status: 404, .. }) => {
+                return unsupported("focus", "server does not support focus");
+            }
+            Err(error) => return Err(api_error(error, 1)),
+        };
+
+        loop {
+            match stream.next_notice() {
+                Ok(OriginNotice::FocusChange(data)) => {
+                    if !data.is_object() || !data["clients"].is_array() {
+                        return Err(CommandError::new(
+                            "origin sent an invalid focus change event",
+                            1,
+                        ));
+                    }
+                    emit(&data)?;
+                    reconnect_delay = Duration::from_millis(250);
+                }
+                Ok(_) => {}
+                Err(ApiError::StreamEnded | ApiError::StreamIo(_)) => break,
+                Err(error) => return Err(api_error(error, 1)),
+            }
+        }
+
+        thread::sleep(reconnect_delay);
+        reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+    }
+}
+
+/// Ask a client to open one message or its chat, without opening or changing a journal.
+pub fn show(
+    context: &CommandContext,
+    sender_id: &str,
+    message_id: &str,
+    chat: bool,
+    device: Option<&str>,
+    client: Option<&str>,
+) -> Result<(), CommandError> {
+    if device.is_some() && client.is_some() {
+        return Err(CommandError::new(
+            "--device and --client cannot be used together",
+            EXIT_REFUSED,
+        ));
+    }
+
+    let mut request = json!({
+        "v":1,
+        "type":"view_show",
+        "sender_id":sender_id,
+        "message_id":message_id,
+        "target":if chat {"chat"} else {"message"}
+    });
+    if let Some(device) = device {
+        request["target_device_name"] = Value::String(device.to_owned());
+    }
+    if let Some(client) = client {
+        request["target_client"] = Value::String(client.to_owned());
+    }
+
+    let response = context
+        .api
+        .post(&request)
+        .map_err(|error| api_error(error, 1))?;
+    emit(&validate_view_show_response(response)?)
+}
+
+fn validate_view_show_response(response: Value) -> Result<Value, CommandError> {
+    match response["type"].as_str() {
+        Some("ok") => {
+            let client_id = response
+                .get("client_id")
+                .filter(|value| value.is_string())
+                .cloned()
+                .ok_or_else(|| CommandError::new("show response has no client_id", 1))?;
+            let device_name = response
+                .get("device_name")
+                .filter(|value| value.is_string())
+                .cloned()
+                .ok_or_else(|| CommandError::new("show response has no device_name", 1))?;
+            let delivery = response
+                .get("delivery")
+                .filter(|value| matches!(value.as_str(), Some("sent" | "held")))
+                .cloned()
+                .ok_or_else(|| CommandError::new("show response has no delivery result", 1))?;
+            Ok(json!({
+                "client_id":client_id,
+                "device_name":device_name,
+                "delivery":delivery
+            }))
+        }
+        Some("error") => {
+            focus_refusal(&response, "show", "Open things on your screen").map(|_| Value::Null)
+        }
+        _ => Err(CommandError::new(
+            "origin returned an invalid show response",
+            1,
+        )),
+    }
+}
+
 fn message_get_sender_id_valid(value: &str) -> bool {
     let Some((namespace, rest)) = value.split_once(':') else {
         return false;
@@ -4309,7 +4492,7 @@ pub fn listen(
                         "Harklight advisory stream hint is malformed or unavailable; continuing ordinary listening"
                     );
                 }
-                Ok(OriginNotice::Coverage) => {}
+                Ok(OriginNotice::Coverage | OriginNotice::FocusChange(_)) => {}
                 Ok(OriginNotice::Replaced) => {
                     return Err(CommandError::new(
                         "origin session listener replaced",
@@ -5473,6 +5656,28 @@ fn stream_should_reconnect(error: &ApiError) -> bool {
     ) || matches!(error, ApiError::Http { status, .. } if *status >= 500)
 }
 
+fn connect_focus_stream_with_retry<T, C, S>(
+    reconnect_delay: &mut Duration,
+    mut connect: C,
+    mut sleep: S,
+) -> Result<T, ApiError>
+where
+    C: FnMut() -> Result<T, ApiError>,
+    S: FnMut(Duration),
+{
+    let max_reconnect_delay = Duration::from_secs(30);
+
+    loop {
+        match connect() {
+            Err(error) if stream_should_reconnect(&error) => {
+                sleep(*reconnect_delay);
+                *reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
+            }
+            result => return result,
+        }
+    }
+}
+
 struct RequestContext {
     sender_id: String,
     message_id: String,
@@ -5833,6 +6038,117 @@ mod tests {
         collections::VecDeque,
         sync::Mutex,
     };
+
+    #[test]
+    fn focus_follow_retries_transient_stream_attach_errors_with_listen_backoff() {
+        let mut reconnect_delay = Duration::from_millis(250);
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+
+        let result: Result<(), ApiError> = connect_focus_stream_with_retry(
+            &mut reconnect_delay,
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(ApiError::Http {
+                        status: 503,
+                        body: "temporarily unavailable".into(),
+                    })
+                } else {
+                    Err(ApiError::Refused("forbidden".into()))
+                }
+            },
+            |delay| delays.push(delay),
+        );
+
+        assert!(matches!(result, Err(ApiError::Refused(reason)) if reason == "forbidden"));
+        assert_eq!(attempts, 4);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1)
+            ]
+        );
+        assert_eq!(reconnect_delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn focus_and_show_responses_keep_contract_output_and_refusals() {
+        let focus = json!({
+            "v":1,
+            "type":"ok",
+            "ref":"ignored",
+            "clients":[{"client_id":"abc","screen":"inbox","reported_at":3}]
+        });
+        assert_eq!(
+            validate_focus_get_response(focus).unwrap(),
+            json!({"clients":[{"client_id":"abc","screen":"inbox","reported_at":3}]})
+        );
+
+        let shown = json!({
+            "v":1,
+            "type":"ok",
+            "client_id":"abc",
+            "device_name":"iPhone",
+            "delivery":"held",
+            "ref":"ignored"
+        });
+        assert_eq!(
+            validate_view_show_response(shown).unwrap(),
+            json!({"client_id":"abc","device_name":"iPhone","delivery":"held"})
+        );
+
+        let see_denied = validate_focus_get_response(json!({
+            "v":1,"type":"error","reason":"forbidden"
+        }))
+        .unwrap_err();
+        assert_eq!(see_denied.exit_code, EXIT_REFUSED);
+        assert!(see_denied.message.contains("See what you're looking at"));
+
+        let push_denied = validate_view_show_response(json!({
+            "v":1,"type":"error","reason":"forbidden"
+        }))
+        .unwrap_err();
+        assert_eq!(push_denied.exit_code, EXIT_REFUSED);
+        assert!(push_denied.message.contains("Open things on your screen"));
+
+        let missing_message = validate_view_show_response(json!({
+            "v":1,"type":"error","reason":"not_found","field":"message_id"
+        }))
+        .unwrap_err();
+        assert_eq!(missing_message.message, "no such message in this account");
+
+        let missing_client = validate_view_show_response(json!({
+            "v":1,"type":"error","reason":"not_found","field":"target_client"
+        }))
+        .unwrap_err();
+        assert_eq!(missing_client.message, "no matching active device");
+
+        let invalid = validate_view_show_response(json!({
+            "v":1,"type":"error","reason":"invalid_field","field":"sender_id"
+        }))
+        .unwrap_err();
+        assert_eq!(invalid.exit_code, EXIT_REFUSED);
+        assert!(invalid.message.contains("sender_id"));
+
+        let old_server = json!({
+            "v":1,"type":"error","reason":"invalid_field","field":"type"
+        });
+        assert_eq!(
+            validate_focus_get_response(old_server.clone())
+                .unwrap_err()
+                .exit_code,
+            EXIT_UNSUPPORTED
+        );
+        assert_eq!(
+            validate_view_show_response(old_server)
+                .unwrap_err()
+                .exit_code,
+            EXIT_UNSUPPORTED
+        );
+    }
 
     #[test]
     fn message_get_preserves_full_latest_and_exact_revision_objects() {
