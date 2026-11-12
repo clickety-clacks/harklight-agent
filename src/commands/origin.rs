@@ -113,6 +113,7 @@ pub fn listen_origin(context: &CommandContext) -> Result<(), CommandError> {
                     }
                     Some(OriginNotice::AdvisoryChange { .. }) => {}
                     Some(OriginNotice::AdvisoryUnavailable) => {}
+                    Some(OriginNotice::FocusChange(_)) => {}
                     Some(OriginNotice::Replaced) => {
                         return Err(CommandError::new(
                             "origin listener replaced",

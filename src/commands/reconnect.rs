@@ -684,7 +684,7 @@ fn reconnect_inner(
                     "Harklight advisory stream hint is malformed or unavailable; continuing ordinary reconnect"
                 );
             }
-            OriginNotice::Coverage => continue,
+            OriginNotice::Coverage | OriginNotice::FocusChange(_) => continue,
             OriginNotice::Replaced => {
                 return Err(Failure::local(
                     "stream",

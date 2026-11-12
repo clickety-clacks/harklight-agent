@@ -206,6 +206,10 @@ impl OriginClient {
         self.open_stream_path("/origin/v1/stream?scope=origin&reconnect=1")
     }
 
+    pub fn connect_focus_stream(&self) -> Result<SseStream, ApiError> {
+        self.open_stream_path("/origin/v1/stream?scope=focus")
+    }
+
     fn open_stream_path(&self, path: &str) -> Result<SseStream, ApiError> {
         let url = self.identity.origin_url(self.port, path)?;
         let response = self.send(self.client.get(url))?;
@@ -286,6 +290,7 @@ pub enum OriginNotice {
     AdvisoryUnavailable,
     Coverage,
     Replaced,
+    FocusChange(Value),
 }
 
 pub struct SseStream {
@@ -370,6 +375,11 @@ impl<R: BufRead> SseDecoder<R> {
                     }
                     "coverage" => Some(OriginNotice::Coverage),
                     "replaced" => Some(OriginNotice::Replaced),
+                    "focus_change" if !self.data.is_empty() => {
+                        let value = serde_json::from_str::<Value>(&data)
+                            .map_err(|_| ApiError::InvalidNotice(data.clone()))?;
+                        Some(OriginNotice::FocusChange(value))
+                    }
                     _ => None,
                 };
                 self.event.clear();
@@ -432,6 +442,35 @@ mod tests {
             }
         );
         assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Replaced);
+    }
+
+    #[test]
+    fn focus_change_notice_preserves_the_server_data_object() {
+        let frames = concat!(
+            "event: focus_change\n",
+            "data: {\"clients\":[{\"client_id\":\"abc\",\"screen\":\"chat\",\"reported_at\":17}]}\n\n"
+        );
+        let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
+        assert_eq!(
+            decoder.next_notice().unwrap(),
+            OriginNotice::FocusChange(serde_json::json!({
+                "clients":[{
+                    "client_id":"abc",
+                    "screen":"chat",
+                    "reported_at":17
+                }]
+            }))
+        );
+    }
+
+    #[test]
+    fn malformed_focus_change_data_is_rejected() {
+        let frames = "event: focus_change\ndata: {invalid}\n\n";
+        let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
+        assert!(matches!(
+            decoder.next_notice(),
+            Err(ApiError::InvalidNotice(_))
+        ));
     }
 
     #[test]
