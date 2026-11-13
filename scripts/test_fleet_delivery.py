@@ -68,6 +68,87 @@ def run_remote(home: Path, archive: Path, version: str, digest: str):
 
 
 class FleetDeliveryTests(unittest.TestCase):
+    def attempt_in_home(self, root, *, transfer="success", target_changed=False):
+        home = root / "destination's home"
+        home.mkdir(exist_ok=True)
+        archive = make_archive(root, "0.1.4", "0.1.4").read_bytes()
+        real_run = subprocess.run
+        copies = []
+
+        def local_transport(command, **kwargs):
+            if command[0] == "scp":
+                local = Path(command[-2])
+                destination, path = command[-1].split(":", 1)
+                self.assertEqual(destination, "configured-route")
+                remote = Path(path)
+                self.assertEqual(remote.parent, home / ".local/share/harklight-agent/staging")
+                self.assertTrue(remote.parent.is_dir())
+                copies.append((local, remote))
+                payload = local.read_bytes()
+                remote.write_bytes(payload if transfer == "success" else payload[:10])
+                if transfer == "timeout":
+                    raise subprocess.TimeoutExpired(command, 120)
+                return subprocess.CompletedProcess(command, 0 if transfer == "success" else 1, b"", b"transfer failed")
+            self.assertEqual(command[0], "ssh")
+            # SSH joins command arguments into a remote shell command. Execute
+            # the real scripts in a scratch HOME; no SSH/SFTP connection is made.
+            remote_command = " ".join(command[command.index("configured-route") + 1:])
+            return real_run(["sh", "-c", remote_command], env={**os.environ, "HOME": str(home)}, **kwargs)
+
+        with patch("fleet_delivery.subprocess.run", side_effect=local_transport), patch(
+            "fleet_delivery.fetch_archive", return_value={"bytes": archive, "sha256": hashlib.sha256(archive).hexdigest()}
+        ), patch("fleet_delivery.load_config", return_value={"withdrawn_versions": []}), patch(
+            "fleet_delivery.fetch_releases", return_value=[release("v0.1.5" if target_changed else "v0.1.4")]
+        ):
+            result = attempt_host({"destination": "configured-route", "target": PLATFORM},
+                                  release("v0.1.4"), [], root / "unused-config.json", None)
+        for local, remote in copies:
+            self.assertFalse(local.exists())
+            self.assertFalse(remote.exists())
+        return result, copies
+
+    def test_upload_uses_destination_home_and_installs_verified_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            staging = root / "destination's home/.local/share/harklight-agent/staging"
+            staging.mkdir(parents=True)
+            retained = staging / "unrelated-file"
+            retained.write_bytes(b"keep")
+            result, copies = self.attempt_in_home(root)
+            self.assertEqual(result["outcome"], "updated", result)
+            self.assertEqual(result["version_output"], "harklight-agent 0.1.4")
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(retained.read_bytes(), b"keep")
+            self.assertTrue((root / "destination's home/.local/bin/harklight-agent").is_file())
+
+    def test_staging_creation_failure_does_not_upload_or_activate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            staging = root / "destination's home/.local/share/harklight-agent/staging"
+            staging.parent.mkdir(parents=True)
+            staging.write_bytes(b"existing-file")
+            result, copies = self.attempt_in_home(root)
+            self.assertEqual(result["outcome"], "failed")
+            self.assertEqual(copies, [])
+            self.assertEqual(staging.read_bytes(), b"existing-file")
+            self.assertFalse((root / "destination's home/.local/bin/harklight-agent").exists())
+
+    def test_failed_or_obsolete_transfer_cleans_only_its_staged_archive(self):
+        for transfer, changed, outcome in [("failure", False, "failed"),
+                                            ("timeout", False, "unreachable"),
+                                            ("success", True, "target_changed")]:
+            with self.subTest(transfer=transfer, target_changed=changed), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                staging = root / "destination's home/.local/share/harklight-agent/staging"
+                staging.mkdir(parents=True)
+                retained = staging / "unrelated-file"
+                retained.write_bytes(b"keep")
+                result, copies = self.attempt_in_home(root, transfer=transfer, target_changed=changed)
+                self.assertEqual(result["outcome"], outcome, result)
+                self.assertEqual(len(copies), 1)
+                self.assertEqual(retained.read_bytes(), b"keep")
+                self.assertFalse((root / "destination's home/.local/bin/harklight-agent").exists())
+
     def test_active_host_status_parser_captures_version_path_and_hash(self):
         digest = "a" * 64
         status = parse_host_status(
