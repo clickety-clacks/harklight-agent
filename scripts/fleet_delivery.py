@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -339,10 +340,27 @@ def attempt_host(host: dict, release: dict, withdrawn: list[str],
     except DeliveryError as error:
         return apply_current_status(host_result(host, version, withdrawn, "failed", str(error)), current_status)
     destination = host["destination"]
-    remote_file = f"/tmp/harklight-agent-transfer-{uuid.uuid4().hex}.tar.gz"
+    remote_file = None
     local_file = None
     uploaded = False
     try:
+        # Resolve HOME on the destination, not on the controller or in scp.
+        prepared = subprocess.run(
+            ["ssh", *SSH_OPTIONS, destination, "sh", "-s"],
+            input=b'''set -eu
+umask 077
+staging="$HOME/.local/share/harklight-agent/staging"
+mkdir -p "$staging"
+printf 'FLEETSTAGING1\\0%s\\0' "$staging"
+''',
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+        )
+        if prepared.returncode:
+            return apply_current_status(failure_result(host, version, withdrawn, prepared.returncode, prepared.stderr), current_status)
+        _, marker, staging = prepared.stdout.partition(b"FLEETSTAGING1\0")
+        if not marker or not staging.startswith(b"/") or not staging.endswith(b"\0"):
+            raise DeliveryError("remote staging path readback incomplete")
+        remote_file = f"{os.fsdecode(staging[:-1])}/harklight-agent-transfer-{uuid.uuid4().hex}.tar.gz"
         with tempfile.NamedTemporaryFile(prefix="harklight-agent-", suffix=".tar.gz", delete=False) as stream:
             local_file = Path(stream.name)
             os.chmod(local_file, 0o600)
@@ -366,7 +384,7 @@ def attempt_host(host: dict, release: dict, withdrawn: list[str],
 
         command = [
             "ssh", *SSH_OPTIONS, destination, "sh", "-s", "--", version,
-            host["target"], archive["sha256"], remote_file,
+            host["target"], archive["sha256"], shlex.quote(remote_file),
         ]
         installed = subprocess.run(
             command, input=INSTALLER.read_bytes(), stdout=subprocess.PIPE,
@@ -413,7 +431,7 @@ def attempt_host(host: dict, release: dict, withdrawn: list[str],
 def best_effort_remove(destination: str, remote_file: str) -> None:
     try:
         subprocess.run(
-            ["ssh", *SSH_OPTIONS, destination, "rm", "-f", remote_file],
+            ["ssh", *SSH_OPTIONS, destination, "rm", "-f", shlex.quote(remote_file)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=20,
