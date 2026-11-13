@@ -259,12 +259,17 @@ fn parse_advisory(
         "accepted_at_ms",
         "due_at_ms",
         "evaluated_at_ms",
-        "bounce_after_days",
         "origin_cursor_at_decision",
     ] {
         if raw[field].as_u64().is_none() {
             return Err("an advisory entry had a non-integer field");
         }
+    }
+    if raw["bounce_after_days"]
+        .as_f64()
+        .is_none_or(|days| !days.is_finite() || days < 0.0)
+    {
+        return Err("an advisory entry had an invalid bounce interval");
     }
     if raw["request_revision"].as_u64() == Some(0) {
         return Err("an advisory entry had an invalid request revision");
@@ -385,6 +390,71 @@ mod tests {
                 "delivered":false
             }]
         })
+    }
+
+    #[test]
+    fn fractional_bounce_days_are_accepted_without_relaxing_other_fields() {
+        let session = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let mut raw = advisory_response(session, id)["entries"][0].clone();
+        raw["bounce_after_days"] = json!(1.5);
+
+        let parsed = parse_advisory(&raw, session, 1).unwrap();
+        assert_eq!(parsed.raw["bounce_after_days"].as_f64(), Some(1.5));
+
+        for field in [
+            "advisory_seq",
+            "request_revision",
+            "accepted_at_ms",
+            "due_at_ms",
+            "evaluated_at_ms",
+            "origin_cursor_at_decision",
+        ] {
+            let mut malformed = raw.clone();
+            malformed[field] = json!(1.5);
+            assert!(
+                parse_advisory(&malformed, session, 1).is_err(),
+                "{field} must remain an integer"
+            );
+        }
+
+        for field in [
+            "session_handle",
+            "advisory_id",
+            "sender_id",
+            "message_id",
+            "level_name",
+            "text",
+        ] {
+            let mut malformed = raw.clone();
+            malformed[field] = json!(1.5);
+            assert!(
+                parse_advisory(&malformed, session, 1).is_err(),
+                "{field} must retain its existing string/UUID validation"
+            );
+        }
+
+        for invalid_days in [json!(-0.5), json!(null), json!("1.5")] {
+            let mut malformed = raw.clone();
+            malformed["bounce_after_days"] = invalid_days;
+            assert!(parse_advisory(&malformed, session, 1).is_err());
+        }
+
+        let mut zero_days = raw;
+        zero_days["bounce_after_days"] = json!(0.0);
+        assert!(parse_advisory(&zero_days, session, 1).is_ok());
+
+        let root = Scratch::new();
+        let mut journal = store(&root, session);
+        let mut fractional_cursor = advisory_response(session, id);
+        fractional_cursor["entries"][0]["bounce_after_days"] = json!(1.5);
+        fractional_cursor["cursor"] = json!(1.5);
+        assert!(
+            !fetch_advisories_with(&mut journal, session, |_| Ok(fractional_cursor.clone()))
+                .unwrap()
+        );
+        assert_eq!(journal.advisory_cursor(session).unwrap(), 0);
+        assert_eq!(journal.cursor().unwrap(), 0);
     }
 
     #[test]
@@ -558,7 +628,8 @@ mod tests {
         );
         assert!(!*not_called.borrow());
 
-        let response = advisory_response(session, id);
+        let mut response = advisory_response(session, id);
+        response["entries"][0]["bounce_after_days"] = json!(1.5);
         fetch_advisories_with(&mut journal, session, |_| Ok(response.clone())).unwrap();
         let not_emitted_called = RefCell::new(false);
         assert!(
