@@ -38,6 +38,8 @@ pub use advisory::ack_advisory;
 use advisory::{emit_pending_advisories, fetch_advisories};
 mod reconnect;
 pub use reconnect::{reconnect, reconnect_configuration_error};
+mod progress;
+pub use progress::{ProgressReport, update as progress_update};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageFieldOptions {
@@ -58,6 +60,8 @@ pub struct MessageFieldOptions {
     pub clear_default: bool,
     /// An exact sender-provided UI/1 document accepted only by send.
     pub answer_ui: Option<Value>,
+    /// Makes a send a Progress FYI carrying this first report.
+    pub progress: Option<ProgressReport>,
 }
 
 impl MessageFieldOptions {
@@ -77,6 +81,7 @@ impl MessageFieldOptions {
             || !self.choice_styles.is_empty()
             || self.clear_default
             || self.answer_ui.is_some()
+            || self.progress.is_some()
     }
 
     fn identity(&self) -> Value {
@@ -110,6 +115,9 @@ impl MessageFieldOptions {
         }
         if let Some(answer_ui) = &self.answer_ui {
             identity["answer_ui"] = answer_ui.clone();
+        }
+        if let Some(progress) = &self.progress {
+            identity["progress"] = progress.identity();
         }
         identity
     }
@@ -662,6 +670,15 @@ fn validate_send_options(
 ) -> Result<(Option<MessageType>, NormalizedMessageFields), CommandError> {
     validate_answer_ui_inputs(choices, informational, fields)?;
     let message_type = send_message_type(fields, informational)?;
+    if let Some(report) = &fields.progress {
+        report.validate()?;
+    }
+    if fields.progress.is_some() && message_type != Some(MessageType::Fyi) {
+        return Err(CommandError::new(
+            "a Progress message is an FYI: use --progress with --type fyi or leave --type out",
+            EXIT_REFUSED,
+        ));
+    }
     validate_message_kind(fields)?;
     if fields.answer_ui.is_none() {
         validate_send_controls(message_type, choices, fields)?;
@@ -1928,12 +1945,16 @@ fn build_send_request_with_fields(
 ) -> Result<Value, CommandError> {
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
+    let created_at = now_ms();
     let mut message = json!({
         "sender_id": sender_id,
         "message_id": message_id,
-        "created_at": now_ms(),
+        "created_at": created_at,
         "title": title
     });
+    if let Some(report) = &fields.progress {
+        message["progress"] = progress::initial_progress(report, created_at);
+    }
     if let Some(body) = body {
         message["body"] = Value::String(body.to_owned());
     }
