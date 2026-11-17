@@ -2107,12 +2107,15 @@ mod tests {
         let holder = Connection::open(&store.journal_path).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
         let hold = Duration::from_secs(8);
+        // Start the clock before the holder's countdown so the release can
+        // never happen sooner than `hold` after it, however threads are
+        // scheduled.
+        let started = std::time::Instant::now();
         let release = thread::spawn(move || {
             thread::sleep(hold);
             holder.execute_batch("COMMIT;").unwrap();
         });
 
-        let started = std::time::Instant::now();
         assert!(store.record_entry(entry(session, 1, "held")).unwrap());
         assert!(started.elapsed() >= hold);
         release.join().unwrap();
