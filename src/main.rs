@@ -4,7 +4,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use harklight_agent::{
-    commands::{self, CommandContext, MessageFieldOptions},
+    commands::{self, CommandContext, MessageFieldOptions, ProgressReport},
     enrollment,
 };
 
@@ -131,10 +131,53 @@ enum Command {
             help = "Send this attention-client.ui/1 answer document (requires --type request)"
         )]
         answer_ui_file: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PERCENT",
+            value_parser = clap::value_parser!(u8).range(0..=100),
+            requires = "progress_stage",
+            help = "Send a Progress FYI at this percent (0-100); update it later with `progress`"
+        )]
+        progress: Option<u8>,
+        #[arg(
+            long,
+            value_name = "LABEL",
+            requires = "progress",
+            help = "Current stage label of a Progress message"
+        )]
+        progress_stage: Option<String>,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            requires = "progress",
+            help = "Note for this Progress report"
+        )]
+        progress_note: Option<String>,
         #[arg(long, conflicts_with = "execute")]
         prepare: bool,
         #[arg(long, conflicts_with = "prepare")]
         execute: bool,
+        #[arg(long)]
+        op_id: Option<Uuid>,
+    },
+    #[command(
+        after_help = "Updates a Progress message in place under the same message ID. Give only the new percent, the current stage and an optional note: the CLI builds the bar's segments from the message's current revision. Raising the percent adds width to the stage, the same percent adds a zero-width visit (a stage change or note), and lowering it trims the newest widths first while keeping earlier notes.\n\nFor an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>`; do not run a changed update. If the update is refused as stale, run `harklight-agent read --session <UUID>` to pick up the current revision, then run the update again."
+    )]
+    Progress {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(
+            long,
+            value_name = "MESSAGE_ID",
+            help = "The Progress message to update"
+        )]
+        request: String,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        percent: u8,
+        #[arg(long, value_name = "LABEL")]
+        stage: String,
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -573,10 +616,26 @@ fn main() {
             origin_listener,
             files,
             answer_ui_file,
+            progress,
+            progress_stage,
+            progress_note,
             prepare,
             execute,
             op_id,
         } => {
+            let progress = match (progress, progress_stage) {
+                (Some(percent), Some(stage)) => Some(ProgressReport {
+                    percent,
+                    stage,
+                    note: progress_note,
+                }),
+                _ => None,
+            };
+            let message_type = if progress.is_some() && message_type.is_none() && !informational {
+                Some("fyi".to_string())
+            } else {
+                message_type
+            };
             for warning in send_cli_warnings(
                 message_type.as_deref(),
                 informational,
@@ -617,6 +676,7 @@ fn main() {
                     choice_styles,
                     clear_default: false,
                     answer_ui: None,
+                    progress,
                 },
                 answer_ui_file.as_deref(),
             )
@@ -775,9 +835,28 @@ fn main() {
                     choice_styles,
                     clear_default,
                     answer_ui: None,
+                    progress: None,
                 },
             )
         }
+        Command::Progress {
+            session,
+            request,
+            percent,
+            stage,
+            note,
+            op_id,
+        } => commands::progress_update(
+            &context,
+            session,
+            &request,
+            &ProgressReport {
+                percent,
+                stage,
+                note,
+            },
+            op_id,
+        ),
         Command::Withdraw {
             session,
             request,
@@ -1118,6 +1197,108 @@ mod tests {
                 && by_when == "2026-11-01T17:00:00Z"
                 && path == PathBuf::from("cover.json")
         ));
+    }
+
+    #[test]
+    fn send_accepts_a_first_progress_report() {
+        let cli = Cli::try_parse_from([
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--route",
+            "claude-code",
+            "--title",
+            "Ship the release",
+            "--progress",
+            "10",
+            "--progress-stage",
+            "spec_writing",
+            "--progress-note",
+            "Scope agreed",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Send {
+                progress: Some(10),
+                progress_stage: Some(stage),
+                progress_note: Some(note),
+                ..
+            } if stage == "spec_writing" && note == "Scope agreed"
+        ));
+    }
+
+    #[test]
+    fn progress_inputs_are_limited_to_a_percent_stage_and_note() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["harklight-agent"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all)
+        };
+        let session = Uuid::new_v4().to_string();
+        let cli = parse(&[
+            "progress",
+            "--session",
+            &session,
+            "--request",
+            "progress-1",
+            "--percent",
+            "45",
+            "--stage",
+            "testing",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Progress { percent: 45, stage, note: None, .. } if stage == "testing"
+        ));
+        assert!(
+            parse(&[
+                "progress",
+                "--session",
+                &session,
+                "--request",
+                "progress-1",
+                "--percent",
+                "101",
+                "--stage",
+                "testing",
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "send",
+                "--session",
+                "new",
+                "--sender-id",
+                "app:example",
+                "--title",
+                "T",
+                "--progress",
+                "10",
+            ])
+            .is_err(),
+            "--progress needs --progress-stage"
+        );
+        assert!(
+            parse(&[
+                "send",
+                "--session",
+                "new",
+                "--sender-id",
+                "app:example",
+                "--title",
+                "T",
+                "--progress-stage",
+                "coding",
+            ])
+            .is_err(),
+            "--progress-stage needs --progress"
+        );
     }
 
     #[test]

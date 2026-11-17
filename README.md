@@ -255,6 +255,52 @@ that handle. Codex is recorded as unsupported by this build. `other` is
 recorded as unsupported unless the same `send --session new` command also
 passes `--controller`; see "Other-route listening" below.
 
+### Progress messages
+
+A Progress message is an FYI that shows a progress bar. You update it in place
+under the same message ID. Harklight shows it in its own Progress section, not
+as a new item, and leaves it out of ranking and the badge. Send the first report
+with `--progress` (a whole percent from 0 to 100), `--progress-stage`, and an
+optional `--progress-note`:
+
+```sh
+harklight-agent send --session "$HARKLIGHT_SESSION" --sender-id app:example \
+  --title "Ship the release" \
+  --progress 10 --progress-stage spec_writing --progress-note "Scope agreed"
+```
+
+`--progress` sends an FYI, so it can't be combined with `--type request`,
+choices, or Reply. Keep the returned `message_id`, then report each change with
+`progress`:
+
+```sh
+harklight-agent progress --session "$HARKLIGHT_SESSION" --request "$MESSAGE_ID" \
+  --percent 40 --stage coding --note "Halfway through the parser"
+```
+
+Give only the new percent, the current stage and an optional note. The CLI
+builds the bar from the message's current revision in the local journal, so you
+never keep or resend the history yourself:
+
+- A higher percent adds width to the stage you name.
+- The same percent adds a zero-width visit. Use it for a stage change or a note on its own.
+- A lower percent trims the newest widths first and adds a zero-width visit for
+  the stage you name. Earlier visits and their notes are kept.
+
+Each visit records its time, the percent you reported and the change from the
+previous report. Any label works as a stage. The app gives `spec_writing`,
+`coding` and `review` their own colors and shows other labels in a neutral
+color. Reaching 100% doesn't close the message; retract it when it should go
+away.
+
+An update is an ordinary revise and follows the same rules. For an unknown
+outcome (exit 7), run `harklight-agent retry --op-id <KEY>`. It resubmits the
+exact same update, and no new update is accepted until it settles. If the
+Server refuses the update as stale because the message changed elsewhere, nothing is
+applied. Run `harklight-agent read --session <UUID>` to pick up the current
+revision, then run the update again. Only a message sent with `--progress` can
+be updated this way.
+
 ### Prepare a send before executing it
 
 A calling runtime can persist its own authenticated sender record and the exact
