@@ -5,3 +5,5 @@ pub mod connect;
 pub mod enrollment;
 pub mod files;
 pub mod journal;
+#[cfg(test)]
+mod test_tls;

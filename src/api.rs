@@ -1,4 +1,3 @@
-use std::time::Duration;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -107,7 +106,6 @@ impl OriginClient {
             self.client
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .timeout(Duration::from_secs(30))
                 .json(command),
         )?;
         parse_post_response(response, &self.identity.address)
@@ -406,7 +404,31 @@ impl<R: BufRead> SseDecoder<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Cursor;
+    use std::time::Duration;
+
+    #[test]
+    fn origin_request_waits_for_a_server_answer_slower_than_the_old_limit() {
+        let delay = Duration::from_secs(35);
+        let server = crate::test_tls::SlowServer::answer_after(
+            delay,
+            r#"{"v":1,"type":"ok","op_id":"slow"}"#,
+        );
+        let identity = EnrolledIdentity::for_test(
+            "127.0.0.1",
+            crate::test_tls::TLS_NAME,
+            server.port,
+            server.ca_pem.as_bytes(),
+        );
+        let client = OriginClient::new(identity, Some(server.port)).unwrap();
+
+        let started = std::time::Instant::now();
+        let answer = client.post(&json!({"v":1,"type":"ack"})).unwrap();
+        assert!(started.elapsed() >= delay);
+        assert_eq!(answer["op_id"], "slow");
+        assert!(server.request_line().starts_with("POST /origin/v1 "));
+    }
 
     #[test]
     fn advisory_stream_opt_in_preserves_session_and_reconnect_parameters() {
