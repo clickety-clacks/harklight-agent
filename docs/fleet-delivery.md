@@ -1,7 +1,9 @@
 # Automatic release delivery
 
-The fleet workflow runs when a release is published and on a ten-minute retry
-schedule. It selects the newest published stable release that is not withdrawn,
+The release workflow starts the fleet workflow after it publishes a stable
+release. A release published with the workflow token does not trigger other
+workflows by itself, so this is an explicit dispatch. The fleet workflow also
+runs on a ten-minute retry schedule, which GitHub may run less often. It selects the newest published stable release that is not withdrawn,
 verifies the platform archive against that release's SHA256SUMS, and reconciles
 each configured destination independently. Prereleases and drafts are ignored.
 The scheduled run also applies changes to the private withdrawn-version list and
