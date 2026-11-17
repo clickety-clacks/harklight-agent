@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -30,7 +30,6 @@ const EXIT_REFUSED: i32 = 2;
 const EXIT_UNSUPPORTED: i32 = 5;
 const EXIT_UNKNOWN: i32 = 7;
 const PENDING_LIFETIME_MS: u64 = 86_400_000;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub struct EnrollmentError {
@@ -165,7 +164,8 @@ impl HttpsTransport {
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
             .https_only(true)
-            .timeout(REQUEST_TIMEOUT)
+            // Wait for the Server's answer or a real connection failure.
+            .timeout(None)
             .build()
             .map_err(|error| EnrollmentError::local(format!("could not configure TLS: {error}")))?;
         Ok(Self { client, endpoint })
@@ -980,6 +980,7 @@ mod tests {
         collections::VecDeque,
         fs,
         path::{Path, PathBuf},
+        time::Duration,
     };
 
     #[cfg(unix)]
@@ -988,9 +989,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EnrollmentError, EnrollmentTransport, HttpResponse, PendingFile, RequestFailure,
-        StatusOutcome, archive_pending, generate_identity, parse_endpoint, print_pending_for_test,
-        query_status, start, submit_existing, write_json_private,
+        Endpoint, EnrollmentError, EnrollmentTransport, HttpResponse, HttpsTransport, PendingFile,
+        RequestFailure, StatusOutcome, archive_pending, generate_identity, parse_endpoint,
+        print_pending_for_test, query_status, start, submit_existing, write_json_private,
     };
 
     struct TestDirectory(PathBuf);
@@ -1014,6 +1015,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn enrollment_request_waits_for_a_server_answer_slower_than_the_old_limits() {
+        let delay = Duration::from_secs(35);
+        let server = crate::test_tls::SlowServer::answer_after(delay, r#"{"v":1}"#);
+        let transport = HttpsTransport::new(
+            Endpoint {
+                address: "127.0.0.1".into(),
+                tls_name: crate::test_tls::TLS_NAME.into(),
+                port: server.port,
+            },
+            server.ca_pem.as_bytes(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let response = transport
+            .post("/enroll/v1/request", &serde_json::json!({"v":1}))
+            .unwrap();
+        assert!(started.elapsed() >= delay);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#"{"v":1}"#);
+        assert!(
+            server
+                .request_line()
+                .starts_with("POST /enroll/v1/request ")
+        );
     }
 
     #[derive(Default)]

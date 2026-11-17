@@ -507,7 +507,11 @@ impl JournalStore {
         set_private_file(&file)?;
         drop(file);
         let connection = Connection::open(&self.journal_path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        // Every Agent process opens the journal only while holding its
+        // exclusive lock file, so SQLite reports busy only while some other
+        // program holds the database. Wait for that holder to finish instead
+        // of failing a journal step that may record a Server answer.
+        connection.busy_handler(Some(wait_for_other_database_holder))?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }
@@ -1997,6 +2001,15 @@ fn merge_server_facts_into_new(entry: &mut JournalEntry) {
     }
 }
 
+/// Pacing between checks while another program holds the journal database.
+/// This is not a limit: the wait continues until the holder releases it.
+const OTHER_HOLDER_RECHECK: Duration = Duration::from_millis(10);
+
+fn wait_for_other_database_holder(_attempts: i32) -> bool {
+    thread::sleep(OTHER_HOLDER_RECHECK);
+    true
+}
+
 fn open_lock_file(path: &Path) -> Result<File, std::io::Error> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -2081,6 +2094,29 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn journal_waits_for_another_program_holding_the_database_past_the_old_limit() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+
+        // Another program (for example an inspecting sqlite3 shell) holds the
+        // database longer than the journal used to tolerate.
+        let holder = Connection::open(&store.journal_path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let hold = Duration::from_secs(8);
+        let release = thread::spawn(move || {
+            thread::sleep(hold);
+            holder.execute_batch("COMMIT;").unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        assert!(store.record_entry(entry(session, 1, "held")).unwrap());
+        assert!(started.elapsed() >= hold);
+        release.join().unwrap();
+        assert!(store.entry_by_event("1").unwrap().is_some());
     }
 
     fn entry(session: Uuid, seq: u64, body: &str) -> JournalEntry {

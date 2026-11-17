@@ -23,6 +23,9 @@ thiserror = "2.0"
 time = "=0.3.47"
 uuid = { version = "1.28.0", features = ["v4", "serde"] }
 
+[dev-dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
+
 [profile.release]
 lto = true
 strip = true

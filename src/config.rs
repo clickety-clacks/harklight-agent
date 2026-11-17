@@ -115,6 +115,29 @@ impl EnrolledIdentity {
         })
     }
 
+    /// An enrolled identity for tests that talk to a local TLS server.
+    #[cfg(test)]
+    pub(crate) fn for_test(address: &str, name: &str, port: u16, ca_pem: &[u8]) -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["device".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        Self {
+            directory: PathBuf::new(),
+            address: address.into(),
+            name: name.into(),
+            port,
+            origin_port: Some(port),
+            person_id: None,
+            device_id: "device".into(),
+            ca_file: PathBuf::new(),
+            certificate_pem: certificate.pem().into_bytes(),
+            key_pem: key.serialize_pem().into_bytes(),
+            ca_pem: ca_pem.to_vec(),
+        }
+    }
+
     pub fn resolve_origin_port(&self, override_port: Option<u16>) -> Result<u16, ConfigError> {
         let port = override_port.or(self.origin_port).ok_or_else(|| {
             ConfigError::Invalid(
@@ -151,6 +174,10 @@ impl EnrolledIdentity {
             .tls_version_min(reqwest::tls::Version::TLS_1_3)
             .tls_version_max(reqwest::tls::Version::TLS_1_3)
             .https_only(true)
+            // Wait for the Server's answer or a real connection failure. The
+            // blocking client otherwise abandons a working request after its
+            // built-in default deadline.
+            .timeout(None)
             .build()?)
     }
 
