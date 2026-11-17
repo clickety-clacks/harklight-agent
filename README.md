@@ -184,6 +184,14 @@ harklight-agent send --session new --sender-id app:example \
 The server reports an odd or already closed target in `supersedes_warnings`;
 valid targets and the new message still post.
 
+For people using Jev, send results may also carry `possible_contradictions`.
+This advisory object passes through unchanged on plain `send`, `send --execute`,
+`retry`, and committed send records. It never means the message was not delivered.
+When matches are listed, talk to their senders to reconcile the competing asks.
+An `incomplete` status reports comparisons that could not finish, with `reason`
+(`unavailable` or `timeout`) and an `unchecked` count; any matches that did finish
+remain listed. A complete check with no matches adds no field.
+
 Messages can be untyped for compatibility, FYI, or requests. An untyped send
 continues to build its existing controls and prints a warning naming
 `--type request` and `--type fyi`; a later server stage may refuse untyped

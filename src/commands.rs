@@ -2385,6 +2385,9 @@ fn send_result(sender_id: &str, message_id: &str, session: Uuid, response: &Valu
     if let Some(warnings) = response.get("field_warnings") {
         result["field_warnings"] = warnings.clone();
     }
+    if let Some(check) = response.get("possible_contradictions") {
+        result["possible_contradictions"] = check.clone();
+    }
     result
 }
 
@@ -5855,6 +5858,10 @@ fn delivered_event<'a>(
 }
 
 fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), CommandError> {
+    emit(&committed_result(kind, op_id, response))
+}
+
+fn committed_result(kind: &str, op_id: Uuid, response: Value) -> Value {
     let mut output = json!({"kind":"committed","operation":kind,"op_id":op_id,"response":response});
     if matches!(kind, "send" | "revise") {
         if let Some(warnings) = output["response"].get("field_warnings").cloned() {
@@ -5866,7 +5873,12 @@ fn emit_committed(kind: &str, op_id: Uuid, response: Value) -> Result<(), Comman
             output["supersedes_warnings"] = warnings;
         }
     }
-    emit(&output)
+    if kind == "send" {
+        if let Some(check) = output["response"].get("possible_contradictions").cloned() {
+            output["possible_contradictions"] = check;
+        }
+    }
+    output
 }
 
 fn retry_committed_result(
@@ -5888,6 +5900,9 @@ fn retry_committed_result(
         output["event_id"] = Value::String(event_id.to_owned());
     }
     if operation_kind == "send" {
+        if let Some(check) = output["response"].get("possible_contradictions").cloned() {
+            output["possible_contradictions"] = check;
+        }
         let sender_id = request["message"]["sender_id"]
             .as_str()
             .ok_or_else(|| CommandError::new("saved send operation has no sender ID", 1))?;
@@ -7833,6 +7848,49 @@ mod tests {
             &json!({"revision":1,"field_warnings":warnings}),
         );
         assert_eq!(result["field_warnings"], warnings);
+    }
+
+    #[test]
+    fn contradiction_advisory_survives_every_send_output() {
+        let checks = [
+            json!({"status":"checked", "warning":"these possibly contradictory messages are still active, please talk to its poster to reconcile them", "messages":[{"sender_id":"app:other","sender_name":"Other","message_id":"old","title":"Ship Friday"}]}),
+            json!({"status":"incomplete","reason":"unavailable","unchecked":2}),
+            json!({"status":"incomplete","reason":"timeout","unchecked":1,"warning":"warning","messages":[]}),
+        ];
+        let session = Uuid::new_v4();
+        for check in checks {
+            let response = json!({"revision":1,"possible_contradictions":check});
+            assert_eq!(
+                send_result("app:example", "new", session, &response)["possible_contradictions"],
+                check
+            );
+            assert_eq!(
+                committed_result("send", session, response.clone())["possible_contradictions"],
+                check
+            );
+            let request = json!({"message":{"sender_id":"app:example","message_id":"new"}});
+            let retried =
+                retry_committed_result("retry", session, "send", &request, response).unwrap();
+            assert_eq!(retried["possible_contradictions"], check);
+        }
+        let response = json!({"revision":1});
+        assert!(
+            send_result("app:example", "new", session, &response)
+                .get("possible_contradictions")
+                .is_none()
+        );
+        assert!(
+            committed_result("send", session, response.clone())
+                .get("possible_contradictions")
+                .is_none()
+        );
+        let request = json!({"message":{"sender_id":"app:example","message_id":"new"}});
+        assert!(
+            retry_committed_result("retry", session, "send", &request, response)
+                .unwrap()
+                .get("possible_contradictions")
+                .is_none()
+        );
     }
 
     #[test]
