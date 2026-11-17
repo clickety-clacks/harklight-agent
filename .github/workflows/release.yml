@@ -218,6 +218,21 @@ jobs:
             dist/harklight-agent-*.tar.gz
             dist/SHA256SUMS
 
+  fleet-delivery:
+    # A release published with the workflow token does not trigger other
+    # workflows, so start fleet delivery explicitly once a stable release is
+    # published. The fleet workflow's schedule remains the retry backstop.
+    if: needs.validate.outputs.publish == 'true' && !contains(needs.validate.outputs.version, '-')
+    needs: [validate, release]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Start fleet delivery
+        run: gh workflow run fleet-delivery.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.event.repository.default_branch }}"
+
   tap-pull-request:
     if: needs.validate.outputs.publish == 'true'
     needs: [validate, release]
