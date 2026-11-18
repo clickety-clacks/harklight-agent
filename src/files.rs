@@ -82,6 +82,114 @@ pub struct PreparedFiles {
     pub manifest: Vec<FileManifestEntry>,
 }
 
+/// Identity of the files on one retained revision. Inline bytes, when present,
+/// must agree with the server's normalized metadata.
+pub(crate) fn retained_manifest(entries: &[Value]) -> Result<Vec<FileManifestEntry>, String> {
+    entries
+        .iter()
+        .map(|file| {
+            let name = file["name"].as_str().ok_or("retained file has no name")?;
+            let (size_bytes, sha256) = if let Some(data) = file.get("data_base64") {
+                let bytes = STANDARD
+                    .decode(data.as_str().ok_or("invalid retained inline bytes")?)
+                    .map_err(|_| "invalid retained inline bytes")?;
+                let size = bytes.len() as u64;
+                let hash = hex::encode(Sha256::digest(&bytes));
+                if file.get("size").is_some_and(|v| v.as_u64() != Some(size))
+                    || file
+                        .get("sha256")
+                        .is_some_and(|v| v.as_str() != Some(hash.as_str()))
+                {
+                    return Err("retained inline fingerprint mismatch".into());
+                }
+                (size, hash)
+            } else {
+                (
+                    file["size"].as_u64().ok_or("retained file has no size")?,
+                    file["sha256"]
+                        .as_str()
+                        .ok_or("retained file has no fingerprint")?
+                        .to_owned(),
+                )
+            };
+            Ok(FileManifestEntry {
+                name: name.to_owned(),
+                size_bytes,
+                sha256,
+            })
+        })
+        .collect()
+}
+
+/// Copy captured upload bytes to the successor operation; never reuse its old
+/// upload identity or reopen the caller's original, mutable input path.
+pub(crate) fn prepare_retained(
+    entries: &[Value],
+    sources: &[UploadSource],
+    limits: &ServerFileLimits,
+    directory: &Path,
+) -> Result<PreparedFiles, String> {
+    let manifest = retained_manifest(entries)?;
+    let mut result = PreparedFiles {
+        entries: vec![],
+        uploads: vec![],
+        manifest: manifest.clone(),
+    };
+    let mut inline_total = 0u64;
+    let prepared = (|| {
+        for (index, (file, identity)) in entries.iter().zip(&manifest).enumerate() {
+            if let Some(data) = file.get("data_base64") {
+                inline_total = inline_total
+                    .checked_add(identity.size_bytes)
+                    .ok_or("inline size overflow")?;
+                if inline_total > limits.inline_decoded_bytes_per_entry {
+                    return Err("retained inline files exceed the current inline allowance".into());
+                }
+                result
+                    .entries
+                    .push(json!({"name":identity.name,"data_base64":data}));
+            } else {
+                let source = sources
+                    .iter()
+                    .find(|source| {
+                        source.name == identity.name
+                            && source.size_bytes == identity.size_bytes
+                            && source.sha256 == identity.sha256
+                    })
+                    .ok_or("current revision file bytes are unavailable")?;
+                let path = source
+                    .staged_path
+                    .as_ref()
+                    .ok_or("current revision staged bytes are unavailable")?;
+                let selected = FileSelection {
+                    name: identity.name.clone(),
+                    path: path.clone(),
+                    size_bytes: identity.size_bytes,
+                };
+                let staged = stage_upload(
+                    &selected,
+                    &directory.join(format!("{index}.upload")),
+                    limits.upload_cap_bytes_per_file,
+                )?;
+                if staged.size_bytes != identity.size_bytes || staged.sha256 != identity.sha256 {
+                    cleanup_staged_uploads(&[staged]);
+                    return Err(
+                        "current revision staged bytes do not match their fingerprint".into(),
+                    );
+                }
+                result.entries.push(json!({"name":staged.name,"upload_pending":true,"size":staged.size_bytes,"sha256":staged.sha256}));
+                result.uploads.push(staged);
+            }
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = prepared {
+        cleanup_staged_uploads(&result.uploads);
+        return Err(error);
+    }
+    Ok(result)
+}
+
 struct DownloadedBody {
     reader: Box<dyn Read>,
     sha256: Option<String>,

@@ -4962,6 +4962,7 @@ fn submit_operation_with_transport(
         ));
     }
     let op_id = operation.op_id;
+    let retain_progress = crate::journal::is_progress(&operation.request["message"]);
     let staged_paths: Vec<PathBuf> = operation
         .uploads
         .iter()
@@ -4981,7 +4982,7 @@ fn submit_operation_with_transport(
                 OperationState::Committed | OperationState::Rejected
             )
         });
-    if settled {
+    if settled && !retain_progress {
         for path in staged_paths {
             let _ = std::fs::remove_file(path);
         }
@@ -5490,7 +5491,12 @@ fn fetch_feed_with(
             let directory = store.event_file_directory(session_handle, event_id);
             materialize(&mut raw, &directory)?
         } else {
-            files::strip_file_payloads(&mut raw);
+            if !(kind == "revision"
+                && author == "origin"
+                && crate::journal::is_progress(&raw["message"]))
+            {
+                files::strip_file_payloads(&mut raw);
+            }
             BTreeMap::new()
         };
         let mut entry = JournalEntry::fetched(
@@ -5707,6 +5713,7 @@ struct RequestContext {
     message_id: String,
     message: Value,
     revision: u64,
+    files: Value,
 }
 
 fn request_context(
@@ -5714,7 +5721,7 @@ fn request_context(
     session: Uuid,
     message_id: &str,
 ) -> Result<RequestContext, CommandError> {
-    let mut best: Option<(u64, Value)> = None;
+    let mut best: Option<(u64, Value, Value)> = None;
     for entry in journal.entries.values().rev().filter(|entry| {
         entry.session_handle == session
             && entry.kind == "revision"
@@ -5722,7 +5729,11 @@ fn request_context(
     }) {
         if let (Some(revision), Some(message)) = (entry.request_revision, entry.raw.get("message"))
         {
-            best = Some((revision, message.clone()));
+            best = Some((
+                revision,
+                message.clone(),
+                entry.raw.get("files").cloned().unwrap_or_else(|| json!([])),
+            ));
             break;
         }
     }
@@ -5763,11 +5774,19 @@ fn request_context(
                     .map(|revision| revision + 1)
                     .unwrap_or(1)
             });
-        if best.as_ref().is_none_or(|(prior, _)| revision > *prior) {
-            best = Some((revision, operation.request["message"].clone()));
+        if best.as_ref().is_none_or(|(prior, _, _)| revision > *prior) {
+            best = Some((
+                revision,
+                operation.request["message"].clone(),
+                operation
+                    .request
+                    .get("files")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            ));
         }
     }
-    let (revision, message) = best.ok_or_else(|| {
+    let (revision, message, files) = best.ok_or_else(|| {
         CommandError::new(
             format!("request {message_id} is not in session {session}'s journal"),
             1,
@@ -5782,6 +5801,7 @@ fn request_context(
         message_id: message_id.to_owned(),
         message,
         revision,
+        files,
     })
 }
 
