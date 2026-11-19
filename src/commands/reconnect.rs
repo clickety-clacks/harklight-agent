@@ -405,6 +405,14 @@ fn attach_locked(
             EXIT_REFUSED,
         ));
     }
+    if controller && route != OriginHarness::Other {
+        return Err(Failure::local(
+            "attachment",
+            "invalid_attachment",
+            "--controller applies only to --route other.",
+            EXIT_REFUSED,
+        ));
+    }
     let vendor = (vendor != "none").then_some(vendor);
     let mut support = attachment_support_request(Uuid::new_v4(), session, route, controller, ack2);
     if origin_listener {
