@@ -406,8 +406,7 @@ fn attach_locked(
         ));
     }
     let vendor = (vendor != "none").then_some(vendor);
-    let mut support =
-        attachment_support_request_with_ack2(Uuid::new_v4(), session, route, controller, ack2);
+    let mut support = attachment_support_request(Uuid::new_v4(), session, route, controller, ack2);
     if origin_listener {
         support["origin_listener"] = Value::Bool(true);
     }

@@ -153,8 +153,7 @@ submission after a restart.
 The journal uses indexed SQLite records. A normal request action reads the
 current revision, terminal state, exact referenced event and any unresolved
 operation without loading the request's earlier turns; it also avoids rewriting
-unrelated history. A prior `origin-feed.json` journal is migrated on first open;
-the original file is left unchanged. Feed and operation history has no retention
+unrelated history. Feed and operation history has no retention
 limit, so keep the state directory on a volume with room for the conversation
 history you retain.
 
@@ -192,12 +191,11 @@ An `incomplete` status reports comparisons that could not finish, with `reason`
 (`unavailable` or `timeout`) and an `unchecked` count; any matches that did finish
 remain listed. A complete check with no matches adds no field.
 
-Messages can be untyped for compatibility, FYI, or requests. An untyped send
-continues to build its existing controls and prints a warning naming
-`--type request` and `--type fyi`; a later server stage may refuse untyped
-sends. `--type fyi` sends only the Seen action. A request needs at least one
-`--choice` or `--reply`. Each
-`--choice` adds one value action, and `--reply` adds a free-text Reply action:
+Every send needs `--type fyi` or `--type request`; a send without one is refused
+before any network call (a `--progress` send is always an FYI, so it may leave
+`--type` out). `--type fyi` sends only the Seen action. A request needs at least
+one `--choice` or `--reply`. Each `--choice` adds one value action, and `--reply`
+adds a free-text Reply action:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
@@ -205,25 +203,16 @@ harklight-agent send --session new --sender-id app:example \
   --choice "Approve" --choice "Hold" --reply
 ```
 
-Use `--informational` as a compatibility spelling for `--type fyi`. FYIs
-cannot include choices, Reply, defaults, or choice styles. `--kind` may label a
+FYIs cannot include choices, Reply, defaults, or choice styles. `--kind` may label a
 message as `blocker` or `success`. `--importance` sets the sender's view
 (`low`, `normal`, `high`, or `now`); Harklight's ranking decides the priority
-the recipient sees. The old `--urgency` spelling remains accepted temporarily
-and prints a warning to use `--importance`. Invalid importance or `--by-when`
+the recipient sees. Invalid importance or `--by-when`
 values are refused with a correction; `--by-when` takes an RFC 3339 timestamp.
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
   --route claude-code --type fyi --kind success --importance normal \
   --title "Update complete"
-```
-
-`--informational` sends the same FYI message as `--type fyi`:
-
-```sh
-harklight-agent send --session new --sender-id app:example \
-  --route claude-code --title "Update complete" --informational
 ```
 
 For a sender-designed picture choice, put an `attention-client.ui/1` document in
@@ -512,7 +501,7 @@ harklight-agent listen --follow --controller --ack2 \
 ```
 
 The `--ack2` flag adds `ack2:true` to that command's journaled support
-operation. Omitting it keeps the legacy capability declaration. The receiving
+operation. Omitting it declares no ACK2 capability. The receiving
 system may submit its processing outcome explicitly:
 
 ```sh

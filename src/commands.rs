@@ -48,8 +48,6 @@ pub struct MessageFieldOptions {
     pub message_kind: Option<String>,
     pub reply: bool,
     pub importance: Option<String>,
-    /// Deprecated CLI alias retained as a distinct input for its warning and migration behavior.
-    pub urgency: Option<String>,
     pub by_when: Option<String>,
     pub stake: Option<String>,
     pub thread: Option<String>,
@@ -71,7 +69,6 @@ impl MessageFieldOptions {
             || self.message_kind.is_some()
             || self.reply
             || self.importance.is_some()
-            || self.urgency.is_some()
             || self.by_when.is_some()
             || self.stake.is_some()
             || self.thread.is_some()
@@ -86,7 +83,6 @@ impl MessageFieldOptions {
 
     fn identity(&self) -> Value {
         let mut identity = json!({
-            "urgency":self.urgency,
             "by_when":self.by_when,
             "stake":self.stake,
             "thread":self.thread,
@@ -348,12 +344,7 @@ fn normalize_message_fields(
 ) -> NormalizedMessageFields {
     let mut normalized = NormalizedMessageFields::default();
 
-    if options.importance.is_some() && options.urgency.is_some() {
-        normalized
-            .errors
-            .push("use only one of --importance or its deprecated alias --urgency".into());
-    }
-    if let Some(importance) = options.importance.as_deref().or(options.urgency.as_deref()) {
+    if let Some(importance) = options.importance.as_deref() {
         if matches!(importance, "low" | "normal" | "high" | "now") {
             normalized
                 .members
@@ -500,22 +491,14 @@ fn parse_message_type(value: &str) -> Result<MessageType, CommandError> {
     }
 }
 
-fn send_message_type(
-    fields: &MessageFieldOptions,
-    informational: bool,
-) -> Result<Option<MessageType>, CommandError> {
-    let message_type = fields
-        .message_type
-        .as_deref()
-        .map(parse_message_type)
-        .transpose()?;
-    if informational && message_type == Some(MessageType::Request) {
-        return Err(CommandError::new(
-            "--informational means --type fyi: remove --informational to send a request, or use --type fyi",
+fn send_message_type(fields: &MessageFieldOptions) -> Result<MessageType, CommandError> {
+    match fields.message_type.as_deref() {
+        Some(message_type) => parse_message_type(message_type),
+        None => Err(CommandError::new(
+            "send requires --type fyi or --type request",
             EXIT_REFUSED,
-        ));
+        )),
     }
-    Ok(message_type.or_else(|| informational.then_some(MessageType::Fyi)))
 }
 
 fn revise_message_type(
@@ -664,12 +647,11 @@ fn first_field_error(normalized: &NormalizedMessageFields) -> Result<(), Command
 
 fn validate_send_options(
     choices: &[String],
-    informational: bool,
     fields: &MessageFieldOptions,
     include_thread: bool,
 ) -> Result<(Option<MessageType>, NormalizedMessageFields), CommandError> {
-    validate_answer_ui_inputs(choices, informational, fields)?;
-    let message_type = send_message_type(fields, informational)?;
+    validate_answer_ui_inputs(choices, fields)?;
+    let message_type = Some(send_message_type(fields)?);
     if let Some(report) = &fields.progress {
         report.validate()?;
     }
@@ -693,7 +675,6 @@ fn validate_send_options(
 
 fn validate_answer_ui_inputs(
     choices: &[String],
-    informational: bool,
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
     let Some(answer_ui) = fields.answer_ui.as_ref() else {
@@ -709,23 +690,9 @@ fn validate_answer_ui_inputs(
         ));
     }
 
-    let mut type_fixes = Vec::new();
-    if informational {
-        if fields.message_type.as_deref() == Some("request") {
-            type_fixes.push("remove --informational".to_owned());
-        } else {
-            type_fixes.push("remove --informational and add --type request".to_owned());
-        }
-    }
     if fields.message_type.as_deref() == Some("fyi") {
-        type_fixes.push("replace --type fyi with --type request".to_owned());
-    }
-    if !type_fixes.is_empty() {
         return Err(CommandError::new(
-            format!(
-                "--answer-ui requires --type request: {}, or drop --answer-ui and use --type fyi",
-                type_fixes.join("; ")
-            ),
+            "--answer-ui requires --type request: replace --type fyi with --type request, or drop --answer-ui and use --type fyi",
             EXIT_REFUSED,
         ));
     }
@@ -1509,7 +1476,7 @@ fn revised_message_with_fields(
 
 fn options_field<'a>(options: &'a MessageFieldOptions, field: &str) -> Option<&'a str> {
     match field {
-        "urgency" => options.importance.as_deref().or(options.urgency.as_deref()),
+        "urgency" => options.importance.as_deref(),
         "by_when" => options.by_when.as_deref(),
         "stake" => options.stake.as_deref(),
         _ => None,
@@ -1532,7 +1499,6 @@ pub fn send_command(
     title: Option<&str>,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -1549,7 +1515,6 @@ pub fn send_command(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -1569,7 +1534,6 @@ pub fn send_command_with_fields(
     title: Option<&str>,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -1594,7 +1558,6 @@ pub fn send_command_with_fields(
             || title.is_some()
             || body.is_some()
             || !choices.is_empty()
-            || informational
             || !supersedes.is_empty()
             || vendor_session_id.is_some()
             || route.is_some()
@@ -1630,7 +1593,6 @@ pub fn send_command_with_fields(
             title,
             body,
             choices,
-            informational,
             supersedes,
             vendor_session_id,
             route,
@@ -1647,7 +1609,6 @@ pub fn send_command_with_fields(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -1664,7 +1625,6 @@ pub fn send_command_with_answer_ui_file(
     title: Option<&str>,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -1689,7 +1649,6 @@ pub fn send_command_with_answer_ui_file(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -1709,7 +1668,6 @@ pub fn send(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -1723,7 +1681,6 @@ pub fn send(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -1740,7 +1697,6 @@ pub fn send_with_fields(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -1749,7 +1705,7 @@ pub fn send_with_fields(
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
     let route = validate_send_route(session_arg, route)?;
-    let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
+    let (message_type, normalized) = validate_send_options(choices, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let mut file_draft = json!({
@@ -1758,7 +1714,6 @@ pub fn send_with_fields(
         "title":title,
         "body":body,
         "choices":choices,
-        "informational":informational,
         "vendor_session_id":vendor_session_id,
         "route":route.map(OriginHarness::as_str)
     });
@@ -1785,7 +1740,6 @@ pub fn send_with_fields(
             title,
             body,
             choices,
-            informational,
             vendor_session_id,
             route,
             controller,
@@ -1850,7 +1804,6 @@ fn build_send_request(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
@@ -1864,12 +1817,15 @@ fn build_send_request(
         title,
         body,
         choices,
-        informational,
         vendor_session_id,
         route,
         controller,
         file_entries,
-        &MessageFieldOptions::default(),
+        &MessageFieldOptions {
+            message_type: Some("request".into()),
+            reply: true,
+            ..MessageFieldOptions::default()
+        },
     )
 }
 
@@ -1881,14 +1837,13 @@ fn build_send_request_with_fields(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
     controller: bool,
     file_entries: &[Value],
     fields: &MessageFieldOptions,
 ) -> Result<Value, CommandError> {
-    let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
+    let (message_type, normalized) = validate_send_options(choices, fields, true)?;
     let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let created_at = now_ms();
     let mut message = json!({
@@ -1955,7 +1910,6 @@ fn send_input_identity(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -1968,7 +1922,6 @@ fn send_input_identity(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -1984,7 +1937,6 @@ fn send_input_identity_with_fields(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -2003,11 +1955,6 @@ fn send_input_identity_with_fields(
         "controller":controller,
         "files":files
     });
-    // Preserve idempotent retries for default-mode operations prepared by an
-    // earlier CLI, while distinguishing an explicitly Seen-only operation.
-    if informational {
-        inputs["informational"] = Value::Bool(true);
-    }
     if !supersedes.is_empty() {
         inputs["supersedes"] = json!(supersedes);
     }
@@ -2022,7 +1969,6 @@ pub fn prepare_send(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -2037,7 +1983,6 @@ pub fn prepare_send(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -2055,7 +2000,6 @@ pub fn prepare_send_with_fields(
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -2064,7 +2008,7 @@ pub fn prepare_send_with_fields(
     op_id: Uuid,
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
-    let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
+    let (message_type, normalized) = validate_send_options(choices, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
     let route = validate_send_route(session_arg, route)?;
@@ -2085,7 +2029,6 @@ pub fn prepare_send_with_fields(
             title,
             body,
             choices,
-            informational,
             supersedes,
             vendor_session_id,
             route,
@@ -2114,7 +2057,6 @@ pub fn prepare_send_with_fields(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -2131,7 +2073,6 @@ pub fn prepare_send_with_fields(
         title,
         body,
         choices,
-        informational,
         vendor_session_id,
         route,
         controller,
@@ -2150,7 +2091,6 @@ pub fn prepare_send_with_fields(
         title,
         body,
         choices,
-        informational,
         supersedes,
         vendor_session_id,
         route,
@@ -2178,39 +2118,12 @@ pub fn prepare_send_with_fields(
     emit_prepared_or_saved_result(&operation, op_id)
 }
 
-#[cfg(test)]
-fn send_draft(
-    session_arg: &str,
-    sender_id: &str,
-    title: &str,
-    body: Option<&str>,
-    choices: &[String],
-    informational: bool,
-    supersedes: &[String],
-    vendor_session_id: Option<&str>,
-    route: Option<OriginHarness>,
-) -> Value {
-    send_draft_with_fields(
-        session_arg,
-        sender_id,
-        title,
-        body,
-        choices,
-        informational,
-        supersedes,
-        vendor_session_id,
-        route,
-        &MessageFieldOptions::default(),
-    )
-}
-
 fn send_draft_with_fields(
     session_arg: &str,
     sender_id: &str,
     title: &str,
     body: Option<&str>,
     choices: &[String],
-    informational: bool,
     supersedes: &[String],
     vendor_session_id: Option<&str>,
     route: Option<OriginHarness>,
@@ -2222,7 +2135,6 @@ fn send_draft_with_fields(
         "title":title,
         "body":body,
         "choices":choices,
-        "informational":informational,
         "vendor_session_id":vendor_session_id,
         "route":route.map(OriginHarness::as_str)
     });
@@ -2374,15 +2286,6 @@ fn attachment_update_request(op_id: Uuid, session: Uuid, vendor_session_id: Opti
 }
 
 fn attachment_support_request(
-    op_id: Uuid,
-    session: Uuid,
-    route: OriginHarness,
-    controller: bool,
-) -> Value {
-    attachment_support_request_with_ack2(op_id, session, route, controller, false)
-}
-
-fn attachment_support_request_with_ack2(
     op_id: Uuid,
     session: Uuid,
     route: OriginHarness,
@@ -2824,7 +2727,7 @@ pub fn attach_with_origin(
     }
 
     let mut support_request =
-        attachment_support_request_with_ack2(Uuid::new_v4(), session, route, controller, ack2);
+        attachment_support_request(Uuid::new_v4(), session, route, controller, ack2);
     if origin_listener {
         support_request["origin_listener"] = Value::Bool(true);
     }
@@ -6275,14 +6178,14 @@ mod tests {
             answer_ui: Some(document.clone()),
             ..MessageFieldOptions::default()
         };
-        assert!(validate_send_options(&[], false, &request_fields, true).is_ok());
+        assert!(validate_send_options(&[], &request_fields, true).is_ok());
 
         let missing_type = MessageFieldOptions {
             answer_ui: Some(document.clone()),
             ..MessageFieldOptions::default()
         };
         assert_eq!(
-            validate_send_options(&[], false, &missing_type, true)
+            validate_send_options(&[], &missing_type, true)
                 .unwrap_err()
                 .message,
             "--answer-ui requires explicit --type request: add --type request, or drop --answer-ui and use --choice/--reply"
@@ -6294,25 +6197,14 @@ mod tests {
             ..MessageFieldOptions::default()
         };
         assert!(
-            validate_send_options(&[], false, &fyi_fields, true)
+            validate_send_options(&[], &fyi_fields, true)
                 .unwrap_err()
                 .message
                 .contains("replace --type fyi with --type request")
         );
 
-        let informational_fields = MessageFieldOptions {
-            answer_ui: Some(document.clone()),
-            ..MessageFieldOptions::default()
-        };
         assert!(
-            validate_send_options(&[], true, &informational_fields, true)
-                .unwrap_err()
-                .message
-                .contains("remove --informational and add --type request")
-        );
-
-        assert!(
-            validate_send_options(&["Approve".into()], false, &request_fields, true)
+            validate_send_options(&["Approve".into()], &request_fields, true)
                 .unwrap_err()
                 .message
                 .contains("remove --choice")
@@ -6323,7 +6215,7 @@ mod tests {
             ..request_fields.clone()
         };
         assert!(
-            validate_send_options(&[], false, &with_default, true)
+            validate_send_options(&[], &with_default, true)
                 .unwrap_err()
                 .message
                 .contains("remove --default")
@@ -6334,7 +6226,7 @@ mod tests {
             ..request_fields.clone()
         };
         assert!(
-            validate_send_options(&[], false, &with_default_at, true)
+            validate_send_options(&[], &with_default_at, true)
                 .unwrap_err()
                 .message
                 .contains("remove --default-at")
@@ -6345,7 +6237,7 @@ mod tests {
             ..request_fields.clone()
         };
         assert!(
-            validate_send_options(&[], false, &with_style, true)
+            validate_send_options(&[], &with_style, true)
                 .unwrap_err()
                 .message
                 .contains("remove --choice-style")
@@ -6356,7 +6248,7 @@ mod tests {
             ..request_fields.clone()
         };
         assert_eq!(
-            validate_send_options(&[], false, &with_reply, true)
+            validate_send_options(&[], &with_reply, true)
                 .unwrap_err()
                 .message,
             "--answer-ui carries its own inputs: remove --reply, or drop --answer-ui and use --choice/--reply"
@@ -6397,7 +6289,6 @@ mod tests {
             "Choose the cover",
             None,
             &[],
-            false,
             None,
             None,
             false,
@@ -6418,7 +6309,6 @@ mod tests {
             "Choose the cover",
             None,
             &[],
-            false,
             &[],
             None,
             None,
@@ -6455,7 +6345,6 @@ mod tests {
             "Choose the cover",
             None,
             &[],
-            false,
             &[],
             None,
             None,
@@ -7057,7 +6946,6 @@ mod tests {
             "A title",
             Some("A body"),
             &choices,
-            false,
             None,
             None,
             false,
@@ -7072,7 +6960,6 @@ mod tests {
             "A title",
             Some("A body"),
             &choices,
-            false,
             &[],
             None,
             None,
@@ -7129,7 +7016,6 @@ mod tests {
             "A title",
             Some("A body"),
             &choices,
-            false,
             None,
             None,
             false,
@@ -7166,7 +7052,6 @@ mod tests {
             "Original",
             None,
             &[],
-            false,
             None,
             None,
             false,
@@ -7179,7 +7064,6 @@ mod tests {
             "Original",
             None,
             &[],
-            false,
             &[],
             None,
             None,
@@ -7204,7 +7088,6 @@ mod tests {
             "Changed",
             None,
             &[],
-            false,
             None,
             None,
             false,
@@ -7217,7 +7100,6 @@ mod tests {
             "Changed",
             None,
             &[],
-            false,
             &[],
             None,
             None,
@@ -7292,7 +7174,6 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
-            false,
             None,
             None,
             false,
@@ -7305,7 +7186,6 @@ mod tests {
             "A title",
             Some("A body"),
             &[],
-            false,
             &[],
             None,
             None,
@@ -7379,7 +7259,6 @@ mod tests {
             "A question",
             None,
             &[],
-            false,
             None,
             None,
             false,
@@ -7388,7 +7267,7 @@ mod tests {
         .unwrap();
         assert_eq!(plain["type"], "send");
         assert!(plain["message"].get("supersedes").is_none());
-        assert!(plain["message"].get("message_type").is_none());
+        assert_eq!(plain["message"]["message_type"], "request");
         let superseding = with_supersedes(
             plain.clone(),
             &["earlier-1".to_string(), "earlier-2".to_string()],
@@ -7410,7 +7289,6 @@ mod tests {
             "Choose one",
             None,
             &choices,
-            false,
             None,
             None,
             false,
@@ -7422,7 +7300,7 @@ mod tests {
             choices_answer_ui(&choices).unwrap()
         );
 
-        let informational = build_send_request(
+        let informational = build_send_request_with_fields(
             Uuid::new_v4(),
             session,
             "notice",
@@ -7430,11 +7308,14 @@ mod tests {
             "A notice",
             None,
             &[],
-            true,
             None,
             None,
             false,
             &[],
+            &MessageFieldOptions {
+                message_type: Some("fyi".into()),
+                ..MessageFieldOptions::default()
+            },
         )
         .unwrap();
         assert_eq!(informational["message"]["answer_ui"], seen_answer_ui());
@@ -7460,7 +7341,6 @@ mod tests {
             "A notice",
             None,
             &[],
-            false,
             None,
             None,
             false,
@@ -7490,7 +7370,6 @@ mod tests {
             "Choose one",
             None,
             &choices,
-            false,
             None,
             None,
             false,
@@ -7529,7 +7408,6 @@ mod tests {
             "Choose one",
             None,
             &choices,
-            false,
             None,
             None,
             false,
@@ -7554,6 +7432,7 @@ mod tests {
     fn send_carries_display_name_unchanged_and_separate_from_sender_id() {
         let display_name = "  Mei\n/💧  ";
         let fields = MessageFieldOptions {
+            message_type: Some("fyi".into()),
             display_name: Some(display_name.to_owned()),
             ..MessageFieldOptions::default()
         };
@@ -7565,7 +7444,6 @@ mod tests {
             "A title",
             None,
             &[],
-            false,
             None,
             Some(OriginHarness::ClaudeCode),
             false,
@@ -7589,12 +7467,12 @@ mod tests {
             "Another title",
             None,
             &[],
-            false,
             None,
             Some(OriginHarness::ClaudeCode),
             false,
             &[],
             &MessageFieldOptions {
+                message_type: Some("fyi".into()),
                 display_name: Some(String::new()),
                 ..MessageFieldOptions::default()
             },
@@ -7604,37 +7482,20 @@ mod tests {
     }
 
     #[test]
-    fn prepared_send_identity_distinguishes_seen_only_without_changing_default_retries() {
+    fn prepared_send_identity_distinguishes_message_field_options() {
         let default = send_input_identity(
             "new",
             "app:example",
             "A notice",
             None,
             &[],
-            false,
             &[],
             None,
             Some(OriginHarness::ClaudeCode),
             false,
             &[],
         );
-        let informational = send_input_identity(
-            "new",
-            "app:example",
-            "A notice",
-            None,
-            &[],
-            true,
-            &[],
-            None,
-            Some(OriginHarness::ClaudeCode),
-            false,
-            &[],
-        );
-        assert!(default.get("informational").is_none());
         assert!(default.get("supersedes").is_none());
-        assert_eq!(informational["informational"], true);
-        assert_ne!(default, informational);
 
         let named = send_input_identity_with_fields(
             "new",
@@ -7642,7 +7503,6 @@ mod tests {
             "A notice",
             None,
             &[],
-            false,
             &[],
             None,
             Some(OriginHarness::ClaudeCode),
@@ -7659,7 +7519,6 @@ mod tests {
             "A notice",
             None,
             &[],
-            false,
             &[],
             None,
             Some(OriginHarness::ClaudeCode),
@@ -7682,7 +7541,6 @@ mod tests {
             "A notice",
             None,
             &[],
-            false,
             &["old-1".to_string(), "old-2".to_string()],
             None,
             Some(OriginHarness::ClaudeCode),
@@ -7793,6 +7651,7 @@ mod tests {
             default_at: Some("2026-10-30T23:00:00Z".into()),
             choice_styles: vec!["Ship=destructive".into()],
             clear_default: false,
+            message_type: Some("request".into()),
             ..MessageFieldOptions::default()
         };
 
@@ -7804,7 +7663,6 @@ mod tests {
             "Ship?",
             None,
             &choices,
-            false,
             None,
             Some(OriginHarness::ClaudeCode),
             false,
@@ -7879,7 +7737,7 @@ mod tests {
             ..MessageFieldOptions::default()
         };
         assert_eq!(
-            validate_send_options(&choices, false, &fyi, true)
+            validate_send_options(&choices, &fyi, true)
                 .unwrap_err()
                 .message,
             "--type fyi carries only the Seen acknowledgment: remove --choice, or use --type request"
@@ -7891,7 +7749,7 @@ mod tests {
             ..MessageFieldOptions::default()
         };
         assert!(
-            validate_send_options(&[], false, &reply_on_fyi, true)
+            validate_send_options(&[], &reply_on_fyi, true)
                 .unwrap_err()
                 .message
                 .contains("remove --reply")
@@ -7902,25 +7760,21 @@ mod tests {
             ..MessageFieldOptions::default()
         };
         assert_eq!(
-            validate_send_options(&[], false, &request_without_controls, true)
+            validate_send_options(&[], &request_without_controls, true)
                 .unwrap_err()
                 .message,
             "--type request needs at least one choice or a reply: add --choice <label> or --reply, or send as --type fyi"
         );
 
-        let informational_request = MessageFieldOptions {
-            message_type: Some("request".into()),
-            ..MessageFieldOptions::default()
-        };
         assert_eq!(
-            send_message_type(&informational_request, true)
+            send_message_type(&MessageFieldOptions::default())
                 .unwrap_err()
                 .message,
-            "--informational means --type fyi: remove --informational to send a request, or use --type fyi"
+            "send requires --type fyi or --type request"
         );
 
         assert_eq!(
-            validate_send_options(&["  ".into()], false, &request_without_controls, true)
+            validate_send_options(&["  ".into()], &request_without_controls, true)
                 .unwrap_err()
                 .message,
             "--choice must have a non-empty label; provide a label or remove --choice"
@@ -7928,7 +7782,6 @@ mod tests {
         assert_eq!(
             validate_send_options(
                 &["Approve".into(), "Approve".into()],
-                false,
                 &request_without_controls,
                 true,
             )
@@ -7945,15 +7798,6 @@ mod tests {
             validate_message_kind(&invalid_kind).unwrap_err().message,
             "--kind must be blocker or success, or left out; got \"update\""
         );
-
-        let legacy_urgency = MessageFieldOptions {
-            urgency: Some("now".into()),
-            ..MessageFieldOptions::default()
-        };
-        let normalized = validate_send_options(&[], false, &legacy_urgency, true)
-            .unwrap()
-            .1;
-        assert_eq!(normalized.members["urgency"], "now");
     }
 
     #[test]
@@ -8496,7 +8340,13 @@ mod tests {
             &mut store,
             session,
             "attachment_support",
-            attachment_support_request(Uuid::new_v4(), session, OriginHarness::ClaudeCode, false),
+            attachment_support_request(
+                Uuid::new_v4(),
+                session,
+                OriginHarness::ClaudeCode,
+                false,
+                false,
+            ),
             false,
         )
         .unwrap();
@@ -8540,7 +8390,13 @@ mod tests {
             &mut store,
             session,
             "attachment_support",
-            attachment_support_request(Uuid::new_v4(), session, OriginHarness::ClaudeCode, false),
+            attachment_support_request(
+                Uuid::new_v4(),
+                session,
+                OriginHarness::ClaudeCode,
+                false,
+                false,
+            ),
             false,
         )
         .unwrap();
@@ -8565,7 +8421,13 @@ mod tests {
                 "attachment_update" => {
                     attachment_update_request(op_id, session, Some("vendor-thread"))
                 }
-                _ => attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false),
+                _ => attachment_support_request(
+                    op_id,
+                    session,
+                    OriginHarness::ClaudeCode,
+                    false,
+                    false,
+                ),
             };
             store
                 .prepare_operation(op_id, session, kind.into(), request.clone())
@@ -8724,7 +8586,6 @@ mod tests {
                         "A request",
                         Some("Please review"),
                         &[],
-                        false,
                         None,
                         None,
                         false,
@@ -9029,9 +8890,13 @@ mod tests {
                     "attachment_update" => {
                         attachment_update_request(op_id, session, Some("vendor-thread"))
                     }
-                    "attachment_support" | "support" => {
-                        attachment_support_request(op_id, session, OriginHarness::ClaudeCode, false)
-                    }
+                    "attachment_support" | "support" => attachment_support_request(
+                        op_id,
+                        session,
+                        OriginHarness::ClaudeCode,
+                        false,
+                        false,
+                    ),
                     "file_use" => json!({
                         "v":1,
                         "type":"file_use",
@@ -9196,8 +9061,13 @@ mod tests {
         );
 
         let support_id = Uuid::new_v4();
-        let support_request =
-            attachment_support_request(support_id, session, OriginHarness::ClaudeCode, false);
+        let support_request = attachment_support_request(
+            support_id,
+            session,
+            OriginHarness::ClaudeCode,
+            false,
+            false,
+        );
         store
             .prepare_operation(
                 support_id,
@@ -9296,7 +9166,13 @@ mod tests {
                 support_id,
                 session,
                 "attachment_support".into(),
-                attachment_support_request(support_id, session, OriginHarness::ClaudeCode, false),
+                attachment_support_request(
+                    support_id,
+                    session,
+                    OriginHarness::ClaudeCode,
+                    false,
+                    false,
+                ),
             )
             .unwrap();
         store
@@ -9322,8 +9198,13 @@ mod tests {
 
     #[test]
     fn attach_support_does_not_claim_codex_listening() {
-        let request =
-            attachment_support_request(Uuid::new_v4(), Uuid::new_v4(), OriginHarness::Codex, false);
+        let request = attachment_support_request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            OriginHarness::Codex,
+            false,
+            false,
+        );
         assert_eq!(request["route"], "codex");
         assert!(
             request["unsupported_reason"]
@@ -9332,8 +9213,13 @@ mod tests {
                 .contains("not supported yet")
         );
         assert!(
-            attachment_support_request(Uuid::new_v4(), Uuid::new_v4(), OriginHarness::Other, true,)
-                ["unsupported_reason"]
+            attachment_support_request(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                OriginHarness::Other,
+                true,
+                false
+            )["unsupported_reason"]
                 .is_null()
         );
         assert!(
@@ -9342,6 +9228,7 @@ mod tests {
                 Uuid::new_v4(),
                 OriginHarness::Other,
                 false,
+                false
             )["unsupported_reason"]
                 .is_null()
         );
@@ -9371,17 +9258,12 @@ mod tests {
     #[test]
     fn controller_ack2_support_is_opt_in_and_requires_server_confirmation() {
         let session = Uuid::new_v4();
-        let legacy =
-            attachment_support_request(Uuid::new_v4(), session, OriginHarness::Other, true);
-        assert!(legacy.get("ack2").is_none());
+        let undeclared =
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::Other, true, false);
+        assert!(undeclared.get("ack2").is_none());
 
-        let declared = attachment_support_request_with_ack2(
-            Uuid::new_v4(),
-            session,
-            OriginHarness::Other,
-            true,
-            true,
-        );
+        let declared =
+            attachment_support_request(Uuid::new_v4(), session, OriginHarness::Other, true, true);
         assert_eq!(declared["ack2"], true);
         let listen_declared = listener_support_request(
             Uuid::new_v4(),

@@ -29,8 +29,6 @@ pub enum JournalError {
     Json(#[from] serde_json::Error),
     #[error("journal database failed: {0}")]
     Database(#[from] rusqlite::Error),
-    #[error("journal schema {0} is not supported")]
-    UnsupportedSchema(u32),
     #[error("journal database is missing its cursor")]
     MissingCursor,
     #[error("journal database cursor is invalid")]
@@ -79,15 +77,6 @@ pub struct Journal {
 }
 
 impl Journal {
-    fn empty() -> Self {
-        Self {
-            schema: 1,
-            cursor: 0,
-            entries: BTreeMap::new(),
-            operations: BTreeMap::new(),
-        }
-    }
-
     pub fn pending_for(&self, session_handle: Uuid) -> Vec<&JournalEntry> {
         let closed_requests: std::collections::BTreeSet<_> = self
             .entries
@@ -329,7 +318,6 @@ pub enum OperationState {
 
 pub struct JournalStore {
     journal_path: PathBuf,
-    legacy_journal_path: PathBuf,
     journal_lock_path: PathBuf,
     listener_lock_path: PathBuf,
     listener_lock: Option<File>,
@@ -337,17 +325,14 @@ pub struct JournalStore {
 
 impl JournalStore {
     /// Recovery may use existing durable history, but must not initialize a
-    /// new origin journal when that history is missing. A legacy journal still
-    /// follows the normal migration path with its cursor and receipts intact.
+    /// new origin journal when that history is missing.
     pub fn open_existing(
         state_root: &Path,
         device_id: &str,
         session_handle: Uuid,
     ) -> Result<Self, JournalError> {
         let directory = state_root.join(hex::encode(Sha256::digest(device_id.as_bytes())));
-        if !directory.join("origin-feed.sqlite3").is_file()
-            && !directory.join("origin-feed.json").is_file()
-        {
+        if !directory.join("origin-feed.sqlite3").is_file() {
             return Err(JournalError::MissingOriginJournal);
         }
         Self::open(state_root, device_id, session_handle)
@@ -363,7 +348,6 @@ impl JournalStore {
         create_private_directory(&directory)?;
         let store = Self {
             journal_path: directory.join("origin-feed.sqlite3"),
-            legacy_journal_path: directory.join("origin-feed.json"),
             journal_lock_path: directory.join("origin-feed.lock"),
             listener_lock_path: directory.join(format!("{session_handle}.listener.lock")),
             listener_lock: None,
@@ -431,41 +415,13 @@ impl JournalStore {
             })
             .optional()?;
         if initialized.is_none() {
-            let legacy = if self.legacy_journal_path.exists() {
-                let bytes = fs::read(&self.legacy_journal_path)?;
-                let journal: Journal = serde_json::from_slice(&bytes)?;
-                if journal.schema != 1 {
-                    return Err(JournalError::UnsupportedSchema(journal.schema));
-                }
-                journal
-            } else {
-                Journal::empty()
-            };
             let tx = connection.transaction()?;
-            for entry in legacy.entries.values() {
-                write_entry(&tx, entry)?;
-                if entry.kind == "terminal" {
-                    if let Some((sender_id, request_id)) =
-                        entry.sender_id.as_deref().zip(entry.request_id.as_deref())
-                    {
-                        close_pending_discussions(
-                            &tx,
-                            entry.session_handle,
-                            sender_id,
-                            request_id,
-                        )?;
-                    }
-                }
-            }
-            for operation in legacy.operations.values() {
-                write_operation(&tx, operation)?;
-            }
             tx.execute(
                 "INSERT INTO meta(key,value) VALUES('schema','2')
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [],
             )?;
-            write_cursor(&tx, legacy.cursor)?;
+            write_cursor(&tx, 0)?;
             tx.commit()?;
             if let Some(parent) = self.journal_path.parent() {
                 File::open(parent)?.sync_all()?;
