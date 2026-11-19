@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.1.15
+
+This release intentionally breaks some command-line behaviour. Callers must update.
+
+- `send` now requires `--type`. The `--urgency` and `--informational` aliases are removed; pass `--type` explicitly.
+- Removed input refusals: blank stage text, flag-combination refusals and required free-text reasons are no longer rejected by the Agent.
+- Enrollment no longer checks label length, and UUIDs are no longer limited by version; any UUID is accepted.
+- The Agent now checks request size client-side and refuses requests over 2 MiB before sending.
+- Removed the one-time migration of an old `origin-feed.json` journal. An Agent state directory that still holds an old `origin-feed.json` will no longer be migrated.
+- Removed the legacy capability path.
+
 ## 0.1.14
 
 - Progress updates keep ordinary inline content and uploaded files across revisions, and fresh uploads are bound to the new revision.
