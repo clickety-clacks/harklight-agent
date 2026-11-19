@@ -181,14 +181,22 @@ fn update_with(
     now: u64,
 ) -> Result<Value, CommandError> {
     report.validate()?;
-    if store
-        .operation(op_id)
-        .map_err(|e| journal_error(e, 1))?
-        .is_some()
-    {
+    // Never stage into an existing operation's directory. Keep the exit class
+    // callers already rely on: an unresolved key means "retry it", and a
+    // settled key is the same conflict the ordinary submit path reports.
+    if let Some(existing) = store.operation(op_id).map_err(|e| journal_error(e, 1))? {
+        if matches!(
+            existing.state,
+            crate::journal::OperationState::Prepared | crate::journal::OperationState::Unknown
+        ) {
+            return Err(CommandError::new(
+                format!("request has unresolved operation {op_id}; retry it before continuing"),
+                super::EXIT_OUTCOME_UNKNOWN,
+            ));
+        }
         return Err(journal_error(
             crate::journal::JournalError::OperationConflict(op_id),
-            EXIT_REFUSED,
+            1,
         ));
     }
     let snapshot = store
@@ -814,6 +822,100 @@ mod tests {
             .exit_code,
             EXIT_REFUSED
         );
+    }
+
+    #[test]
+    fn committed_withdraw_releases_current_inline_and_uploaded_material() {
+        for uploaded in [false, true] {
+            let scratch = Scratch::new();
+            let session = Uuid::new_v4();
+            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+            let origin = Origin::new();
+            let first = send_file(&origin, &mut store, session, &scratch.0, uploaded);
+            let kept = store.operation(first).unwrap().unwrap();
+            let staged = kept.uploads.first().and_then(|u| u.staged_path.clone());
+            if let Some(path) = &staged {
+                assert!(path.exists());
+            } else {
+                assert!(kept.request["files"][0].get("data_base64").is_some());
+            }
+            let withdraw = Uuid::new_v4();
+            let operation = store
+                .prepare_operation(
+                    withdraw,
+                    session,
+                    "withdraw".into(),
+                    json!({"v":1,"type":"withdraw","op_id":withdraw.to_string(),
+                        "sender_id":SENDER,"message_id":MESSAGE}),
+                )
+                .unwrap();
+            submit_operation_with_transport(&origin, &mut store, operation).unwrap();
+            let released = store.operation(first).unwrap().unwrap();
+            assert_eq!(released.response, kept.response);
+            assert!(released.request["files"][0].get("data_base64").is_none());
+            assert!(released.uploads.iter().all(|u| u.staged_path.is_none()));
+            if let Some(path) = &staged {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_update_key_keeps_its_retry_or_conflict_exit_class() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let origin = Origin::new();
+        send_progress(&origin, &mut store, session, report(10, "coding", None), T0);
+        let committed = Uuid::new_v4();
+        update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "coding", None),
+            committed,
+            T0 + 1,
+        )
+        .unwrap();
+        let again = update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "coding", None),
+            committed,
+            T0 + 2,
+        )
+        .unwrap_err();
+        assert_eq!(again.exit_code, 1);
+
+        let lost = Origin::new().then(Err(ApiError::InvalidResponse("lost".into())));
+        let unknown = Uuid::new_v4();
+        update_with(
+            &lost,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(30, "coding", None),
+            unknown,
+            T0 + 3,
+        )
+        .unwrap_err();
+        let staged = store.operation(unknown).unwrap().unwrap().request.clone();
+        let retry = update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(30, "coding", None),
+            unknown,
+            T0 + 4,
+        )
+        .unwrap_err();
+        assert_eq!(retry.exit_code, super::super::EXIT_OUTCOME_UNKNOWN);
+        assert!(retry.message.contains(&unknown.to_string()));
+        assert_eq!(store.operation(unknown).unwrap().unwrap().request, staged);
     }
 
     #[test]

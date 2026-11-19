@@ -143,8 +143,19 @@ impl JournalStore {
                     .and_then(|n| u64::try_from(n).ok())
                     .is_some_and(|n| keep_revision(operation_sender(op), n));
             if !keep {
-                op.request = redact_file_payloads(&op.request);
-                redact_prepared_send(op);
+                let request = redact_file_payloads(&op.request);
+                let prepared = op
+                    .prepared_send
+                    .as_ref()
+                    .map(|p| redact_file_payloads(&p.request));
+                // Rewrite only rows that still hold material; released rows
+                // stay untouched so a pass costs nothing for old history.
+                let changed = request != op.request
+                    || prepared.as_ref() != op.prepared_send.as_ref().map(|p| &p.request);
+                if changed {
+                    op.request = request;
+                    redact_prepared_send(op);
+                }
                 for (index, upload) in op.uploads.iter().enumerate() {
                     if let Some(path) = &upload.staged_path {
                         if !protected.contains(path) {
@@ -152,7 +163,9 @@ impl JournalStore {
                         }
                     }
                 }
-                write_operation(&tx, op)?;
+                if changed {
+                    write_operation(&tx, op)?;
+                }
             }
         }
         for entry in &mut entries {
@@ -163,8 +176,11 @@ impl JournalStore {
                     .request_revision
                     .is_some_and(|n| keep_revision(entry.sender_id.as_deref().unwrap_or(""), n))
             {
+                let before = entry.raw.clone();
                 strip_file_payloads(&mut entry.raw);
-                write_entry(&tx, entry)?;
+                if entry.raw != before {
+                    write_entry(&tx, entry)?;
+                }
             }
         }
         tx.commit()?;
