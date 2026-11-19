@@ -71,9 +71,6 @@ fn emit_covered(
 
 pub fn listen_origin(context: &CommandContext) -> Result<(), CommandError> {
     let mut store = context.open_global_store()?;
-    store
-        .acquire_origin_listener()
-        .map_err(|error| journal_error(error, EXIT_LISTENER_ACTIVE))?;
     let mut delay = Duration::from_millis(250);
     'connect: loop {
         let mut stream = match context.api.connect_origin_stream() {
