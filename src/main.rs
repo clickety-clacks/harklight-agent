@@ -121,7 +121,7 @@ enum Command {
         route: Option<Route>,
         #[arg(long)]
         controller: bool,
-        #[arg(long, requires_all = ["route", "controller"])]
+        #[arg(long)]
         origin_listener: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
@@ -190,11 +190,10 @@ enum Command {
         route: Route,
         #[arg(long)]
         controller: bool,
-        #[arg(long, requires_all = ["route", "controller"])]
+        #[arg(long)]
         origin_listener: bool,
         #[arg(
             long,
-            requires = "controller",
             help = "Declare that this controller sends system ACK2 for this handle"
         )]
         ack2: bool,
@@ -278,6 +277,8 @@ enum Command {
         #[arg(
             long = "not-handed",
             value_name = "REASON",
+            num_args = 0..=1,
+            default_missing_value = "",
             conflicts_with = "rerouted"
         )]
         not_handed: Option<String>,
@@ -480,7 +481,6 @@ struct ListenArgs {
     controller: bool,
     #[arg(
         long,
-        requires = "controller",
         help = "Declare that this controller sends system ACK2 for this handle"
     )]
     ack2: bool,
@@ -1725,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn ack2_is_a_separate_receiver_command_and_controller_capability_is_explicit() {
+    fn ack2_is_a_separate_receiver_command_and_controller_capability_is_declared_by_flag() {
         let handle = "123e4567-e89b-42d3-a456-426614174000";
         let attach = Cli::try_parse_from([
             "harklight-agent",
@@ -1748,20 +1748,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "attach",
-                "--session",
-                handle,
-                "--vendor-session-id",
-                "none",
-                "--route",
-                "other",
-                "--ack2",
-            ])
-            .is_err()
-        );
 
         let listen = Cli::try_parse_from([
             "harklight-agent",
@@ -1781,17 +1767,6 @@ mod tests {
                 ..
             })
         ));
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "listen",
-                "--session",
-                handle,
-                "--follow",
-                "--ack2",
-            ])
-            .is_err()
-        );
 
         let handed = Cli::try_parse_from([
             "harklight-agent",

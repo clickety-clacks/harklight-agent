@@ -397,11 +397,11 @@ fn attach_locked(
     ack2: bool,
     origin_listener: bool,
 ) -> Result<Value, Failure> {
-    if vendor.is_empty() || (controller && route != OriginHarness::Other) {
+    if vendor.is_empty() {
         return Err(Failure::local(
             "attachment",
             "invalid_attachment",
-            "Use a non-empty vendor ID or none; controller requires route other.",
+            "Use a non-empty vendor ID or none.",
             EXIT_REFUSED,
         ));
     }

@@ -491,12 +491,8 @@ harklight-agent send --session new --sender-id app:example \
 harklight-agent listen --follow --controller --session "$HARKLIGHT_SESSION"
 ```
 
-`--controller` on `send` requires `--session new --route other` together; it
-refuses before any network call otherwise. `--controller` on `listen` requires
-`--follow` (not `--next`) and requires that the same handle was minted with
-`--route other`; it refuses otherwise. Declaring `--controller` is this
-harness's own statement that it runs and supervises that `--follow` process;
-the CLI records the arm as supported on that basis alone. It still has no
+Declaring `--controller` is this harness's own statement that it runs and
+supervises that `--follow` process; the CLI records the arm as supported on that basis alone. It still has no
 built-in knowledge of this harness's delivery contract and makes no stronger
 claim than for Claude Code or Codex.
 
@@ -527,8 +523,8 @@ harklight-agent ack2 --session "$HARKLIGHT_SESSION" --event "$HARKLIGHT_EVENT" \
 ```
 
 Use `--agent` only when the receiving system has the agent's human-readable
-name. `--rerouted` applies only to `handed`; `--not-handed` supplies the reason
-for a negative outcome. This command submits an ACK2 operation only when the
+name. `--rerouted` applies only to `handed`; `--not-handed` marks a negative
+outcome and may carry a reason. This command submits an ACK2 operation only when the
 receiving system explicitly invokes it. It does not mark the agent Seen, infer
 delivery from generated output, or automatically retry an uncertain result.
 After an unknown outcome, retry only the same journaled operation with
@@ -576,6 +572,8 @@ harklight-agent file-use --session "$HARKLIGHT_SESSION" \
   --event "$HARKLIGHT_EVENT" --file "diagram.png" --unusable \
   --reason "This session cannot inspect this format."
 ```
+
+`--reason` is optional and valid only with `--unusable`.
 
 `used` and `unusable` are the agent's own reports, not evidence that a vendor
 read or acted on the bytes. Uploaded-file transfer is recorded only after the

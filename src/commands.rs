@@ -1165,23 +1165,10 @@ fn prepare_outgoing_files_with_lookup(
 fn validate_send_route(
     session_arg: &str,
     route: Option<OriginHarness>,
-    controller: bool,
 ) -> Result<Option<OriginHarness>, CommandError> {
-    if controller && (session_arg != "new" || route != Some(OriginHarness::Other)) {
-        return Err(CommandError::new(
-            "--controller requires --session new --route other",
-            EXIT_REFUSED,
-        ));
-    }
     if session_arg == "new" && route.is_none() {
         return Err(CommandError::new(
             "--route is required when minting a new session handle",
-            EXIT_REFUSED,
-        ));
-    }
-    if session_arg != "new" && route.is_some() {
-        return Err(CommandError::new(
-            "--route is only accepted when minting a new session handle",
             EXIT_REFUSED,
         ));
     }
@@ -1761,15 +1748,7 @@ pub fn send_with_fields(
     files: &[PathBuf],
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
-    let route = validate_send_route(session_arg, route, controller)?;
-    if fields.origin_listener
-        && (session_arg != "new" || route != Some(OriginHarness::Other) || !controller)
-    {
-        return Err(CommandError::new(
-            "--origin-listener requires --session new --route other --controller",
-            EXIT_REFUSED,
-        ));
-    }
+    let route = validate_send_route(session_arg, route)?;
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
@@ -2088,15 +2067,7 @@ pub fn prepare_send_with_fields(
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
-    let route = validate_send_route(session_arg, route, controller)?;
-    if fields.origin_listener
-        && (session_arg != "new" || route != Some(OriginHarness::Other) || !controller)
-    {
-        return Err(CommandError::new(
-            "--origin-listener requires --session new --route other --controller",
-            EXIT_REFUSED,
-        ));
-    }
+    let route = validate_send_route(session_arg, route)?;
     let global = context.open_global_store()?;
 
     if let Some(existing) = global
@@ -2474,13 +2445,11 @@ fn listener_support_flags(
     controller: bool,
     requested_ack2: bool,
 ) -> ListenerSupportFlags {
-    if route != OriginHarness::Other || !controller {
-        return ListenerSupportFlags::default();
-    }
+    let preserved = route == OriginHarness::Other && controller;
     let support = &status["listening_support"];
     ListenerSupportFlags {
-        ack2: requested_ack2 || support["ack2"] == true,
-        origin_listener: support["origin_listener"] == true,
+        ack2: requested_ack2 || (preserved && support["ack2"] == true),
+        origin_listener: preserved && support["origin_listener"] == true,
     }
 }
 
@@ -2822,18 +2791,6 @@ pub fn attach_with_origin(
     ack2: bool,
     origin_listener: bool,
 ) -> Result<(), CommandError> {
-    if origin_listener && (!controller || route != OriginHarness::Other) {
-        return Err(CommandError::new(
-            "--origin-listener requires --route other --controller",
-            EXIT_REFUSED,
-        ));
-    }
-    if ack2 && !controller {
-        return Err(CommandError::new(
-            "--ack2 requires --controller",
-            EXIT_REFUSED,
-        ));
-    }
     if controller {
         return reconnect::controller_attach(
             context,
@@ -2843,12 +2800,6 @@ pub fn attach_with_origin(
             ack2,
             origin_listener,
         );
-    }
-    if controller && route != OriginHarness::Other {
-        return Err(CommandError::new(
-            "--controller is valid only with --route other",
-            EXIT_REFUSED,
-        ));
     }
     let vendor_session_id = match vendor_session_arg {
         "none" => None,
@@ -2872,8 +2823,11 @@ pub fn attach_with_origin(
         ));
     }
 
-    let support_request =
+    let mut support_request =
         attachment_support_request_with_ack2(Uuid::new_v4(), session, route, controller, ack2);
+    if origin_listener {
+        support_request["origin_listener"] = Value::Bool(true);
+    }
     ensure_attach_recovery_compatible(&store, session, vendor_session_id, &support_request)?;
 
     let attachment_request = attachment_update_request(Uuid::new_v4(), session, vendor_session_id);
@@ -3134,12 +3088,6 @@ fn ack2_request(
                 EXIT_REFUSED,
             ));
         }
-        if reason.trim().is_empty() {
-            return Err(CommandError::new(
-                "--not-handed requires a nonempty reason",
-                EXIT_REFUSED,
-            ));
-        }
     }
     let outcome = if not_handed.is_some() {
         "not_handed"
@@ -3157,7 +3105,9 @@ fn ack2_request(
         request["agent"] = Value::String(agent.to_owned());
     }
     if let Some(reason) = not_handed {
-        request["reason"] = Value::String(reason.to_owned());
+        if !reason.is_empty() {
+            request["reason"] = Value::String(reason.to_owned());
+        }
     } else {
         request["rerouted"] = Value::Bool(rerouted);
     }
@@ -3181,15 +3131,8 @@ pub fn file_use(
                 EXIT_REFUSED,
             ));
         }
-        ("unusable", Some(reason)) if !reason.trim().is_empty() => {
-            json!({"status":"unusable","reason":reason})
-        }
-        ("unusable", _) => {
-            return Err(CommandError::new(
-                "--unusable requires a nonempty --reason",
-                EXIT_REFUSED,
-            ));
-        }
+        ("unusable", Some(reason)) => json!({"status":"unusable","reason":reason}),
+        ("unusable", None) => json!({"status":"unusable"}),
         _ => return Err(CommandError::new("invalid file-use outcome", EXIT_REFUSED)),
     };
 
@@ -4122,18 +4065,6 @@ pub fn listen(
     controller: bool,
     ack2: bool,
 ) -> Result<(), CommandError> {
-    if ack2 && !controller {
-        return Err(CommandError::new(
-            "--ack2 requires --controller",
-            EXIT_REFUSED,
-        ));
-    }
-    if controller && !follow {
-        return Err(CommandError::new(
-            "--controller requires listen --follow",
-            EXIT_REFUSED,
-        ));
-    }
     let mut store = context.open_store(session)?;
     store.acquire_listener().map_err(|error| {
         let code = if matches!(
@@ -4182,12 +4113,6 @@ pub fn listen(
             "listen",
             "the current server route differs from the confirmed local attach; run attach again before listening",
         );
-    }
-    if controller && route != OriginHarness::Other {
-        return Err(CommandError::new(
-            "--controller requires a session declared with route other",
-            EXIT_REFUSED,
-        ));
     }
     let flags = listener_support_flags(&current_status, route, controller, ack2);
     let unsupported_reason = listener_unsupported_reason(
@@ -8427,35 +8352,19 @@ mod tests {
     }
 
     #[test]
-    fn route_is_required_only_when_minting_a_session_handle() {
+    fn route_is_required_when_minting_a_session_handle() {
         assert!(matches!(
-            validate_send_route("new", None, false),
+            validate_send_route("new", None),
             Err(error) if error.exit_code == EXIT_REFUSED
         ));
         assert_eq!(
-            validate_send_route("new", Some(OriginHarness::ClaudeCode), false).unwrap(),
+            validate_send_route("new", Some(OriginHarness::ClaudeCode)).unwrap(),
             Some(OriginHarness::ClaudeCode)
         );
         assert_eq!(
-            validate_send_route(&Uuid::new_v4().to_string(), None, false).unwrap(),
+            validate_send_route(&Uuid::new_v4().to_string(), None).unwrap(),
             None
         );
-        assert!(matches!(
-            validate_send_route("existing", Some(OriginHarness::ClaudeCode), false),
-            Err(error) if error.exit_code == EXIT_REFUSED
-        ));
-        assert_eq!(
-            validate_send_route("new", Some(OriginHarness::Other), true).unwrap(),
-            Some(OriginHarness::Other)
-        );
-        assert!(matches!(
-            validate_send_route("new", Some(OriginHarness::ClaudeCode), true),
-            Err(error) if error.exit_code == EXIT_REFUSED
-        ));
-        assert!(matches!(
-            validate_send_route("existing", Some(OriginHarness::Other), true),
-            Err(error) if error.exit_code == EXIT_REFUSED
-        ));
     }
 
     #[test]
@@ -9842,7 +9751,9 @@ mod tests {
 
         assert!(ack2_request(Uuid::new_v4(), "812", None, true, Some("no")).is_err());
         assert!(ack2_request(Uuid::new_v4(), "812", Some("  "), false, None).is_err());
-        assert!(ack2_request(Uuid::new_v4(), "812", None, false, Some("  ")).is_err());
+        let bare = ack2_request(Uuid::new_v4(), "812", None, false, Some("")).unwrap();
+        assert_eq!(bare["outcome"], "not_handed");
+        assert!(bare.get("reason").is_none());
         assert!(ack2_request(Uuid::new_v4(), "08", None, false, None).is_err());
     }
 
