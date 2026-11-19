@@ -80,17 +80,12 @@ pub struct Journal {
 
 impl Journal {
     pub fn pending_for(&self, session_handle: Uuid) -> Vec<&JournalEntry> {
-        let mut closed_at: BTreeMap<_, u64> = BTreeMap::new();
-        for entry in self
+        let closed_requests: std::collections::BTreeSet<_> = self
             .entries
             .values()
             .filter(|entry| entry.kind == "terminal")
-        {
-            if let Some(key) = entry.request_key() {
-                let latest = closed_at.entry(key).or_insert(entry.feed_seq);
-                *latest = (*latest).max(entry.feed_seq);
-            }
-        }
+            .filter_map(JournalEntry::request_key)
+            .collect();
 
         self.entries
             .values()
@@ -98,9 +93,7 @@ impl Journal {
             .filter(|entry| entry.actionable && entry.acted_at_ms.is_none())
             .filter(|entry| match entry.kind.as_str() {
                 "discussion" => entry.request_key().is_none_or(|key| {
-                    closed_at.get(&key).is_none_or(|terminal_seq| {
-                        entry.raw["channel"] == "chat" && entry.feed_seq > *terminal_seq
-                    })
+                    !closed_requests.contains(&key) || entry.raw["channel"] == "chat"
                 }),
                 "terminal" if entry.raw["terminal_state"] != "answered" => {
                     entry.delivered_at_ms.is_none()
@@ -1608,23 +1601,18 @@ fn entry_pending_active(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<bo
             else {
                 return Ok(true);
             };
-            let terminal_seq: Option<String> = tx
+            let has_terminal: Option<String> = tx
                 .query_row(
                     "SELECT feed_seq FROM entries
                      WHERE session_handle=?1 AND sender_id=?2 AND request_id=?3 AND kind='terminal'
-                     ORDER BY feed_seq DESC LIMIT 1",
+                     LIMIT 1",
                     params![entry.session_handle.to_string(), sender_id, request_id],
                     |row| row.get(0),
                 )
                 .optional()?;
-            // Chat stays open after any terminal outcome; a chat message that
-            // arrived before the terminal was closed by it.
-            Ok(match terminal_seq {
-                None => true,
-                Some(terminal_seq) => {
-                    entry.raw["channel"] == "chat" && encode_sequence(entry.feed_seq) > terminal_seq
-                }
-            })
+            // Chat stays open after any terminal outcome, whether it arrived
+            // before or after it; a terminal closes only reply-channel turns.
+            Ok(has_terminal.is_none() || entry.raw["channel"] == "chat")
         }
         "terminal" if entry.raw["terminal_state"] == "answered" => Ok(true),
         "terminal" => Ok(entry.delivered_at_ms.is_none()),
@@ -1681,7 +1669,8 @@ fn close_pending_discussions(
 ) -> Result<(), JournalError> {
     tx.execute(
         "UPDATE entries SET pending_active=0
-         WHERE session_handle=?1 AND sender_id=?2 AND request_id=?3 AND kind='discussion'",
+         WHERE session_handle=?1 AND sender_id=?2 AND request_id=?3 AND kind='discussion'
+           AND COALESCE(json_extract(payload,'$.raw.channel'),'') != 'chat'",
         params![session_handle.to_string(), sender_id, request_id],
     )?;
     Ok(())
@@ -2820,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_after_any_terminal_still_surfaces_but_reply_channel_discussion_does_not() {
+    fn chat_stays_pending_across_any_terminal_but_reply_channel_discussion_closes() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
         let mut store = open(&root, session);
@@ -2837,12 +2826,12 @@ mod tests {
             item.raw["terminal_state"] = json!(state);
             item
         };
+        // Unreplied chat and a reply-channel turn from before the terminal.
         store.record_entry(discussion(1, "chat")).unwrap();
-        store.record_entry(terminal(2, "retracted")).unwrap();
-        // The terminal closes what was pending before it.
-        assert!(store.pending_for(session).unwrap().is_empty());
-        store.record_entry(discussion(3, "chat")).unwrap();
-        store.record_entry(discussion(4, "reply")).unwrap();
+        store.record_entry(discussion(2, "reply")).unwrap();
+        store.record_entry(terminal(3, "answered")).unwrap();
+        store.record_entry(discussion(4, "chat")).unwrap();
+        store.record_entry(discussion(5, "reply")).unwrap();
 
         let pending: Vec<_> = store
             .pending_for(session)
@@ -2850,15 +2839,25 @@ mod tests {
             .into_iter()
             .map(|entry| entry.event_id)
             .collect();
-        assert_eq!(pending, vec!["3".to_string()]);
-        let snapshot: Vec<_> = store
-            .snapshot()
-            .unwrap()
+        assert_eq!(pending, vec!["1".to_string(), "4".to_string()]);
+        let snapshot = store.snapshot().unwrap();
+        let in_memory: Vec<_> = snapshot
             .pending_for(session)
             .into_iter()
             .map(|entry| entry.event_id.clone())
             .collect();
-        assert_eq!(snapshot, pending);
+        assert_eq!(in_memory, pending);
+
+        // Rewriting an entry (for example emitting it) keeps the same answer.
+        store.mark_emitted("1").unwrap();
+        store.mark_emitted("2").unwrap();
+        let after_rewrite: Vec<_> = store
+            .pending_for(session)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.event_id)
+            .collect();
+        assert_eq!(after_rewrite, pending);
     }
 
     #[test]
