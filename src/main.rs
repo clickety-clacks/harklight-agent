@@ -380,6 +380,14 @@ enum Command {
         #[arg(long)]
         op_id: Uuid,
     },
+    #[command(
+        about = "Give up an operation stuck with an unknown outcome",
+        after_help = "Marks the unresolved operation abandoned so it stops blocking new operations for its request. The Server may or may not have applied it. An abandoned operation can no longer be retried; a committed or refused operation cannot be abandoned."
+    )]
+    Abandon {
+        #[arg(long)]
+        op_id: Uuid,
+    },
     #[command(group(
         ArgGroup::new("file-use-result")
             .required(true)
@@ -847,6 +855,7 @@ fn main() {
             SessionCommand::End { session, gone: _ } => commands::session_end(&context, session),
         },
         Command::Retry { op_id } => commands::retry(&context, op_id),
+        Command::Abandon { op_id } => commands::abandon(&context, op_id),
         Command::FileUse {
             session,
             event,

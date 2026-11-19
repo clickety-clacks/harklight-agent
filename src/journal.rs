@@ -60,6 +60,8 @@ pub enum JournalError {
     OperationConflict(Uuid),
     #[error("journal has no operation with key {0}")]
     MissingOperation(Uuid),
+    #[error("operation {op_id} is {state}; only an unresolved operation can be abandoned")]
+    NotUnresolved { op_id: Uuid, state: &'static str },
     #[error("listener already active (pid {0})")]
     ListenerActive(u32),
     #[error("listener lock is held but its process id is not available")]
@@ -1285,22 +1287,45 @@ impl JournalStore {
 
     pub fn reject_operation(&mut self, op_id: Uuid, response: Value) -> Result<(), JournalError> {
         let result = self.update_operation(op_id, |operation| {
-            operation.state = OperationState::Rejected;
-            operation.updated_at_ms = now_ms();
-            operation.request = redact_file_payloads(&operation.request);
-            redact_prepared_send(operation);
-            operation.response = Some(redact_file_payloads(&response));
-            if !is_progress(&operation.request["message"]) {
-                for upload in &mut operation.uploads {
-                    upload.staged_path = None;
-                }
-            }
+            mark_rejected(operation, &response, false);
             Ok(true)
         });
         if result.is_ok() {
             self.maintain_operation_progress(op_id);
         }
         result
+    }
+
+    /// Give up an operation whose outcome was never resolved. It stops
+    /// blocking new operations for its request and can no longer be retried.
+    /// Only an unresolved (prepared or unknown) operation can be abandoned;
+    /// abandoning one already abandoned is a no-op. The Server may or may not
+    /// have applied it: that is the caller's explicit choice.
+    pub fn abandon_operation(&mut self, op_id: Uuid) -> Result<OperationRecord, JournalError> {
+        let result = self.update_operation(op_id, |operation| {
+            match operation.state {
+                OperationState::Prepared | OperationState::Unknown => {}
+                OperationState::Rejected if operation_is_abandoned(operation) => {
+                    return Ok(false);
+                }
+                state => {
+                    return Err(JournalError::NotUnresolved {
+                        op_id,
+                        state: operation_state_name(state),
+                    });
+                }
+            }
+            mark_rejected(
+                operation,
+                &serde_json::json!({"kind":"abandoned","reason":"abandoned by explicit command"}),
+                true,
+            );
+            Ok(true)
+        });
+        result?;
+        self.maintain_operation_progress(op_id);
+        self.operation(op_id)?
+            .ok_or(JournalError::MissingOperation(op_id))
     }
 
     fn maintain_operation_progress(&self, op_id: Uuid) {
@@ -1414,6 +1439,32 @@ pub(crate) fn operation_request_revision(operation: &OperationRecord) -> Option<
         _ => None,
     }?;
     i64::try_from(revision).ok()
+}
+
+fn mark_rejected(operation: &mut OperationRecord, response: &Value, remove_staged: bool) {
+    operation.state = OperationState::Rejected;
+    operation.updated_at_ms = now_ms();
+    operation.request = redact_file_payloads(&operation.request);
+    redact_prepared_send(operation);
+    operation.response = Some(redact_file_payloads(response));
+    if !is_progress(&operation.request["message"]) {
+        for upload in &mut operation.uploads {
+            if remove_staged {
+                if let Some(path) = upload.staged_path.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            upload.staged_path = None;
+        }
+    }
+}
+
+pub fn operation_is_abandoned(operation: &OperationRecord) -> bool {
+    operation.state == OperationState::Rejected
+        && operation
+            .response
+            .as_ref()
+            .is_some_and(|response| response["kind"] == "abandoned")
 }
 
 fn operation_state_name(state: OperationState) -> &'static str {
