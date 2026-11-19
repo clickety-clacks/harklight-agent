@@ -416,7 +416,7 @@ fn resolve_before_mutation(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, Enrol
 }
 
 fn verify_existing_server(context: &EnrollmentContext) -> Result<(), EnrollmentError> {
-    check_private_directory(&context.identity_dir)?;
+    ensure_private_directory(&context.identity_dir)?;
     let server_path = context.identity_dir.join("server.json");
     let bytes = fs::read(&server_path).map_err(|error| {
         EnrollmentError::local(format!("could not read {}: {error}", server_path.display()))
@@ -518,7 +518,7 @@ fn submit_existing(
     now_ms: u64,
 ) -> Result<PendingFile, EnrollmentError> {
     let certificate_path = identity_dir.join("identity.pem");
-    check_private_file(&certificate_path)?;
+    ensure_private_file(&certificate_path)?;
     let certificate = fs::read_to_string(&certificate_path).map_err(|error| {
         EnrollmentError::local(format!("could not read identity certificate: {error}"))
     })?;
@@ -790,7 +790,7 @@ fn read_optional_pending(identity_dir: &Path) -> Result<Option<PendingFile>, Enr
             )));
         }
     };
-    check_private_file(&path)?;
+    ensure_private_file(&path)?;
     let pending: PendingFile = serde_json::from_slice(&bytes).map_err(|error| {
         EnrollmentError::local(format!("invalid JSON in {}: {error}", path.display()))
     })?;
@@ -807,7 +807,7 @@ fn read_optional_pending(identity_dir: &Path) -> Result<Option<PendingFile>, Enr
 
 fn read_enrollment(identity_dir: &Path) -> Result<EnrollmentFile, EnrollmentError> {
     let path = identity_dir.join("enrollment.json");
-    check_private_file(&path)?;
+    ensure_private_file(&path)?;
     let bytes = fs::read(&path).map_err(|error| {
         EnrollmentError::local(format!("could not read {}: {error}", path.display()))
     })?;
@@ -886,33 +886,37 @@ fn sync_directory(directory: &Path) -> Result<(), EnrollmentError> {
         })
 }
 
-fn check_private_directory(directory: &Path) -> Result<(), EnrollmentError> {
+fn ensure_private_directory(directory: &Path) -> Result<(), EnrollmentError> {
     let metadata = fs::metadata(directory).map_err(|error| {
         EnrollmentError::local(format!("could not inspect identity directory: {error}"))
     })?;
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(EnrollmentError::local(format!(
-            "identity directory must be private (mode 0700): {}",
-            directory.display()
-        )));
-    }
     if !metadata.is_dir() {
         return Err(EnrollmentError::local("identity path is not a directory"));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            EnrollmentError::local(format!(
+                "could not make the identity directory private (mode 0700): {}: {error}",
+                directory.display()
+            ))
+        })?;
     }
     Ok(())
 }
 
-fn check_private_file(path: &Path) -> Result<(), EnrollmentError> {
+fn ensure_private_file(path: &Path) -> Result<(), EnrollmentError> {
     let metadata = fs::metadata(path).map_err(|error| {
         EnrollmentError::local(format!("could not inspect {}: {error}", path.display()))
     })?;
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(EnrollmentError::local(format!(
-            "identity file must be private (mode 0600): {}",
-            path.display()
-        )));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            EnrollmentError::local(format!(
+                "could not make the identity file private (mode 0600): {}: {error}",
+                path.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1268,6 +1272,23 @@ mod tests {
                 .exit_code,
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_identity_directory_and_files_are_tightened_not_refused() {
+        let directory = TestDirectory::new();
+        setup_identity(directory.path());
+        let certificate = directory.path().join("identity.pem");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&certificate, fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::ensure_private_directory(directory.path()).unwrap();
+        super::ensure_private_file(&certificate).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(directory.path()), 0o700);
+        assert_eq!(mode(&certificate), 0o600);
     }
 
     #[test]

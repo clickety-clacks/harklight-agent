@@ -23,10 +23,16 @@ pub enum ConfigError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("identity directory must be private (mode 0700): {0}")]
-    DirectoryPermissions(PathBuf),
-    #[error("identity private key must be private (mode 0600): {0}")]
-    KeyPermissions(PathBuf),
+    #[error("could not make the identity directory private (mode 0700): {path}: {source}")]
+    DirectoryPermissions {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not make the identity private key private (mode 0600): {path}: {source}")]
+    KeyPermissions {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("server configuration does not match the enrolled CA")]
     CaMismatch,
     #[error("enrollment or server configuration is incomplete: {0}")]
@@ -69,7 +75,7 @@ pub struct EnrolledIdentity {
 
 impl EnrolledIdentity {
     pub fn load(directory: &Path, ca_file: &Path) -> Result<Self, ConfigError> {
-        check_private_directory(directory)?;
+        ensure_private_directory(directory)?;
 
         let server_path = directory.join("server.json");
         let server: ServerFile = read_json(&server_path)?;
@@ -89,7 +95,12 @@ impl EnrolledIdentity {
         let key_path = directory.join("identity.key");
         let key_metadata = fs::metadata(&key_path)?;
         if key_metadata.permissions().mode() & 0o077 != 0 {
-            return Err(ConfigError::KeyPermissions(key_path));
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).map_err(
+                |source| ConfigError::KeyPermissions {
+                    path: key_path.clone(),
+                    source,
+                },
+            )?;
         }
 
         let certificate_pem = fs::read(&certificate_path)?;
@@ -233,15 +244,67 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigError
 }
 
 #[cfg(unix)]
-fn check_private_directory(directory: &Path) -> Result<(), ConfigError> {
+fn ensure_private_directory(directory: &Path) -> Result<(), ConfigError> {
     let metadata = fs::metadata(directory)?;
     if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(ConfigError::DirectoryPermissions(directory.to_path_buf()));
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            ConfigError::DirectoryPermissions {
+                path: directory.to_path_buf(),
+                source,
+            }
+        })?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn check_private_directory(_directory: &Path) -> Result<(), ConfigError> {
+fn ensure_private_directory(_directory: &Path) -> Result<(), ConfigError> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use sha2::{Digest, Sha256};
+
+    use super::EnrolledIdentity;
+
+    #[test]
+    fn loading_an_identity_tightens_loose_directory_and_key_modes() {
+        let root = std::env::temp_dir().join(format!("harklight-config-{}", uuid::Uuid::new_v4()));
+        let identity = root.join("identity");
+        fs::create_dir_all(&identity).unwrap();
+        let ca = root.join("ca.pem");
+        fs::write(&ca, "ca pem\n").unwrap();
+        let ca_hash = hex::encode(Sha256::digest(b"ca pem\n"));
+        fs::write(
+            identity.join("server.json"),
+            format!(
+                r#"{{"address":"127.0.0.1","name":"example.test","port":18444,"origin_port":null,"ca_sha256":"{ca_hash}"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            identity.join("enrollment.json"),
+            r#"{"person_id":null,"device_id":"device"}"#,
+        )
+        .unwrap();
+        fs::write(identity.join("identity.pem"), "certificate pem\n").unwrap();
+        fs::write(identity.join("identity.key"), "private key pem\n").unwrap();
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            identity.join("identity.key"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        EnrolledIdentity::load(&identity, &ca).unwrap();
+
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&identity), 0o700);
+        assert_eq!(mode(&identity.join("identity.key")), 0o600);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
