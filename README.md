@@ -672,8 +672,11 @@ coverage; the origin listener updates its set on the server's coverage notice.
 The origin listener stays connected when no requests remain open. On reconnect,
 it offers still-pending entries again with their existing `delivered` and `acted`
 facts. Deduplicate by `event_id`; a feed cursor records fetch progress, not action
-completion. There is one local origin listener lease per enrollment state
-directory, independent of handle leases. A replacement connection for the same
+completion. The CLI takes no local lease for the origin listener, so several
+origin listeners may run against one enrollment state directory; they share one
+journal, which records each event and each operation key once and keeps a
+single `delivered` and `acted` fact per event when both listeners see it. Per-handle
+`listen` still holds a lease per handle. A replacement connection for the same
 enrollment makes the displaced listener exit with listener-active code 6 instead
 of reconnecting. An unsupported server produces exit code 5.
 

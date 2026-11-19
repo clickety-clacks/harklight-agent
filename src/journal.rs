@@ -911,15 +911,6 @@ impl JournalStore {
             .join(op_id.to_string())
     }
 
-    pub fn acquire_origin_listener(&mut self) -> Result<(), JournalError> {
-        self.listener_lock_path = self
-            .journal_path
-            .parent()
-            .expect("journal directory")
-            .join("origin.listener.lock");
-        self.acquire_listener()
-    }
-
     pub fn acquire_listener(&mut self) -> Result<(), JournalError> {
         if self.listener_lock.is_some() {
             return Ok(());
@@ -2697,24 +2688,81 @@ mod tests {
     }
 
     #[test]
-    fn origin_lease_is_exclusive_and_independent_of_handle_leases() {
+    fn origin_listeners_share_one_journal_and_record_each_event_once() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
-        let mut origin = open(&root, Uuid::nil());
-        origin.acquire_origin_listener().unwrap();
+        let mut first = open(&root, Uuid::nil());
         let mut second = open(&root, Uuid::nil());
-        assert!(matches!(
-            second.acquire_origin_listener(),
-            Err(JournalError::ListenerActive(_))
-        ));
-        let mut handle = open(&root, session);
-        handle.acquire_listener().unwrap();
-        handle.record_entry(entry(session, 1, "pending")).unwrap();
-        assert_eq!(origin.cursor().unwrap(), 1);
-        assert_eq!(origin.pending_for(session).unwrap().len(), 1);
-        drop(origin);
-        second.acquire_origin_listener().unwrap();
+
+        // Both listeners fetch the same feed entry; it is stored once.
+        assert!(first.record_entry(entry(session, 1, "hello")).unwrap());
+        assert!(!second.record_entry(entry(session, 1, "hello")).unwrap());
+        assert_eq!(first.cursor().unwrap(), 1);
         assert_eq!(second.pending_for(session).unwrap().len(), 1);
+
+        // Both see it pending; acking from either keeps one recorded fact.
+        first.mark_ack_pending("1").unwrap();
+        let pending_at = second
+            .entry_by_event("1")
+            .unwrap()
+            .unwrap()
+            .ack_pending_at_ms;
+        assert!(pending_at.is_some());
+        second.mark_ack_pending("1").unwrap();
+        assert_eq!(
+            first
+                .entry_by_event("1")
+                .unwrap()
+                .unwrap()
+                .ack_pending_at_ms,
+            pending_at
+        );
+
+        first.mark_delivered("1").unwrap();
+        let delivered_at = second.entry_by_event("1").unwrap().unwrap().delivered_at_ms;
+        assert!(delivered_at.is_some());
+        second.mark_delivered("1").unwrap();
+        assert_eq!(
+            first.entry_by_event("1").unwrap().unwrap().delivered_at_ms,
+            delivered_at
+        );
+        first.mark_acted("1").unwrap();
+        let acted_at = second.entry_by_event("1").unwrap().unwrap().acted_at_ms;
+        second.mark_acted("1").unwrap();
+        assert_eq!(
+            first.entry_by_event("1").unwrap().unwrap().acted_at_ms,
+            acted_at
+        );
+        assert!(first.pending_for(session).unwrap().is_empty());
+        assert!(second.pending_for(session).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reused_operation_key_returns_the_one_recorded_operation() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let op_id = Uuid::new_v4();
+        let request = json!({"v":1,"type":"ack","event_id":"1"});
+        let mut first = open(&root, session);
+        let mut second = open(&root, session);
+        let recorded = first
+            .prepare_operation(op_id, session, "ack".into(), request.clone())
+            .unwrap();
+        let again = second
+            .prepare_operation(op_id, session, "ack".into(), request)
+            .unwrap();
+        assert_eq!(recorded.created_at_ms, again.created_at_ms);
+        assert_eq!(first.operations_for_session(session).unwrap().len(), 1);
+        assert!(
+            second
+                .prepare_operation(
+                    op_id,
+                    session,
+                    "ack".into(),
+                    json!({"v":1,"type":"ack","event_id":"2"})
+                )
+                .is_err()
+        );
     }
 
     #[test]
