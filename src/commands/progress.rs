@@ -11,7 +11,6 @@ use uuid::Uuid;
 use super::{
     CommandContext, CommandError, EXIT_REFUSED, OperationTransport, emit_committed,
     ensure_request_open, journal_error, now_ms, request_context, submit_operation_with_transport,
-    validate_request_pre_upload,
 };
 use crate::files::{self, PreparedFiles, ServerFileLimits};
 use crate::journal::JournalStore;
@@ -234,10 +233,6 @@ fn update_with(
     });
     let prepared = preserved_files(transport, store, &snapshot, &request, session, op_id)?;
     command["files"] = Value::Array(prepared.entries);
-    if let Err(error) = validate_request_pre_upload(&command) {
-        files::cleanup_staged_uploads(&prepared.uploads);
-        return Err(error);
-    }
     let uploads = prepared.uploads;
     let operation =
         super::prepare_with_uploads(store, session, op_id, "revise", command, uploads.clone())

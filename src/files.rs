@@ -19,8 +19,6 @@ use crate::{
     journal::{FileTransfer, UploadSource},
 };
 
-pub const MAX_ORIGIN_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerFileLimits {
     pub inline_decoded_bytes_per_entry: u64,

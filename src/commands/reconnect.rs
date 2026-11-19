@@ -455,14 +455,6 @@ fn attach_locked(
 }
 
 fn open_locked(context: &CommandContext, session: Uuid) -> Result<JournalStore, Failure> {
-    if session.get_version() != Some(Version::Random) {
-        return Err(Failure::local(
-            "journal",
-            "invalid_handle",
-            "An existing UUIDv4 handle is required.",
-            EXIT_REFUSED,
-        ));
-    }
     let mut store = JournalStore::open_existing(&context.state_root, &context.device_id, session)
         .map_err(|e| {
         let exit = if matches!(e, JournalError::MissingOriginJournal) {

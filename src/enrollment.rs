@@ -214,7 +214,6 @@ pub fn start(
     origin_port: Option<u16>,
 ) -> Result<(), EnrollmentError> {
     let label = required(label, "--label")?;
-    validate_label(label)?;
     if origin_port == Some(0) {
         return Err(EnrollmentError::local("--origin-port must be nonzero"));
     }
@@ -260,7 +259,6 @@ pub fn retry(
     label: Option<&str>,
 ) -> Result<(), EnrollmentError> {
     let label = required(label, "--label")?;
-    validate_label(label)?;
     let context = make_context(identity_dir, ca_file, connect, tls_name, port)?;
     verify_existing_server(&context)?;
     resolve_before_mutation(&context.endpoint)?;
@@ -406,15 +404,6 @@ fn parse_endpoint(
 
 fn required<'a>(value: Option<&'a str>, option: &str) -> Result<&'a str, EnrollmentError> {
     value.ok_or_else(|| EnrollmentError::local(format!("provide required {option} input")))
-}
-
-fn validate_label(label: &str) -> Result<(), EnrollmentError> {
-    if !(1..=256).contains(&label.len()) {
-        return Err(EnrollmentError::local(
-            "--label must contain between 1 and 256 UTF-8 bytes",
-        ));
-    }
-    Ok(())
 }
 
 fn resolve_before_mutation(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, EnrollmentError> {
