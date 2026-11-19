@@ -3081,13 +3081,11 @@ fn ack2_request(
             EXIT_REFUSED,
         ));
     }
-    if let Some(reason) = not_handed {
-        if rerouted {
-            return Err(CommandError::new(
-                "--rerouted is valid only for a handed ACK2 outcome",
-                EXIT_REFUSED,
-            ));
-        }
+    if not_handed.is_some() && rerouted {
+        return Err(CommandError::new(
+            "--rerouted is valid only for a handed ACK2 outcome",
+            EXIT_REFUSED,
+        ));
     }
     let outcome = if not_handed.is_some() {
         "not_handed"
