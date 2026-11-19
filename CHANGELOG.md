@@ -10,6 +10,8 @@ This release intentionally breaks some command-line behaviour. Callers must upda
 - The Agent now checks request size client-side and refuses requests over 2 MiB before sending.
 - Removed the one-time migration of an old `origin-feed.json` journal. An Agent state directory that still holds an old `origin-feed.json` will no longer be migrated.
 - Removed the legacy capability path.
+- `--controller` is now refused where it would do nothing, restoring some refusals that were removed earlier in this release.
+- Removed the origin-wide listener lease. Several origin listeners may now run per enrollment, and a local lease no longer produces exit code 6.
 
 ## 0.1.14
 
