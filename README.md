@@ -448,7 +448,21 @@ harklight-agent retry --op-id "$HARKLIGHT_OP_ID"
 Feed receipt, stdout output and listener attachment do not prove that handoff.
 The CLI persists each operation before submission and reports uncertain
 outcomes; retry that operation with the same UUID key rather than creating a
-second action. A reply, revision, withdrawal or source result acts on the exact
+second action. An operation whose outcome stays unknown blocks new operations of
+its kind for the same request until it is retried. If you decide not to retry it,
+give it up explicitly:
+
+```sh
+harklight-agent abandon --op-id "$HARKLIGHT_OP_ID"
+```
+
+`abandon` marks that unresolved operation abandoned in the journal, so it stops
+blocking and can no longer be retried. The Server may or may not have applied it.
+Only an unresolved operation can be abandoned: a committed or refused one is
+refused, and abandoning an already abandoned one does nothing. Every other
+operation still deduplicates by its key.
+
+A reply, revision, withdrawal or source result acts on the exact
 person turn it names. A final answer does not close through local process exit;
 only a server terminal entry closes the request.
 An origin withdrawal is recorded as a `retracted` terminal entry. Retraction

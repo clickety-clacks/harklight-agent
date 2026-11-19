@@ -3884,6 +3884,25 @@ pub fn session_end(context: &CommandContext, session: Uuid) -> Result<(), Comman
     emit(&response)
 }
 
+/// Explicitly give up an operation stuck with an unknown outcome so it stops
+/// blocking new operations of its kind for the request.
+pub fn abandon(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> {
+    let mut store = context.open_global_store()?;
+    let operation = store.abandon_operation(op_id).map_err(|error| {
+        let code = match error {
+            JournalError::NotUnresolved { .. } => EXIT_REFUSED,
+            _ => 1,
+        };
+        journal_error(error, code)
+    })?;
+    emit(&json!({
+        "kind":"abandoned",
+        "operation":operation.kind,
+        "op_id":op_id,
+        "session_handle":operation.session_handle
+    }))
+}
+
 pub fn retry(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> {
     let mut store = context.open_global_store()?;
     let operation = store
@@ -10251,6 +10270,117 @@ mod tests {
             Err(error)
                 if error.exit_code == EXIT_OUTCOME_UNKNOWN
                     && error.message.contains(&op_id.to_string())
+        ));
+    }
+
+    fn reply_request(op_id: Uuid, text: &str) -> Value {
+        json!({
+            "v":1,
+            "type":"reply",
+            "op_id":op_id,
+            "sender_id":"app:example",
+            "message_id":"request-1",
+            "in_reply_to":"9",
+            "text":text
+        })
+    }
+
+    #[test]
+    fn abandoning_a_stuck_operation_unblocks_a_changed_operation_for_its_request() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let stuck = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        store
+            .prepare_operation(stuck, session, "reply".into(), reply_request(stuck, "done"))
+            .unwrap();
+        store.mark_operation_unknown(stuck).unwrap();
+
+        // While the outcome is unknown, a changed operation is blocked.
+        let changed = Uuid::new_v4();
+        let blocked = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "reply",
+            reply_request(changed, "different text"),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(blocked.exit_code, EXIT_OUTCOME_UNKNOWN);
+        assert!(blocked.message.contains(&stuck.to_string()));
+        assert!(matches!(
+            request_context(&store.snapshot().unwrap(), session, "request-1"),
+            Err(error) if error.exit_code == EXIT_OUTCOME_UNKNOWN
+        ));
+
+        let abandoned = store.abandon_operation(stuck).unwrap();
+        assert!(crate::journal::operation_is_abandoned(&abandoned));
+        // Abandoning again changes nothing.
+        store.abandon_operation(stuck).unwrap();
+
+        let proceeds = prepare_or_resume_operation(
+            &mut store,
+            session,
+            "reply",
+            reply_request(changed, "different text"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(proceeds.op_id, changed);
+        assert!(!matches!(
+            request_context(&store.snapshot().unwrap(), session, "request-1"),
+            Err(error) if error.exit_code == EXIT_OUTCOME_UNKNOWN
+                && error.message.contains(&stuck.to_string())
+        ));
+    }
+
+    #[test]
+    fn only_an_unresolved_operation_can_be_abandoned() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+
+        let committed = Uuid::new_v4();
+        store
+            .prepare_operation(
+                committed,
+                session,
+                "reply".into(),
+                reply_request(committed, "done"),
+            )
+            .unwrap();
+        store
+            .settle_operation(committed, json!({"type":"ok"}), None)
+            .unwrap();
+        assert!(matches!(
+            store.abandon_operation(committed),
+            Err(JournalError::NotUnresolved { .. })
+        ));
+        assert_eq!(
+            store.operation(committed).unwrap().unwrap().state,
+            OperationState::Committed
+        );
+
+        let refused = Uuid::new_v4();
+        store
+            .prepare_operation(
+                refused,
+                session,
+                "reply".into(),
+                reply_request(refused, "no"),
+            )
+            .unwrap();
+        store
+            .reject_operation(refused, json!({"type":"error","reason":"closed"}))
+            .unwrap();
+        assert!(matches!(
+            store.abandon_operation(refused),
+            Err(JournalError::NotUnresolved { .. })
+        ));
+
+        assert!(matches!(
+            store.abandon_operation(Uuid::new_v4()),
+            Err(JournalError::MissingOperation(_))
         ));
     }
 }
