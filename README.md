@@ -545,7 +545,8 @@ Attach files to a new request, reply or revision with `--file`:
 
 ```sh
 harklight-agent send --session new --sender-id app:example \
-  --route claude-code --title "Review these notes" --file ./notes.pdf
+  --route claude-code --type request --reply \
+  --title "Review these notes" --file ./notes.pdf
 harklight-agent revise --session "$HARKLIGHT_SESSION" \
   --request "$HARKLIGHT_REQUEST" --base-revision 1 \
   --title "Updated request" --file ./diagram.png
