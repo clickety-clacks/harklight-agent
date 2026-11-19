@@ -80,18 +80,17 @@ pub struct Journal {
 
 impl Journal {
     pub fn pending_for(&self, session_handle: Uuid) -> Vec<&JournalEntry> {
-        let closed_requests: std::collections::BTreeSet<_> = self
+        let mut closed_at: BTreeMap<_, u64> = BTreeMap::new();
+        for entry in self
             .entries
             .values()
             .filter(|entry| entry.kind == "terminal")
-            .filter_map(JournalEntry::request_key)
-            .collect();
-        let answered_requests: std::collections::BTreeSet<_> = self
-            .entries
-            .values()
-            .filter(|entry| entry.kind == "terminal" && entry.raw["terminal_state"] == "answered")
-            .filter_map(JournalEntry::request_key)
-            .collect();
+        {
+            if let Some(key) = entry.request_key() {
+                let latest = closed_at.entry(key).or_insert(entry.feed_seq);
+                *latest = (*latest).max(entry.feed_seq);
+            }
+        }
 
         self.entries
             .values()
@@ -99,8 +98,9 @@ impl Journal {
             .filter(|entry| entry.actionable && entry.acted_at_ms.is_none())
             .filter(|entry| match entry.kind.as_str() {
                 "discussion" => entry.request_key().is_none_or(|key| {
-                    !closed_requests.contains(&key)
-                        || (entry.raw["channel"] == "chat" && answered_requests.contains(&key))
+                    closed_at.get(&key).is_none_or(|terminal_seq| {
+                        entry.raw["channel"] == "chat" && entry.feed_seq > *terminal_seq
+                    })
                 }),
                 "terminal" if entry.raw["terminal_state"] != "answered" => {
                     entry.delivered_at_ms.is_none()
@@ -1608,19 +1608,22 @@ fn entry_pending_active(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<bo
             else {
                 return Ok(true);
             };
-            let terminal_state: Option<String> = tx
+            let terminal_seq: Option<String> = tx
                 .query_row(
-                    "SELECT terminal_state FROM entries
+                    "SELECT feed_seq FROM entries
                      WHERE session_handle=?1 AND sender_id=?2 AND request_id=?3 AND kind='terminal'
                      ORDER BY feed_seq DESC LIMIT 1",
                     params![entry.session_handle.to_string(), sender_id, request_id],
                     |row| row.get(0),
                 )
                 .optional()?;
-            Ok(match terminal_state.as_deref() {
+            // Chat stays open after any terminal outcome; a chat message that
+            // arrived before the terminal was closed by it.
+            Ok(match terminal_seq {
                 None => true,
-                Some("answered") => entry.raw["channel"] == "chat",
-                Some(_) => false,
+                Some(terminal_seq) => {
+                    entry.raw["channel"] == "chat" && encode_sequence(entry.feed_seq) > terminal_seq
+                }
             })
         }
         "terminal" if entry.raw["terminal_state"] == "answered" => Ok(true),
@@ -2817,6 +2820,48 @@ mod tests {
     }
 
     #[test]
+    fn chat_after_any_terminal_still_surfaces_but_reply_channel_discussion_does_not() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = open(&root, session);
+        let discussion = |seq: u64, channel: &str| {
+            let mut item = entry(session, seq, channel);
+            item.raw["channel"] = json!(channel);
+            item
+        };
+        let terminal = |seq: u64, state: &str| {
+            let mut item = entry(session, seq, "terminal");
+            item.kind = "terminal".into();
+            item.actionable = false;
+            item.raw["kind"] = json!("terminal");
+            item.raw["terminal_state"] = json!(state);
+            item
+        };
+        store.record_entry(discussion(1, "chat")).unwrap();
+        store.record_entry(terminal(2, "retracted")).unwrap();
+        // The terminal closes what was pending before it.
+        assert!(store.pending_for(session).unwrap().is_empty());
+        store.record_entry(discussion(3, "chat")).unwrap();
+        store.record_entry(discussion(4, "reply")).unwrap();
+
+        let pending: Vec<_> = store
+            .pending_for(session)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.event_id)
+            .collect();
+        assert_eq!(pending, vec!["3".to_string()]);
+        let snapshot: Vec<_> = store
+            .snapshot()
+            .unwrap()
+            .pending_for(session)
+            .into_iter()
+            .map(|entry| entry.event_id.clone())
+            .collect();
+        assert_eq!(snapshot, pending);
+    }
+
+    #[test]
     fn listener_lease_blocks_only_another_listener() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
@@ -2983,7 +3028,7 @@ mod tests {
     }
 
     #[test]
-    fn post_answer_chat_stays_pending_and_non_answer_terminals_still_close_chat() {
+    fn post_terminal_chat_stays_pending_for_every_terminal_outcome() {
         for terminal_kind in [None, Some("no_comment")] {
             let root = Scratch::new();
             let session = Uuid::new_v4();
@@ -3016,7 +3061,10 @@ mod tests {
         let mut chat = entry(session, 2, "chat after expiry");
         chat.raw["channel"] = json!("chat");
         store.record_entry(chat).unwrap();
-        assert!(store.snapshot().unwrap().pending_for(session).is_empty());
+        let snapshot = store.snapshot().unwrap();
+        let pending = snapshot.pending_for(session);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, "2");
     }
 
     #[test]
