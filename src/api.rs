@@ -287,7 +287,6 @@ pub enum OriginNotice {
     AdvisoryChange { session_handle: Uuid, cursor: u64 },
     AdvisoryUnavailable,
     Coverage,
-    Replaced,
     FocusChange(Value),
 }
 
@@ -371,7 +370,6 @@ impl<R: BufRead> SseDecoder<R> {
                         Some(notice)
                     }
                     "coverage" => Some(OriginNotice::Coverage),
-                    "replaced" => Some(OriginNotice::Replaced),
                     "focus_change" if !self.data.is_empty() => {
                         let value = serde_json::from_str::<Value>(&data)
                             .map_err(|_| ApiError::InvalidNotice(data.clone()))?;
@@ -450,7 +448,7 @@ mod tests {
     fn origin_notices_preserve_control_events() {
         let session = Uuid::new_v4();
         let frames = format!(
-            "event: coverage\ndata: {{}}\n\nevent: change\ndata: {{\"cursor\":7}}\n\nevent: advisory_change\ndata: {{\"session_handle\":\"{session}\",\"advisory_cursor\":3}}\n\nevent: replaced\ndata: {{}}\n\n"
+            "event: coverage\ndata: {{}}\n\nevent: change\ndata: {{\"cursor\":7}}\n\nevent: advisory_change\ndata: {{\"session_handle\":\"{session}\",\"advisory_cursor\":3}}\n\n"
         );
         let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
         assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Coverage);
@@ -462,7 +460,13 @@ mod tests {
                 cursor: 3
             }
         );
-        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Replaced);
+    }
+
+    #[test]
+    fn unrecognized_events_are_skipped_rather_than_ending_the_stream() {
+        let frames = "event: replaced\ndata: {}\n\nevent: change\ndata: {\"cursor\":9}\n\n";
+        let mut decoder = SseDecoder::new(Cursor::new(frames.as_bytes()));
+        assert_eq!(decoder.next_notice().unwrap(), OriginNotice::Change(9));
     }
 
     #[test]

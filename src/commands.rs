@@ -4126,13 +4126,10 @@ pub fn listen(
                     reconnect_delay = reconnect_delay.saturating_mul(2).min(max_reconnect_delay);
                     continue;
                 }
-                Err(ApiError::Refused(reason)) if reason.contains("already_listening") => {
-                    return Err(CommandError::new(
-                        "origin session already has a server listener attached",
-                        EXIT_LISTENER_ACTIVE,
-                    ));
+                Err(error) => {
+                    let exit = reconnect::stream_open_exit(&error);
+                    return Err(api_error(error, exit));
                 }
-                Err(error) => return Err(api_error(error, EXIT_LISTENER_ACTIVE)),
             };
 
         let status = match refresh_listener_state(context, &mut store, session) {
@@ -4317,12 +4314,6 @@ pub fn listen(
                     );
                 }
                 Ok(OriginNotice::Coverage | OriginNotice::FocusChange(_)) => {}
-                Ok(OriginNotice::Replaced) => {
-                    return Err(CommandError::new(
-                        "origin session listener replaced",
-                        EXIT_LISTENER_ACTIVE,
-                    ));
-                }
                 Err(ApiError::StreamEnded | ApiError::StreamIo(_)) => break,
                 Err(error) => return Err(api_error(error, 1)),
             }
@@ -4391,7 +4382,6 @@ fn advisory_stream_unavailable(error: &ApiError) -> bool {
                 | "invalid_session"
                 | "session_mismatch"
                 | "gone"
-                | "already_listening"
         ),
         _ => false,
     }

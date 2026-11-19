@@ -197,13 +197,7 @@ fn advisory_unavailable(reason: &'static str) -> Result<bool, CommandError> {
 fn advisory_refusal_is_auth_or_session(reason: &str) -> bool {
     matches!(
         reason,
-        "forbidden"
-            | "revoked"
-            | "unauthorized"
-            | "invalid_session"
-            | "session_mismatch"
-            | "already_listening"
-            | "gone"
+        "forbidden" | "revoked" | "unauthorized" | "invalid_session" | "session_mismatch" | "gone"
     ) || reason.contains("auth")
         || reason.contains("session")
         || reason.contains("revoked")

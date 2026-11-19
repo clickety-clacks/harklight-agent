@@ -31,10 +31,6 @@ impl SafeReason {
 
     pub(super) fn server(reason: &str) -> Self {
         let (code, text) = match reason {
-            "already_listening" => (
-                "already_listening",
-                "The origin handle already has a registered stream.",
-            ),
             "not_found" => ("not_found", "The server did not find this origin handle."),
             "forbidden" => ("forbidden", "The server refused this origin's access."),
             "revoked" => (
@@ -233,11 +229,8 @@ pub fn reconnect_configuration_error(session: Uuid, operation: &str) -> CommandE
 /// A refused stream open exits as refused, not as a transport failure; the
 /// revoked refusal arrives as a plain HTTP error envelope rather than an SSE
 /// content-type mismatch, so it is recognized by its stated reason.
-fn stream_open_exit(error: &ApiError) -> i32 {
-    if matches!(error, ApiError::Refused(reason) if reason == "already_listening") {
-        EXIT_LISTENER_ACTIVE
-    } else if matches!(error, ApiError::Refused(_))
-        || error.refusal_reason().as_deref() == Some("revoked")
+pub(super) fn stream_open_exit(error: &ApiError) -> i32 {
+    if matches!(error, ApiError::Refused(_)) || error.refusal_reason().as_deref() == Some("revoked")
     {
         EXIT_REFUSED
     } else {
@@ -575,19 +568,9 @@ fn reconnect_inner(
     // The stream is open before catch-up, so changes during startup remain
     // observable. The initial hint is only a trigger; both durable cursors
     // come from their respective feeds.
-    if matches!(
-        stream
-            .next_notice()
-            .map_err(|e| Failure::command("stream", api_error(e, 1)))?,
-        OriginNotice::Replaced
-    ) {
-        return Err(Failure::local(
-            "stream",
-            "listener_replaced",
-            "The origin session listener was replaced.",
-            EXIT_LISTENER_ACTIVE,
-        ));
-    }
+    stream
+        .next_notice()
+        .map_err(|e| Failure::command("stream", api_error(e, 1)))?;
     fetch_feed(context, &mut store).map_err(|e| Failure::command("feed", e))?;
     if advisory_stream {
         match fetch_advisories(context, &mut store, session) {
@@ -684,14 +667,6 @@ fn reconnect_inner(
                 );
             }
             OriginNotice::Coverage | OriginNotice::FocusChange(_) => continue,
-            OriginNotice::Replaced => {
-                return Err(Failure::local(
-                    "stream",
-                    "listener_replaced",
-                    "The origin session listener was replaced.",
-                    EXIT_LISTENER_ACTIVE,
-                ));
-            }
         }
         let status = read_status(context, session).map_err(|e| Failure::command("feed", e))?;
         emit_pending(&mut store, session, true, &mut offered)

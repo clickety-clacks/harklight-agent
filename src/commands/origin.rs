@@ -111,12 +111,6 @@ pub fn listen_origin(context: &CommandContext) -> Result<(), CommandError> {
                     Some(OriginNotice::AdvisoryChange { .. }) => {}
                     Some(OriginNotice::AdvisoryUnavailable) => {}
                     Some(OriginNotice::FocusChange(_)) => {}
-                    Some(OriginNotice::Replaced) => {
-                        return Err(CommandError::new(
-                            "origin listener replaced",
-                            EXIT_LISTENER_ACTIVE,
-                        ));
-                    }
                 }
                 // A shared reader can advance the cursor; emission remains independent of fetching.
                 emit_covered(&mut store, &covered, &mut offered)

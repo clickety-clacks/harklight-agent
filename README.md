@@ -696,9 +696,8 @@ completion. The CLI takes no local lease for the origin listener, so several
 origin listeners may run against one enrollment state directory; they share one
 journal, which records each event and each operation key once and keeps a
 single `delivered` and `acted` fact per event when both listeners see it. Per-handle
-`listen` still holds a lease per handle. A replacement connection for the same
-enrollment makes the displaced listener exit with listener-active code 6 instead
-of reconnecting. An unsupported server produces exit code 5.
+`listen` still holds a lease per handle. An unsupported server produces exit
+code 5.
 
 The scope is the enrolled identity, including conversations it opened through its
 granted senders. Separate systems that need separate aggregation use separate
