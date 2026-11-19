@@ -1132,7 +1132,14 @@ fn prepare_outgoing_files_with_lookup(
 fn validate_send_route(
     session_arg: &str,
     route: Option<OriginHarness>,
+    controller: bool,
 ) -> Result<Option<OriginHarness>, CommandError> {
+    if controller && route != Some(OriginHarness::Other) {
+        return Err(CommandError::new(
+            "--controller applies only to --route other",
+            EXIT_REFUSED,
+        ));
+    }
     if session_arg == "new" && route.is_none() {
         return Err(CommandError::new(
             "--route is required when minting a new session handle",
@@ -1704,7 +1711,7 @@ pub fn send_with_fields(
     files: &[PathBuf],
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
-    let route = validate_send_route(session_arg, route)?;
+    let route = validate_send_route(session_arg, route, controller)?;
     let (message_type, normalized) = validate_send_options(choices, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
@@ -2011,7 +2018,7 @@ pub fn prepare_send_with_fields(
     let (message_type, normalized) = validate_send_options(choices, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
-    let route = validate_send_route(session_arg, route)?;
+    let route = validate_send_route(session_arg, route, controller)?;
     let global = context.open_global_store()?;
 
     if let Some(existing) = global
@@ -2694,6 +2701,12 @@ pub fn attach_with_origin(
     ack2: bool,
     origin_listener: bool,
 ) -> Result<(), CommandError> {
+    if controller && route != OriginHarness::Other {
+        return Err(CommandError::new(
+            "--controller applies only to --route other",
+            EXIT_REFUSED,
+        ));
+    }
     if controller {
         return reconnect::controller_attach(
             context,
@@ -3966,6 +3979,12 @@ pub fn listen(
     controller: bool,
     ack2: bool,
 ) -> Result<(), CommandError> {
+    if controller && !follow {
+        return Err(CommandError::new(
+            "--controller requires listen --follow",
+            EXIT_REFUSED,
+        ));
+    }
     let mut store = context.open_store(session)?;
     store.acquire_listener().map_err(|error| {
         let code = if matches!(
@@ -4014,6 +4033,12 @@ pub fn listen(
             "listen",
             "the current server route differs from the confirmed local attach; run attach again before listening",
         );
+    }
+    if controller && route != OriginHarness::Other {
+        return Err(CommandError::new(
+            "--controller requires a session declared with route other",
+            EXIT_REFUSED,
+        ));
     }
     let flags = listener_support_flags(&current_status, route, controller, ack2);
     let unsupported_reason = listener_unsupported_reason(
@@ -8194,19 +8219,38 @@ mod tests {
     }
 
     #[test]
-    fn route_is_required_when_minting_a_session_handle() {
+    fn route_is_required_when_minting_and_controller_needs_route_other() {
         assert!(matches!(
-            validate_send_route("new", None),
+            validate_send_route("new", None, false),
             Err(error) if error.exit_code == EXIT_REFUSED
         ));
         assert_eq!(
-            validate_send_route("new", Some(OriginHarness::ClaudeCode)).unwrap(),
+            validate_send_route("new", Some(OriginHarness::ClaudeCode), false).unwrap(),
             Some(OriginHarness::ClaudeCode)
         );
         assert_eq!(
-            validate_send_route(&Uuid::new_v4().to_string(), None).unwrap(),
+            validate_send_route(&Uuid::new_v4().to_string(), None, false).unwrap(),
             None
         );
+        assert_eq!(
+            validate_send_route("new", Some(OriginHarness::Other), true).unwrap(),
+            Some(OriginHarness::Other)
+        );
+        let existing = Uuid::new_v4().to_string();
+        assert_eq!(
+            validate_send_route(&existing, Some(OriginHarness::Other), true).unwrap(),
+            Some(OriginHarness::Other)
+        );
+        for (session, route) in [
+            ("new", Some(OriginHarness::ClaudeCode)),
+            ("new", Some(OriginHarness::Codex)),
+            (existing.as_str(), None),
+            (existing.as_str(), Some(OriginHarness::ClaudeCode)),
+        ] {
+            let error = validate_send_route(session, route, true).unwrap_err();
+            assert_eq!(error.exit_code, EXIT_REFUSED);
+            assert_eq!(error.message, "--controller applies only to --route other");
+        }
     }
 
     #[test]

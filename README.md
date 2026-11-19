@@ -480,7 +480,10 @@ harklight-agent send --session new --sender-id app:example \
 harklight-agent listen --follow --controller --session "$HARKLIGHT_SESSION"
 ```
 
-Declaring `--controller` is this harness's own statement that it runs and
+`--controller` applies only to `--route other` (on `send`, `attach` and `listen`)
+and, on `listen`, only with `--follow`; otherwise it is refused before any
+network call, because it would do nothing or record support with no supervised
+listener behind it. Declaring `--controller` is this harness's own statement that it runs and
 supervises that `--follow` process; the CLI records the arm as supported on that basis alone. It still has no
 built-in knowledge of this harness's delivery contract and makes no stronger
 claim than for Claude Code or Codex.
