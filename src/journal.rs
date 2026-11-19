@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod progress_files;
+pub(crate) use progress_files::is_progress;
+
 #[derive(Debug, Error)]
 pub enum JournalError {
     #[error("the enrolled origin has no existing local journal")]
@@ -366,6 +369,7 @@ impl JournalStore {
             listener_lock: None,
         };
         store.initialize()?;
+        store.maintain_progress_material(session_handle)?;
         Ok(store)
     }
 
@@ -983,7 +987,9 @@ impl JournalStore {
     }
 
     pub fn record_entry(&mut self, entry: JournalEntry) -> Result<bool, JournalError> {
-        self.with_transaction(|tx| {
+        let session = entry.session_handle;
+        let request_id = entry.request_id.clone();
+        let result = self.with_transaction(|tx| {
             let cursor = read_cursor(tx)?;
             if entry.feed_seq <= cursor {
                 let mut existing =
@@ -1027,7 +1033,13 @@ impl JournalStore {
             write_cursor(tx, entry.feed_seq)?;
             reconcile_own_entry(tx, &entry)?;
             Ok(true)
-        })
+        });
+        if result.is_ok() {
+            if let Some(request_id) = request_id {
+                let _ = self.prune_progress_request(session, &request_id);
+            }
+        }
+        result
     }
 
     pub fn mark_emitted(&mut self, event_id: &str) -> Result<(), JournalError> {
@@ -1289,18 +1301,20 @@ impl JournalStore {
         acted_event_id: Option<&str>,
     ) -> Result<(), JournalError> {
         let acted_event_id = acted_event_id.map(str::to_owned);
-        self.with_transaction(|tx| {
+        let result = self.with_transaction(|tx| {
             let mut operation =
                 read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
             let session = operation.session_handle;
             operation.state = OperationState::Committed;
             operation.updated_at_ms = now_ms();
-            operation.request = redact_file_payloads(&operation.request);
-            redact_prepared_send(&mut operation);
-            operation.response = Some(redact_file_payloads(&response));
-            for upload in &mut operation.uploads {
-                upload.staged_path = None;
+            if !is_progress(&operation.request["message"]) {
+                operation.request = redact_file_payloads(&operation.request);
+                redact_prepared_send(&mut operation);
+                for upload in &mut operation.uploads {
+                    upload.staged_path = None;
+                }
             }
+            operation.response = Some(redact_file_payloads(&response));
             write_operation(tx, &operation)?;
             if let Some(event_id) = acted_event_id {
                 let mut entry = read_entry_by_event(tx, &event_id)?
@@ -1315,21 +1329,42 @@ impl JournalStore {
                 write_entry(tx, &entry)?;
             }
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.maintain_operation_progress(op_id);
+        }
+        result
     }
 
     pub fn reject_operation(&mut self, op_id: Uuid, response: Value) -> Result<(), JournalError> {
-        self.update_operation(op_id, |operation| {
+        let result = self.update_operation(op_id, |operation| {
             operation.state = OperationState::Rejected;
             operation.updated_at_ms = now_ms();
             operation.request = redact_file_payloads(&operation.request);
             redact_prepared_send(operation);
             operation.response = Some(redact_file_payloads(&response));
-            for upload in &mut operation.uploads {
-                upload.staged_path = None;
+            if !is_progress(&operation.request["message"]) {
+                for upload in &mut operation.uploads {
+                    upload.staged_path = None;
+                }
             }
             Ok(true)
-        })
+        });
+        if result.is_ok() {
+            self.maintain_operation_progress(op_id);
+        }
+        result
+    }
+
+    fn maintain_operation_progress(&self, op_id: Uuid) {
+        if let Ok(Some(op)) = self.operation(op_id) {
+            if let Some(id) = op.request["message"]["message_id"]
+                .as_str()
+                .or_else(|| op.request["message_id"].as_str())
+            {
+                let _ = self.prune_progress_request(op.session_handle, id);
+            }
+        }
     }
 }
 
@@ -1417,7 +1452,7 @@ fn migrate_request_indexes(connection: &mut Connection) -> Result<(), JournalErr
     Ok(())
 }
 
-fn operation_request_revision(operation: &OperationRecord) -> Option<i64> {
+pub(crate) fn operation_request_revision(operation: &OperationRecord) -> Option<i64> {
     let revision = match operation.kind.as_str() {
         "send" => Some(1),
         "revise" => operation
@@ -1860,8 +1895,10 @@ fn reconcile_own_entry(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<boo
         let mut operation = matching.remove(0);
         operation.state = OperationState::Committed;
         operation.updated_at_ms = now_ms();
-        operation.request = redact_file_payloads(&operation.request);
-        redact_prepared_send(&mut operation);
+        if !is_progress(&operation.request["message"]) {
+            operation.request = redact_file_payloads(&operation.request);
+            redact_prepared_send(&mut operation);
+        }
         operation.response = Some(serde_json::json!({
             "v":1,
             "type":"ok",

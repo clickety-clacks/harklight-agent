@@ -10,9 +10,10 @@ use uuid::Uuid;
 
 use super::{
     CommandContext, CommandError, EXIT_REFUSED, OperationTransport, emit_committed,
-    ensure_request_open, journal_error, now_ms, prepare, request_context,
-    submit_operation_with_transport, validate_request_pre_upload,
+    ensure_request_open, journal_error, now_ms, request_context, submit_operation_with_transport,
+    validate_request_pre_upload,
 };
+use crate::files::{self, PreparedFiles, ServerFileLimits};
 use crate::journal::JournalStore;
 
 /// One progress report: the caller's complete input for a send or update.
@@ -180,6 +181,24 @@ fn update_with(
     now: u64,
 ) -> Result<Value, CommandError> {
     report.validate()?;
+    // Never stage into an existing operation's directory. Keep the exit class
+    // callers already rely on: an unresolved key means "retry it", and a
+    // settled key is the same conflict the ordinary submit path reports.
+    if let Some(existing) = store.operation(op_id).map_err(|e| journal_error(e, 1))? {
+        if matches!(
+            existing.state,
+            crate::journal::OperationState::Prepared | crate::journal::OperationState::Unknown
+        ) {
+            return Err(CommandError::new(
+                format!("request has unresolved operation {op_id}; retry it before continuing"),
+                super::EXIT_OUTCOME_UNKNOWN,
+            ));
+        }
+        return Err(journal_error(
+            crate::journal::JournalError::OperationConflict(op_id),
+            1,
+        ));
+    }
     let snapshot = store
         .request_snapshot(session, message_id, None)
         .map_err(|error| journal_error(error, 1))?;
@@ -204,7 +223,7 @@ fn update_with(
     message["sender_id"] = Value::String(request.sender_id.clone());
     message["message_id"] = Value::String(request.message_id.clone());
 
-    let command = json!({
+    let mut command = json!({
         "v":1,
         "type":"revise",
         "op_id":op_id.to_string(),
@@ -213,9 +232,111 @@ fn update_with(
         "base_revision":request.revision,
         "message":message
     });
-    validate_request_pre_upload(&command)?;
-    let operation = prepare(store, session, op_id, "revise", command)?;
+    let prepared = preserved_files(transport, store, &snapshot, &request, session, op_id)?;
+    command["files"] = Value::Array(prepared.entries);
+    if let Err(error) = validate_request_pre_upload(&command) {
+        files::cleanup_staged_uploads(&prepared.uploads);
+        return Err(error);
+    }
+    let uploads = prepared.uploads;
+    let operation =
+        super::prepare_with_uploads(store, session, op_id, "revise", command, uploads.clone())
+            .map_err(|error| {
+                if store.operation(op_id).ok().flatten().is_none() {
+                    files::cleanup_staged_uploads(&uploads);
+                }
+                error
+            })?;
     submit_operation_with_transport(transport, store, operation)
+}
+
+fn preserved_files(
+    transport: &impl OperationTransport,
+    store: &JournalStore,
+    snapshot: &crate::journal::Journal,
+    request: &super::RequestContext,
+    session: Uuid,
+    op_id: Uuid,
+) -> Result<PreparedFiles, CommandError> {
+    let unavailable = |reason: String| {
+        CommandError::new(
+            format!(
+                "cannot prepare a Progress update: current revision file bytes are unavailable ({reason}); no update was sent"
+            ),
+            EXIT_REFUSED,
+        )
+    };
+    let entries = request
+        .files
+        .as_array()
+        .ok_or_else(|| unavailable("invalid retained manifest".into()))?;
+    let identity = files::retained_manifest(entries).map_err(&unavailable)?;
+    let mut captured = entries.clone();
+    let mut sources = vec![];
+    // A feed snapshot wins a same-revision tie for message content. Only a
+    // matching committed operation of THAT revision can supply absent bytes.
+    for op in snapshot.operations.values().filter(|op| {
+        op.state == crate::journal::OperationState::Committed
+            && op.session_handle == session
+            && op.request["message"]["sender_id"] == request.sender_id
+            && op.request["message"]["message_id"] == request.message_id
+            && crate::journal::operation_request_revision(op)
+                == i64::try_from(request.revision).ok()
+    }) {
+        let empty = vec![];
+        let prior = match op.request.get("files") {
+            None => &empty,
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| unavailable("invalid operation manifest".into()))?,
+        };
+        if files::retained_manifest(prior).ok().as_ref() != Some(&identity)
+            || !entries.iter().zip(prior).all(|(a, b)| {
+                a.get("upload_id")
+                    .is_none_or(|id| b.get("upload_id") == Some(id))
+            })
+        {
+            return Err(unavailable("same-revision manifests disagree".into()));
+        }
+        for (file, original) in captured.iter_mut().zip(prior) {
+            if file.get("data_base64").is_none() && original.get("data_base64").is_some() {
+                *file = original.clone();
+            }
+        }
+        sources = op.uploads.clone();
+    }
+    if entries.is_empty() {
+        return Ok(PreparedFiles {
+            entries: vec![],
+            uploads: vec![],
+            manifest: vec![],
+        });
+    }
+    // Validate availability before even consulting limits. Fingerprints alone
+    // are not source bytes, and a former upload ID is not new upload authority.
+    for (file, identity) in captured.iter().zip(&identity) {
+        if file.get("data_base64").is_none()
+            && !sources.iter().any(|source| {
+                source.name == identity.name
+                    && source.size_bytes == identity.size_bytes
+                    && source.sha256 == identity.sha256
+                    && source.staged_path.is_some()
+            })
+        {
+            return Err(unavailable(identity.name.clone()));
+        }
+    }
+    let response = transport
+        .post(&json!({"v":1,"type":"file_limits"}))
+        .map_err(|error| unavailable(error.to_string()))?;
+    let limits = ServerFileLimits::from_response(&response).map_err(&unavailable)?;
+    files::prepare_retained(
+        &captured,
+        &sources,
+        &limits,
+        &store.upload_staging_directory(session, op_id),
+    )
+    .map_err(unavailable)
 }
 
 /// RFC 3339 UTC with millisecond precision, e.g. `2026-11-09T10:00:00.000Z`.
@@ -250,9 +371,13 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 mod tests {
     use std::{collections::VecDeque, path::Path, sync::Mutex};
 
-    use super::super::{MessageFieldOptions, build_send_request_with_fields};
+    use super::super::{MessageFieldOptions, build_send_request_with_fields, prepare};
     use super::*;
     use crate::api::ApiError;
+    use crate::files::{self, ServerFileLimits};
+    use crate::journal::{JournalEntry, OperationState};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha256};
 
     const SENDER: &str = "app:example";
     const MESSAGE: &str = "progress-1";
@@ -279,6 +404,7 @@ mod tests {
     struct Origin {
         posts: Mutex<Vec<Value>>,
         answers: Mutex<VecDeque<Result<Value, ApiError>>>,
+        uploads: Mutex<Vec<Value>>,
     }
 
     impl Origin {
@@ -286,6 +412,7 @@ mod tests {
             Self {
                 posts: Mutex::new(Vec::new()),
                 answers: Mutex::new(VecDeque::new()),
+                uploads: Mutex::new(Vec::new()),
             }
         }
 
@@ -301,6 +428,11 @@ mod tests {
 
     impl OperationTransport for Origin {
         fn post(&self, request: &Value) -> Result<Value, ApiError> {
+            if request["type"] == "file_limits" {
+                return Ok(
+                    json!({"type":"ok","inline_decoded_bytes_per_entry":262144,"upload_cap_bytes_per_file":"none"}),
+                );
+            }
             let mut posts = self.posts.lock().unwrap();
             posts.push(request.clone());
             let revision = posts.len() as u64;
@@ -313,15 +445,24 @@ mod tests {
 
         fn upload_file(
             &self,
-            _op_id: Uuid,
-            _sender_id: &str,
-            _message_id: &str,
-            _request_revision: u64,
-            _name: &str,
-            _path: &Path,
-            _size: u64,
+            op_id: Uuid,
+            sender: &str,
+            message: &str,
+            revision: u64,
+            name: &str,
+            path: &Path,
+            size: u64,
         ) -> Result<Value, ApiError> {
-            unreachable!("Progress messages carry no files")
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes.len() as u64, size);
+            let response = json!({"type":"ok","name":name,"size":size,
+                "sha256":hex::encode(Sha256::digest(bytes)),"upload_id":Uuid::new_v4().to_string()});
+            self.uploads
+                .lock()
+                .unwrap()
+                .push(json!({"op_id":op_id.to_string(),"sender_id":sender,
+                "message_id":message,"revision":revision,"response":response}));
+            Ok(response)
         }
     }
 
@@ -389,6 +530,616 @@ mod tests {
     }
 
     const T0: u64 = 1_794_214_800_000; // 2026-11-09T09:00:00.000Z
+
+    fn send_file(
+        origin: &Origin,
+        store: &mut JournalStore,
+        session: Uuid,
+        root: &Path,
+        uploaded: bool,
+    ) -> Uuid {
+        let path = root.join("input.bin");
+        std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+        let op = Uuid::new_v4();
+        let prepared = files::prepare_outgoing(
+            &[path],
+            &ServerFileLimits {
+                inline_decoded_bytes_per_entry: if uploaded { 0 } else { 262144 },
+                upload_cap_bytes_per_file: None,
+            },
+            &store.upload_staging_directory(session, op),
+        )
+        .unwrap();
+        let fields = MessageFieldOptions {
+            message_type: Some("fyi".into()),
+            progress: Some(report(10, "coding", Some("first"))),
+            ..Default::default()
+        };
+        let mut request = build_send_request_with_fields(
+            op,
+            session,
+            MESSAGE,
+            SENDER,
+            "Keep title",
+            Some("Keep body"),
+            &[],
+            false,
+            None,
+            None,
+            false,
+            &prepared.entries,
+            &fields,
+        )
+        .unwrap();
+        request["message"]["extra"] = json!({"keep":[1,"two"]});
+        request["message"]["urgency"] = json!("high");
+        request["message"]["thread"] = json!("release");
+        request["message"]["progress"] = initial_progress(fields.progress.as_ref().unwrap(), T0);
+        let operation = super::super::prepare_with_uploads(
+            store,
+            session,
+            op,
+            "send",
+            request,
+            prepared.uploads,
+        )
+        .unwrap();
+        submit_operation_with_transport(origin, store, operation).unwrap();
+        op
+    }
+
+    fn revision_entry(
+        session: Uuid,
+        seq: u64,
+        revision: u64,
+        message: Value,
+        files: Value,
+    ) -> JournalEntry {
+        JournalEntry::fetched(
+            seq,
+            seq.to_string(),
+            session,
+            "revision".into(),
+            "origin".into(),
+            false,
+            Some(SENDER.into()),
+            Some(MESSAGE.into()),
+            Some(revision),
+            json!({"kind":"revision","author":"origin",
+                "sender_id":SENDER,"message_id":MESSAGE,"request_revision":revision,"message":message,"files":files}),
+        )
+    }
+
+    #[test]
+    fn inline_files_survive_revisions_unknown_replay_and_reference_cleanup() {
+        file_preservation_case(false);
+    }
+
+    #[test]
+    fn uploaded_files_survive_revisions_unknown_replay_and_reference_cleanup() {
+        file_preservation_case(true);
+    }
+
+    fn file_preservation_case(uploaded: bool) {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let origin = Origin::new();
+        let first = send_file(&origin, &mut store, session, &scratch.0, uploaded);
+        let original = origin.last_post();
+        let first_op = store.operation(first).unwrap().unwrap();
+        let old_path = first_op.uploads.first().and_then(|u| u.staged_path.clone());
+        if let Some(path) = &old_path {
+            assert!(path.exists());
+        }
+        // The caller's mutable input is no longer the authoritative source.
+        std::fs::write(scratch.0.join("input.bin"), [9, 9]).unwrap();
+        let second = Uuid::new_v4();
+        update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "review", Some("second")),
+            second,
+            T0 + 1,
+        )
+        .unwrap();
+        let wire = origin.last_post();
+        assert_eq!(wire["base_revision"], 1);
+        assert_eq!(wire["op_id"], second.to_string());
+        assert!(
+            wire.get("files").is_some(),
+            "Progress revise omitted the current file manifest"
+        );
+        assert_eq!(wire["files"].as_array().unwrap().len(), 1);
+        let mut before = original["message"].clone();
+        let mut after = wire["message"].clone();
+        for key in ["progress", "created_at"] {
+            before.as_object_mut().unwrap().remove(key);
+            after.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(before, after);
+        assert_eq!(
+            wire["message"]["progress"]["segments"][0],
+            original["message"]["progress"]["segments"][0]
+        );
+        assert_eq!(
+            wire["message"]["progress"]["segments"][1]["visit_at"],
+            rfc3339_utc(T0 + 1)
+        );
+        if uploaded {
+            assert_ne!(
+                wire["files"][0]["upload_id"],
+                original["files"][0]["upload_id"]
+            );
+            let uploads = origin.uploads.lock().unwrap();
+            assert_eq!(uploads[1]["op_id"], second.to_string());
+            assert_eq!(uploads[1]["revision"], 2);
+            assert_eq!(uploads[1]["sender_id"], SENDER);
+            assert_eq!(uploads[1]["message_id"], MESSAGE);
+            assert_eq!(
+                wire["files"][0]["sha256"],
+                hex::encode(Sha256::digest([1, 2, 3, 4]))
+            );
+        } else {
+            assert_eq!(wire["files"], original["files"]);
+        }
+        if let Some(path) = &old_path {
+            assert!(!path.exists());
+        }
+        assert!(
+            store.operation(first).unwrap().unwrap().request["files"][0]
+                .get("data_base64")
+                .is_none()
+        );
+        let second_op = store.operation(second).unwrap().unwrap();
+        let current_path = second_op
+            .uploads
+            .first()
+            .and_then(|u| u.staged_path.clone());
+
+        let third = Uuid::new_v4();
+        origin
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Err(ApiError::InvalidResponse("lost".into())));
+        assert_eq!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(30, "testing", None),
+                third,
+                T0 + 2
+            )
+            .unwrap_err()
+            .exit_code,
+            super::super::EXIT_OUTCOME_UNKNOWN
+        );
+        let uncertain_wire = origin.last_post();
+        let pending = store.operation(third).unwrap().unwrap();
+        assert_eq!(pending.state, OperationState::Unknown);
+        assert_eq!(pending.request, uncertain_wire);
+        if let Some(path) = &current_path {
+            assert!(path.exists());
+        }
+        let upload_count = origin.uploads.lock().unwrap().len();
+        drop(store);
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let pending = store.operation(third).unwrap().unwrap();
+        assert_eq!(pending.request, uncertain_wire);
+        origin
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Ok(json!({"type":"ok","revision":3,"duplicate":true})));
+        let receipt = submit_operation_with_transport(&origin, &mut store, pending).unwrap();
+        assert_eq!(origin.last_post(), uncertain_wire);
+        assert_eq!(origin.uploads.lock().unwrap().len(), upload_count);
+        if let Some(path) = &current_path {
+            assert!(!path.exists());
+        }
+        let committed = store.operation(third).unwrap().unwrap();
+        let posts = origin.posts.lock().unwrap().len();
+        assert_eq!(
+            submit_operation_with_transport(&origin, &mut store, committed.clone()).unwrap(),
+            receipt
+        );
+        assert_eq!(origin.posts.lock().unwrap().len(), posts);
+        let mut changed = committed.request.clone();
+        changed["message"]["title"] = json!("changed");
+        assert!(
+            store
+                .prepare_operation(third, session, "revise".into(), changed)
+                .is_err()
+        );
+
+        // Closure does not release either revision's bytes while an
+        // unresolved successor still references the accepted base.
+        let fourth = Uuid::new_v4();
+        origin
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Err(ApiError::InvalidResponse("lost".into())));
+        assert!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(40, "coding", None),
+                fourth,
+                T0 + 3
+            )
+            .is_err()
+        );
+        let terminal = JournalEntry::fetched(
+            1,
+            "1".into(),
+            session,
+            "terminal".into(),
+            "person".into(),
+            true,
+            Some(SENDER.into()),
+            Some(MESSAGE.into()),
+            Some(3),
+            json!({"terminal_state":"cleared"}),
+        );
+        store.record_entry(terminal).unwrap();
+        let base = store.operation(third).unwrap().unwrap();
+        if uploaded {
+            assert!(base.uploads[0].staged_path.as_ref().unwrap().exists());
+        } else {
+            assert!(base.request["files"][0].get("data_base64").is_some());
+        }
+        let fourth_paths = store.operation(fourth).unwrap().unwrap().uploads;
+        store
+            .reject_operation(fourth, json!({"type":"error","reason":"closed"}))
+            .unwrap();
+        let released = store.operation(third).unwrap().unwrap();
+        assert_eq!(released.response, Some(receipt));
+        assert!(released.request["files"][0].get("data_base64").is_none());
+        for u in base.uploads.iter().chain(&fourth_paths) {
+            if let Some(path) = &u.staged_path {
+                assert!(!path.exists());
+            }
+        }
+        assert_eq!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(50, "review", None),
+                Uuid::new_v4(),
+                T0 + 4
+            )
+            .unwrap_err()
+            .exit_code,
+            EXIT_REFUSED
+        );
+    }
+
+    #[test]
+    fn committed_withdraw_releases_current_inline_and_uploaded_material() {
+        for uploaded in [false, true] {
+            let scratch = Scratch::new();
+            let session = Uuid::new_v4();
+            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+            let origin = Origin::new();
+            let first = send_file(&origin, &mut store, session, &scratch.0, uploaded);
+            let kept = store.operation(first).unwrap().unwrap();
+            let staged = kept.uploads.first().and_then(|u| u.staged_path.clone());
+            if let Some(path) = &staged {
+                assert!(path.exists());
+            } else {
+                assert!(kept.request["files"][0].get("data_base64").is_some());
+            }
+            let withdraw = Uuid::new_v4();
+            let operation = store
+                .prepare_operation(
+                    withdraw,
+                    session,
+                    "withdraw".into(),
+                    json!({"v":1,"type":"withdraw","op_id":withdraw.to_string(),
+                        "sender_id":SENDER,"message_id":MESSAGE}),
+                )
+                .unwrap();
+            submit_operation_with_transport(&origin, &mut store, operation).unwrap();
+            let released = store.operation(first).unwrap().unwrap();
+            assert_eq!(released.response, kept.response);
+            assert!(released.request["files"][0].get("data_base64").is_none());
+            assert!(released.uploads.iter().all(|u| u.staged_path.is_none()));
+            if let Some(path) = &staged {
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_update_key_keeps_its_retry_or_conflict_exit_class() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let origin = Origin::new();
+        send_progress(&origin, &mut store, session, report(10, "coding", None), T0);
+        let committed = Uuid::new_v4();
+        update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "coding", None),
+            committed,
+            T0 + 1,
+        )
+        .unwrap();
+        let again = update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "coding", None),
+            committed,
+            T0 + 2,
+        )
+        .unwrap_err();
+        assert_eq!(again.exit_code, 1);
+
+        let lost = Origin::new().then(Err(ApiError::InvalidResponse("lost".into())));
+        let unknown = Uuid::new_v4();
+        update_with(
+            &lost,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(30, "coding", None),
+            unknown,
+            T0 + 3,
+        )
+        .unwrap_err();
+        let staged = store.operation(unknown).unwrap().unwrap().request.clone();
+        let retry = update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(30, "coding", None),
+            unknown,
+            T0 + 4,
+        )
+        .unwrap_err();
+        assert_eq!(retry.exit_code, super::super::EXIT_OUTCOME_UNKNOWN);
+        assert!(retry.message.contains(&unknown.to_string()));
+        assert_eq!(store.operation(unknown).unwrap().unwrap().request, staged);
+    }
+
+    #[test]
+    fn current_feed_revision_and_manifest_are_selected_together_without_older_fallback() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let origin = Origin::new();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        send_file(&origin, &mut store, session, &scratch.0, false);
+        let mut message = origin.last_post()["message"].clone();
+        message["title"] = json!("new current title");
+        let files = json!([{"name":"new.bin","data_base64":STANDARD.encode([5,6])}]);
+        store
+            .record_entry(revision_entry(
+                session,
+                1,
+                2,
+                message.clone(),
+                files.clone(),
+            ))
+            .unwrap();
+        origin
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Ok(json!({"type":"ok","revision":3})));
+        update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "review", None),
+            Uuid::new_v4(),
+            T0 + 1,
+        )
+        .unwrap();
+        let wire = origin.last_post();
+        assert_eq!(wire["base_revision"], 2);
+        assert_eq!(wire["message"]["title"], "new current title");
+        assert_eq!(wire["files"], files);
+        // A newer metadata-only snapshot cannot borrow the old source bytes.
+        store
+            .record_entry(revision_entry(
+                session,
+                2,
+                4,
+                message,
+                json!([{"name":"new.bin","tier":"inline","size":2,
+            "sha256":hex::encode(Sha256::digest([7,8]))}]),
+            ))
+            .unwrap();
+        let posts = origin.posts.lock().unwrap().len();
+        let op = Uuid::new_v4();
+        assert!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(30, "review", None),
+                op,
+                T0 + 2
+            )
+            .unwrap_err()
+            .message
+            .contains("file bytes are unavailable")
+        );
+        assert!(store.operation(op).unwrap().is_none());
+        assert_eq!(origin.posts.lock().unwrap().len(), posts);
+    }
+
+    #[test]
+    fn same_revision_feed_metadata_uses_only_matching_captured_material() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let origin = Origin::new();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        send_file(&origin, &mut store, session, &scratch.0, false);
+        let initial = origin.last_post();
+        let metadata = json!([{"name":"input.bin","tier":"inline","size":4,"sha256":hex::encode(Sha256::digest([1,2,3,4]))}]);
+        store
+            .record_entry(revision_entry(
+                session,
+                1,
+                1,
+                initial["message"].clone(),
+                metadata.clone(),
+            ))
+            .unwrap();
+        update_with(
+            &origin,
+            &mut store,
+            session,
+            MESSAGE,
+            &report(20, "review", None),
+            Uuid::new_v4(),
+            T0 + 1,
+        )
+        .unwrap();
+        assert_eq!(origin.last_post()["files"], initial["files"]);
+        let mut wrong = metadata;
+        wrong[0]["sha256"] = json!(hex::encode(Sha256::digest([9, 9, 9, 9])));
+        store
+            .record_entry(revision_entry(
+                session,
+                2,
+                2,
+                origin.last_post()["message"].clone(),
+                wrong,
+            ))
+            .unwrap();
+        assert!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(30, "review", None),
+                Uuid::new_v4(),
+                T0 + 2
+            )
+            .unwrap_err()
+            .message
+            .contains("manifests disagree")
+        );
+    }
+
+    #[test]
+    fn missing_or_changed_captured_upload_and_missing_snapshot_refuse_without_posting() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let origin = Origin::new();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        assert!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(10, "review", None),
+                Uuid::new_v4(),
+                T0
+            )
+            .is_err()
+        );
+        let first = send_file(&origin, &mut store, session, &scratch.0, true);
+        let source = store.operation(first).unwrap().unwrap().uploads[0]
+            .staged_path
+            .clone()
+            .unwrap();
+        let posts = origin.posts.lock().unwrap().len();
+        let uploads = origin.uploads.lock().unwrap().len();
+        std::fs::write(&source, [9, 9, 9, 9]).unwrap();
+        assert!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(20, "review", None),
+                Uuid::new_v4(),
+                T0 + 1
+            )
+            .is_err()
+        );
+        std::fs::remove_file(source).unwrap();
+        assert!(
+            update_with(
+                &origin,
+                &mut store,
+                session,
+                MESSAGE,
+                &report(20, "review", None),
+                Uuid::new_v4(),
+                T0 + 2
+            )
+            .is_err()
+        );
+        assert_eq!(origin.posts.lock().unwrap().len(), posts);
+        assert_eq!(origin.uploads.lock().unwrap().len(), uploads);
+    }
+
+    #[test]
+    fn stale_file_update_releases_only_the_refused_candidate() {
+        for uploaded in [false, true] {
+            let scratch = Scratch::new();
+            let session = Uuid::new_v4();
+            let origin = Origin::new();
+            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+            let first = send_file(&origin, &mut store, session, &scratch.0, uploaded);
+            let current = store.operation(first).unwrap().unwrap();
+            origin
+                .answers
+                .lock()
+                .unwrap()
+                .push_back(Ok(json!({"type":"error","reason":"stale_revision",
+                "field":"base_revision","current_revision":2})));
+            let candidate = Uuid::new_v4();
+            assert_eq!(
+                update_with(
+                    &origin,
+                    &mut store,
+                    session,
+                    MESSAGE,
+                    &report(20, "review", None),
+                    candidate,
+                    T0 + 1
+                )
+                .unwrap_err()
+                .exit_code,
+                EXIT_REFUSED
+            );
+            let refused = store.operation(candidate).unwrap().unwrap();
+            assert_eq!(refused.state, OperationState::Rejected);
+            assert!(refused.request["files"][0].get("data_base64").is_none());
+            assert!(refused.uploads.iter().all(|u| u.staged_path.is_none()));
+            let after = store.operation(first).unwrap().unwrap();
+            assert_eq!(after.request, current.request);
+            assert_eq!(after.response, current.response);
+            for u in &after.uploads {
+                assert!(u.staged_path.as_ref().unwrap().exists());
+            }
+        }
+    }
 
     #[test]
     fn send_creates_an_ordinary_fyi_carrying_the_first_visit() {
