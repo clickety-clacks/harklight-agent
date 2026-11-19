@@ -360,8 +360,7 @@ impl<R: BufRead> SseDecoder<R> {
                             .and_then(|value| {
                                 let session_handle = value["session_handle"]
                                     .as_str()
-                                    .and_then(|value| Uuid::parse_str(value).ok())
-                                    .filter(|value| value.get_version_num() == 4)?;
+                                    .and_then(|value| Uuid::parse_str(value).ok())?;
                                 let cursor = value["advisory_cursor"].as_u64()?;
                                 Some(OriginNotice::AdvisoryChange {
                                     session_handle,

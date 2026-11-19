@@ -91,7 +91,7 @@ each new connection. The TLS name and CA trust remain separate inputs.
 | `enroll status` | `--connect`, `--name`, `--port` |
 
 All three also require `--identity-dir` and `--ca-file` (or their environment
-variables above). The label must contain 1 to 256 UTF-8 bytes.
+variables above).
 
 ```sh
 harklight-agent --identity-dir "$HOME/Library/Application Support/Harklight/Identity" \
@@ -455,7 +455,7 @@ harklight-agent retry --op-id "$HARKLIGHT_OP_ID"
 `ack` records delivery only when explicitly run from the originating session.
 Feed receipt, stdout output and listener attachment do not prove that handoff.
 The CLI persists each operation before submission and reports uncertain
-outcomes; retry that operation with the same UUIDv4 key rather than creating a
+outcomes; retry that operation with the same UUID key rather than creating a
 second action. A reply, revision, withdrawal or source result acts on the exact
 person turn it names. A final answer does not close through local process exit;
 only a server terminal entry closes the request.
@@ -553,9 +553,8 @@ Before sending files, the CLI asks the origin for its published inline allowance
 and upload cap. It sends exact bytes inline while their decoded aggregate fits
 the reported per-entry allowance, then uploads any remaining files as exact
 bytes and references each server identity, size and SHA-256 in the entry. The
-separate upload body is not limited by the 2 MiB JSON request bound. Before
-submitting the entry, the CLI checks that its final JSON request fits that
-existing bound. A file over the published upload cap, an upload failure or an
+CLI does not check the entry's JSON request size; the Server answers if it
+refuses the request. A file over the published upload cap, an upload failure or an
 unusable limit response refuses the entry as a whole; it does not split a file,
 truncate bytes or send only the text. A retry after an unknown upload response
 reuses the same operation key and exact staged bytes.
@@ -586,7 +585,7 @@ CLI verifies the fetched byte count and digest and saves the exact bytes.
 
 A client may request cleanup only when the person explicitly navigates away
 from a message with unsubmitted uploads. The operation is scoped to the exact
-sender, message ID and revision and is durably journaled with a UUIDv4 key:
+sender, message ID and revision and is durably journaled with a UUID key:
 
 ```sh
 harklight-agent discard-uploads --sender-id app:example \

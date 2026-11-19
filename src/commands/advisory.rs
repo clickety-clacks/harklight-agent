@@ -6,15 +6,6 @@ pub fn ack_advisory(
     session: Uuid,
     advisory_id: Uuid,
 ) -> Result<(), CommandError> {
-    if session.get_version() != Some(Version::Random)
-        || advisory_id.get_version() != Some(Version::Random)
-    {
-        return Err(CommandError::new(
-            "session and advisory identifiers must be UUIDv4",
-            EXIT_REFUSED,
-        ));
-    }
-
     let mut store = context.open_store(session)?;
     ack_advisory_with(&mut store, session, advisory_id, |request| {
         context.api.post(request)
@@ -232,7 +223,6 @@ fn parse_advisory(
     let session_handle = raw["session_handle"]
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok())
-        .filter(|value| value.get_version() == Some(Version::Random))
         .ok_or("an advisory entry had an invalid session handle")?;
     if session_handle != session {
         return Err("an advisory entry named a different session");
@@ -240,7 +230,6 @@ fn parse_advisory(
     let advisory_id = raw["advisory_id"]
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok())
-        .filter(|value| value.get_version() == Some(Version::Random))
         .ok_or("an advisory entry had an invalid id")?;
     let sequence = raw["advisory_seq"]
         .as_u64()

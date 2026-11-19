@@ -13,7 +13,7 @@ use serde::{
 };
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use uuid::{Uuid, Version};
+use uuid::Uuid;
 
 use crate::{
     api::{ApiError, OriginClient, OriginNotice, SseStream},
@@ -1162,36 +1162,6 @@ fn prepare_outgoing_files_with_lookup(
     }
 }
 
-fn validate_request_size(request: &Value) -> Result<(), CommandError> {
-    let body = serde_json::to_vec(request)
-        .map_err(|error| CommandError::new(format!("could not encode request: {error}"), 1))?;
-    if body.len() as u64 > files::MAX_ORIGIN_REQUEST_BYTES {
-        return Err(CommandError::new(
-            "origin request exceeds its existing 2 MiB body bound; nothing was submitted",
-            EXIT_UNSUPPORTED,
-        ));
-    }
-    Ok(())
-}
-
-fn validate_request_pre_upload(request: &Value) -> Result<(), CommandError> {
-    let mut projected = request.clone();
-    if let Some(files) = projected.get_mut("files").and_then(Value::as_array_mut) {
-        for file in files {
-            let Some(object) = file.as_object_mut() else {
-                continue;
-            };
-            if object.remove("upload_pending") == Some(Value::Bool(true)) {
-                object.insert(
-                    "upload_id".into(),
-                    Value::String("00000000-0000-4000-8000-000000000000".into()),
-                );
-            }
-        }
-    }
-    validate_request_size(&projected)
-}
-
 fn validate_send_route(
     session_arg: &str,
     route: Option<OriginHarness>,
@@ -1845,10 +1815,6 @@ pub fn send_with_fields(
         )?,
         supersedes,
     );
-    if let Err(error) = validate_request_pre_upload(&request) {
-        files::cleanup_staged_uploads(&prepared_files.uploads);
-        return Err(error);
-    }
     let expected_session = session.to_string();
     let operation = prepare_with_uploads(
         &mut store,
@@ -2119,9 +2085,6 @@ pub fn prepare_send_with_fields(
     op_id: Uuid,
     fields: &MessageFieldOptions,
 ) -> Result<(), CommandError> {
-    if op_id.get_version_num() != 4 {
-        return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
-    }
     let (message_type, normalized) = validate_send_options(choices, informational, fields, true)?;
     print_message_field_warnings(&normalized.warnings);
     let _answer_ui = answer_ui_for_send(choices, message_type, fields)?;
@@ -2210,10 +2173,6 @@ pub fn prepare_send_with_fields(
             return Err(error);
         }
     };
-    if let Err(error) = validate_request_pre_upload(&request) {
-        files::cleanup_staged_uploads(&prepared_files.uploads);
-        return Err(error);
-    }
     let inputs = send_input_identity_with_fields(
         session_arg,
         sender_id,
@@ -2340,9 +2299,6 @@ fn emit_prepared_or_saved_result(
 }
 
 pub fn execute_send(context: &CommandContext, op_id: Uuid) -> Result<(), CommandError> {
-    if op_id.get_version_num() != 4 {
-        return Err(CommandError::new("send op_id must be UUIDv4", EXIT_REFUSED));
-    }
     let global = context.open_global_store()?;
     let existing = global
         .operation(op_id)
@@ -2888,12 +2844,6 @@ pub fn attach_with_origin(
             origin_listener,
         );
     }
-    if session.get_version() != Some(Version::Random) {
-        return Err(CommandError::new(
-            "--session must be an existing UUIDv4 Harklight handle",
-            EXIT_REFUSED,
-        ));
-    }
     if controller && route != OriginHarness::Other {
         return Err(CommandError::new(
             "--controller is valid only with --route other",
@@ -3128,12 +3078,6 @@ pub fn ack2(
     rerouted: bool,
     not_handed: Option<&str>,
 ) -> Result<(), CommandError> {
-    if session.get_version() != Some(Version::Random) {
-        return Err(CommandError::new(
-            "session handle must be UUIDv4",
-            EXIT_REFUSED,
-        ));
-    }
     validate_event_id(event_id)?;
     let mut store = context.open_store(session)?;
     let entry = store
@@ -3370,10 +3314,6 @@ pub fn reply(
     if !prepared_files.entries.is_empty() {
         body["files"] = Value::Array(prepared_files.entries.clone());
     }
-    if let Err(error) = validate_request_pre_upload(&body) {
-        files::cleanup_staged_uploads(&prepared_files.uploads);
-        return Err(error);
-    }
     let operation = prepare_with_uploads(
         &mut store,
         session,
@@ -3494,10 +3434,6 @@ pub fn revise_with_fields(
     if !prepared_files.entries.is_empty() {
         command["files"] = Value::Array(prepared_files.entries.clone());
     }
-    if let Err(error) = validate_request_pre_upload(&command) {
-        files::cleanup_staged_uploads(&prepared_files.uploads);
-        return Err(error);
-    }
     let operation = prepare_with_uploads(
         &mut store,
         session,
@@ -3562,12 +3498,6 @@ fn discard_uploads_request(
     message_id: &str,
     revision: u64,
 ) -> Result<Value, CommandError> {
-    if op_id.get_version_num() != 4 {
-        return Err(CommandError::new(
-            "cleanup operation key must be UUIDv4",
-            EXIT_REFUSED,
-        ));
-    }
     if sender_id.trim().is_empty() || message_id.trim().is_empty() || revision == 0 {
         return Err(CommandError::new(
             "cleanup requires a sender, message identity and positive revision",
@@ -5178,15 +5108,6 @@ fn upload_pending_files(
             .map_err(|error| journal_error(error, 1))?
             .ok_or_else(|| CommandError::new("operation disappeared after upload", 1))?;
     }
-    if let Err(error) = validate_request_size(&current.request) {
-        store
-            .reject_operation(
-                current.op_id,
-                json!({"kind":"request_too_large","reason":error.message}),
-            )
-            .map_err(|error| journal_error(error, 1))?;
-        return Err(error);
-    }
     Ok(current)
 }
 
@@ -5472,7 +5393,6 @@ fn fetch_feed_with(
         let session_handle = raw["session_handle"]
             .as_str()
             .and_then(|value| Uuid::parse_str(value).ok())
-            .filter(|value| value.get_version_num() == 4)
             .ok_or_else(|| CommandError::new("feed entry has an invalid session_handle", 1))?;
         let kind = raw["kind"]
             .as_str()
@@ -6039,10 +5959,7 @@ fn journal_error(error: JournalError, fallback_code: i32) -> CommandError {
 
 fn parse_session(value: &str) -> Result<Uuid, CommandError> {
     let session = Uuid::parse_str(value)
-        .map_err(|_| CommandError::new("session must be a UUIDv4 or the word new", 1))?;
-    if session.get_version_num() != 4 {
-        return Err(CommandError::new("session handle must be UUIDv4", 1));
-    }
+        .map_err(|_| CommandError::new("session must be a UUID or the word new", 1))?;
     Ok(session)
 }
 
@@ -6064,13 +5981,7 @@ fn parse_uuid_field(request: &Value, field: &str) -> Result<Uuid, CommandError> 
         .as_str()
         .ok_or_else(|| CommandError::new(format!("operation request has no {field}"), 1))?;
     let id = Uuid::parse_str(value)
-        .map_err(|_| CommandError::new(format!("operation {field} is not UUIDv4"), 1))?;
-    if id.get_version_num() != 4 {
-        return Err(CommandError::new(
-            format!("operation {field} is not UUIDv4"),
-            1,
-        ));
-    }
+        .map_err(|_| CommandError::new(format!("operation {field} is not a UUID"), 1))?;
     Ok(id)
 }
 
@@ -10401,27 +10312,6 @@ mod tests {
                 .unwrap()
                 .contains("no controller declared")
         );
-    }
-
-    #[test]
-    fn request_preflight_accounts_for_the_server_assigned_upload_identity() {
-        let mut request = json!({
-            "v":1,
-            "type":"send",
-            "files":[{
-                "name":"file.bin",
-                "upload_pending":true,
-                "size":1,
-                "sha256":"0000000000000000000000000000000000000000000000000000000000000000"
-            }]
-        });
-        request["body"] = Value::String(String::new());
-        let base_len = serde_json::to_vec(&request).unwrap().len() as u64;
-        let body_len = files::MAX_ORIGIN_REQUEST_BYTES - 4 - base_len;
-        request["body"] = Value::String("x".repeat(body_len as usize));
-
-        assert!(validate_request_size(&request).is_ok());
-        assert!(validate_request_pre_upload(&request).is_err());
     }
 
     #[test]
