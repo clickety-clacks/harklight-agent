@@ -34,12 +34,6 @@ impl ProgressReport {
                 EXIT_REFUSED,
             ));
         }
-        if self.stage.trim().is_empty() {
-            return Err(CommandError::new(
-                "progress stage must be a nonblank label",
-                EXIT_REFUSED,
-            ));
-        }
         Ok(())
     }
 
@@ -1398,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_requires_an_fyi_and_a_nonblank_stage() {
+    fn progress_requires_an_fyi() {
         let send = |message_type: &str, stage: &str| {
             build_send_request_with_fields(
                 Uuid::new_v4(),
@@ -1424,7 +1418,6 @@ mod tests {
             send("request", "coding").unwrap_err().exit_code,
             EXIT_REFUSED
         );
-        assert_eq!(send("fyi", "  ").unwrap_err().exit_code, EXIT_REFUSED);
         assert!(send("fyi", "packaging").is_ok());
     }
 
