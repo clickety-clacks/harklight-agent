@@ -27,28 +27,6 @@ struct Cli {
     command: Command,
 }
 
-fn send_cli_warnings(
-    message_type: Option<&str>,
-    informational: bool,
-    urgency: Option<&str>,
-    execute: bool,
-) -> Vec<&'static str> {
-    if execute {
-        return Vec::new();
-    }
-
-    let mut warnings = Vec::new();
-    if urgency.is_some() {
-        warnings.push("warning: --urgency is deprecated; use --importance");
-    }
-    if message_type.is_none() && !informational {
-        warnings.push(
-            "warning: add --type request (or --type fyi); untyped sends will be refused by the Server",
-        );
-    }
-    warnings
-}
-
 #[derive(Debug, Subcommand)]
 enum Command {
     Enroll {
@@ -78,11 +56,10 @@ enum Command {
             help = "Add this exact value choice; may be repeated"
         )]
         choices: Vec<String>,
-        #[arg(long, help = "Equivalent to --type fyi; offer only the Seen action")]
-        informational: bool,
         #[arg(
             long = "type",
             value_name = "fyi|request",
+            required_unless_present_any = ["execute", "progress"],
             help = "Choose an FYI or a request that needs an answer"
         )]
         message_type: Option<String>,
@@ -97,8 +74,6 @@ enum Command {
             help = "Your importance estimate; Harklight decides the priority the recipient sees"
         )]
         importance: Option<String>,
-        #[arg(long, hide = true)]
-        urgency: Option<String>,
         #[arg(long, help = "Add a free-text Reply action to a request")]
         reply: bool,
         #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
@@ -334,8 +309,6 @@ enum Command {
             help = "Your importance estimate; Harklight decides the priority the recipient sees"
         )]
         importance: Option<String>,
-        #[arg(long, hide = true)]
-        urgency: Option<String>,
         #[arg(long, help = "RFC 3339 time by which this matters")]
         by_when: Option<String>,
         #[arg(long)]
@@ -597,11 +570,9 @@ fn main() {
             title,
             body,
             choices,
-            informational,
             message_type,
             message_kind,
             importance,
-            urgency,
             reply,
             supersedes,
             by_when,
@@ -631,19 +602,11 @@ fn main() {
                 }),
                 _ => None,
             };
-            let message_type = if progress.is_some() && message_type.is_none() && !informational {
+            let message_type = if progress.is_some() && message_type.is_none() {
                 Some("fyi".to_string())
             } else {
                 message_type
             };
-            for warning in send_cli_warnings(
-                message_type.as_deref(),
-                informational,
-                urgency.as_deref(),
-                execute,
-            ) {
-                eprintln!("{warning}");
-            }
             commands::send_command_with_answer_ui_file(
                 &context,
                 session.as_deref(),
@@ -651,7 +614,6 @@ fn main() {
                 title.as_deref(),
                 body.as_deref(),
                 &choices,
-                informational,
                 &supersedes,
                 vendor_session_id.as_deref(),
                 route.map(Into::into),
@@ -666,7 +628,6 @@ fn main() {
                     message_kind,
                     reply,
                     importance,
-                    urgency,
                     by_when,
                     stake,
                     thread,
@@ -793,7 +754,6 @@ fn main() {
             message_kind,
             reply,
             importance,
-            urgency,
             by_when,
             stake,
             default_choice,
@@ -803,42 +763,36 @@ fn main() {
             in_reply_to,
             files,
             op_id,
-        } => {
-            if urgency.is_some() {
-                eprintln!("warning: --urgency is deprecated; use --importance");
-            }
-            commands::revise_with_fields(
-                &context,
-                session,
-                &request,
-                base_revision,
-                &title,
-                body.as_deref(),
-                &choices,
-                clear_choices,
-                in_reply_to.as_deref(),
-                &files,
-                op_id,
-                &MessageFieldOptions {
-                    origin_listener: false,
-                    message_type,
-                    message_kind,
-                    reply,
-                    importance,
-                    urgency,
-                    by_when,
-                    stake,
-                    thread: None,
-                    display_name: None,
-                    default_choice,
-                    default_at,
-                    choice_styles,
-                    clear_default,
-                    answer_ui: None,
-                    progress: None,
-                },
-            )
-        }
+        } => commands::revise_with_fields(
+            &context,
+            session,
+            &request,
+            base_revision,
+            &title,
+            body.as_deref(),
+            &choices,
+            clear_choices,
+            in_reply_to.as_deref(),
+            &files,
+            op_id,
+            &MessageFieldOptions {
+                origin_listener: false,
+                message_type,
+                message_kind,
+                reply,
+                importance,
+                by_when,
+                stake,
+                thread: None,
+                display_name: None,
+                default_choice,
+                default_at,
+                choice_styles,
+                clear_default,
+                answer_ui: None,
+                progress: None,
+            },
+        ),
         Command::Progress {
             session,
             request,
@@ -1125,23 +1079,6 @@ mod tests {
     }
 
     #[test]
-    fn send_warnings_cover_untyped_legacy_and_prepared_execution_cases() {
-        assert_eq!(
-            send_cli_warnings(None, false, None, false),
-            vec![
-                "warning: add --type request (or --type fyi); untyped sends will be refused by the Server"
-            ]
-        );
-        assert!(send_cli_warnings(Some("request"), false, None, false).is_empty());
-        assert!(send_cli_warnings(None, true, None, false).is_empty());
-        assert_eq!(
-            send_cli_warnings(Some("fyi"), false, Some("high"), false),
-            vec!["warning: --urgency is deprecated; use --importance"]
-        );
-        assert!(send_cli_warnings(None, false, None, true).is_empty());
-    }
-
-    #[test]
     fn send_prepare_accepts_existing_inputs_and_required_operation_id() {
         let cli = Cli::try_parse_from([
             "harklight-agent",
@@ -1302,6 +1239,43 @@ mod tests {
     }
 
     #[test]
+    fn send_requires_a_type_unless_executing_or_reporting_progress() {
+        let base = [
+            "harklight-agent",
+            "send",
+            "--session",
+            "new",
+            "--sender-id",
+            "app:example",
+            "--title",
+            "A notice",
+            "--route",
+            "claude-code",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--type", "fyi"])).is_ok());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--progress",
+                "10",
+                "--progress-stage",
+                "coding"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "harklight-agent",
+                "send",
+                "--execute",
+                "--op-id",
+                "123e4567-e89b-42d3-a456-426614174000"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn send_accepts_multiple_superseded_message_ids_in_order() {
         let cli = Cli::try_parse_from([
             "harklight-agent",
@@ -1314,6 +1288,8 @@ mod tests {
             "Updated plan",
             "--route",
             "claude-code",
+            "--type",
+            "fyi",
             "--supersedes",
             "earlier-1",
             "--supersedes",
@@ -1343,6 +1319,8 @@ mod tests {
             "A title",
             "--route",
             "claude-code",
+            "--type",
+            "fyi",
         ])
         .unwrap();
 
@@ -1502,57 +1480,6 @@ mod tests {
     }
 
     #[test]
-    fn informational_send_is_parsed_as_the_fyi_compatibility_flag() {
-        let cli = Cli::try_parse_from([
-            "harklight-agent",
-            "send",
-            "--session",
-            "new",
-            "--sender-id",
-            "app:example",
-            "--title",
-            "A notice",
-            "--route",
-            "claude-code",
-            "--informational",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Send {
-                informational: true,
-                choices,
-                ..
-            } if choices.is_empty()
-        ));
-
-        let with_choice = Cli::try_parse_from([
-            "harklight-agent",
-            "send",
-            "--session",
-            "new",
-            "--sender-id",
-            "app:example",
-            "--title",
-            "A notice",
-            "--route",
-            "claude-code",
-            "--informational",
-            "--choice",
-            "Approve",
-        ])
-        .unwrap();
-        assert!(matches!(
-            with_choice.command,
-            Command::Send {
-                informational: true,
-                choices,
-                ..
-            } if choices == vec!["Approve"]
-        ));
-    }
-
-    #[test]
     fn send_and_revise_accept_the_message_field_flags_but_revise_has_no_thread_flag() {
         let send = Cli::try_parse_from([
             "harklight-agent",
@@ -1598,7 +1525,6 @@ mod tests {
                 message_kind: Some(message_kind),
                 reply: true,
                 importance: Some(importance),
-                urgency: None,
                 by_when: Some(by_when),
                 stake: Some(stake),
                 thread: Some(thread),
@@ -1633,7 +1559,7 @@ mod tests {
             "--kind",
             "success",
             "--reply",
-            "--urgency",
+            "--importance",
             "now",
             "--clear-default",
             "--choice-style",
@@ -1646,14 +1572,13 @@ mod tests {
                 message_type: Some(message_type),
                 message_kind: Some(message_kind),
                 reply: true,
-                urgency: Some(urgency),
-                importance: None,
+                importance: Some(importance),
                 clear_default: true,
                 choice_styles,
                 ..
             } if message_type == "request"
                 && message_kind == "success"
-                && urgency == "now"
+                && importance == "now"
                 && choice_styles == vec!["Ship=primary"]
         ));
 
@@ -1677,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn importance_is_visible_while_urgency_remains_a_hidden_alias() {
+    fn importance_is_visible_on_send_and_revise() {
         let mut command = Cli::command();
         let send_help = command
             .find_subcommand_mut("send")
@@ -1685,7 +1610,6 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(send_help.contains("--importance"));
-        assert!(!send_help.contains("--urgency"));
         assert!(send_help.contains("--answer-ui"));
         assert!(send_help.contains("--file cover-a.jpg --file cover-b.jpg"));
 
@@ -1695,7 +1619,6 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(revise_help.contains("--importance"));
-        assert!(!revise_help.contains("--urgency"));
         assert!(send_help.contains("priority the recipient sees"));
         assert!(revise_help.contains("priority the recipient sees"));
     }
