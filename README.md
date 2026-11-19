@@ -54,6 +54,9 @@ The CLI reads the existing device enrollment files `server.json`,
 `enrollment.json`, `identity.pem` and `identity.key` from a private identity
 directory. It verifies the configured CA fingerprint and authenticates with the
 enrolled device certificate. The sender ID still needs its existing grant.
+If the identity directory or a file in it is readable by group or other, the CLI
+sets the directory to mode 0700 and the key to 0600 and continues; it refuses only
+if it cannot change the mode.
 The message commands do not create an identity, grant or trust root. Use the
 enrollment commands below to create the same identity files the message
 commands already read.
