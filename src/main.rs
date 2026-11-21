@@ -5,9 +5,10 @@ use uuid::Uuid;
 
 use harklight_agent::{
     commands::{self, CommandContext, MessageFieldOptions, ProgressReport},
-    config::EnrolledIdentity,
+    config::{EnrolledIdentity, default_state_root},
     enrollment,
-    v2::{AgentClient, V2Error},
+    journal::JournalStore,
+    v2::{AgentClient, V2Error, writes},
 };
 
 #[derive(Debug, Parser)]
@@ -232,15 +233,13 @@ enum Command {
     /// Ask a Harklight client to open a message or its chat.
     Show {
         #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        message_id: String,
+        item_id: String,
         #[arg(long)]
         chat: bool,
-        #[arg(long, conflicts_with = "client")]
+        #[arg(long)]
         device: Option<String>,
-        #[arg(long, conflicts_with = "device")]
-        client: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
     Ack {
         #[arg(long)]
@@ -254,30 +253,20 @@ enum Command {
         #[arg(long, required_unless_present = "event", conflicts_with = "event")]
         advisory: Option<Uuid>,
     },
-    #[command(
-        about = "Record a receiving-system ACK2 outcome for a person entry",
-        after_help = "This system-level processing receipt is separate from the agent Seen command `ack`. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same saved operation key."
-    )]
-    Ack2 {
+    /// Report handoff of an answer or a person chat entry.
+    Receipt {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        event: String,
-        #[arg(
-            long,
-            help = "Human-readable name of the agent that received the entry"
-        )]
+        entry_id: Option<String>,
+        #[arg(long)]
         agent: Option<String>,
         #[arg(long, conflicts_with = "not_handed")]
         rerouted: bool,
-        #[arg(
-            long = "not-handed",
-            value_name = "REASON",
-            num_args = 0..=1,
-            default_missing_value = "",
-            conflicts_with = "rerouted"
-        )]
+        #[arg(long, value_name = "REASON")]
         not_handed: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
     Reply {
         #[arg(long)]
@@ -361,19 +350,23 @@ enum Command {
     },
     Retract {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        request: String,
+        in_reply_to: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
+    },
+    Lifecycle {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long, value_enum)]
+        action: LifecycleAction,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
     Result {
         #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
-        #[arg(long)]
-        in_reply_to: String,
+        item_id: String,
         #[arg(long, value_enum)]
         status: ResultStatus,
         #[arg(long)]
@@ -400,7 +393,11 @@ enum Command {
     Retry {
         #[arg(long)]
         op_id: Uuid,
+        #[arg(long)]
+        journal_id: Option<Uuid>,
     },
+    /// Print the persistent ID of this operation journal.
+    JournalId,
     #[command(
         about = "Give up an operation stuck with an unknown outcome",
         after_help = "Marks the unresolved operation abandoned so it stops blocking new operations for its request. The Server may or may not have applied it. An abandoned operation can no longer be retried; a committed or refused operation cannot be abandoned."
@@ -417,17 +414,19 @@ enum Command {
     ))]
     FileUse {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        event: String,
+        entry_id: String,
         #[arg(long)]
-        file: String,
+        file_id: String,
         #[arg(long, group = "file-use-result")]
         used: bool,
-        #[arg(long, group = "file-use-result")]
+        #[arg(long, group = "file-use-result", requires = "reason")]
         unusable: bool,
-        #[arg(long)]
+        #[arg(long, requires = "unusable")]
         reason: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
 }
 
@@ -493,8 +492,8 @@ enum SessionCommand {
     End {
         #[arg(long)]
         session: Uuid,
-        #[arg(long, required = true)]
-        gone: bool,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
 }
 
@@ -511,6 +510,25 @@ enum SessionContext {
     Bare,
     Print,
     Sdk,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LifecycleAction {
+    Answered,
+    Cleared,
+    Expired,
+    Superseded,
+}
+
+impl LifecycleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Cleared => "cleared",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -570,6 +588,23 @@ fn main() {
         Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. }
     ) {
         run_device_read(&cli);
+        return;
+    }
+
+    if matches!(
+        cli.command,
+        Command::Retract { .. }
+            | Command::Lifecycle { .. }
+            | Command::Result { .. }
+            | Command::Receipt { .. }
+            | Command::FileUse { .. }
+            | Command::Show { .. }
+            | Command::JournalId
+            | Command::Session { .. }
+            | Command::Retry { .. }
+            | Command::Abandon { .. }
+    ) {
+        run_device_write(&cli);
         return;
     }
 
@@ -724,20 +759,6 @@ fn main() {
             unreachable!("device reads were dispatched before loading the origin context")
         }
         Command::Focus { follow } => commands::focus(&context, follow),
-        Command::Show {
-            sender_id,
-            message_id,
-            chat,
-            device,
-            client,
-        } => commands::show(
-            &context,
-            &sender_id,
-            &message_id,
-            chat,
-            device.as_deref(),
-            client.as_deref(),
-        ),
         Command::Ack {
             session,
             event,
@@ -747,20 +768,6 @@ fn main() {
             (None, Some(advisory)) => commands::ack_advisory(&context, session, advisory),
             _ => unreachable!("clap requires exactly one acknowledgment target"),
         },
-        Command::Ack2 {
-            session,
-            event,
-            agent,
-            rerouted,
-            not_handed,
-        } => commands::ack2(
-            &context,
-            session,
-            &event,
-            agent.as_deref(),
-            rerouted,
-            not_handed.as_deref(),
-        ),
         Command::Reply {
             session,
             request,
@@ -852,25 +859,6 @@ fn main() {
             in_reply_to,
             op_id,
         } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
-        Command::Retract {
-            session,
-            request,
-            op_id,
-        } => commands::retract(&context, session, &request, op_id),
-        Command::Result {
-            session,
-            request,
-            in_reply_to,
-            status,
-            op_id,
-        } => commands::result(
-            &context,
-            session,
-            &request,
-            &in_reply_to,
-            status.into(),
-            op_id,
-        ),
         Command::Status { session } => commands::status(&context, session),
         Command::DiscardUploads {
             sender_id,
@@ -878,30 +866,18 @@ fn main() {
             revision,
             op_id,
         } => commands::discard_uploads(&context, &sender_id, &message_id, revision, op_id),
-        Command::Session { action } => match action {
-            SessionCommand::End { session, gone: _ } => commands::session_end(&context, session),
-        },
-        Command::Retry { op_id } => commands::retry(&context, op_id),
-        Command::Abandon { op_id } => commands::abandon(&context, op_id),
-        Command::FileUse {
-            session,
-            event,
-            file,
-            used,
-            unusable,
-            reason,
-        } => commands::file_use(
-            &context,
-            session,
-            &event,
-            &file,
-            match (used, unusable) {
-                (true, false) => "used",
-                (false, true) => "unusable",
-                _ => unreachable!("clap requires exactly one file-use outcome"),
-            },
-            reason.as_deref(),
-        ),
+        Command::Retract { .. }
+        | Command::Lifecycle { .. }
+        | Command::Result { .. }
+        | Command::Receipt { .. }
+        | Command::FileUse { .. }
+        | Command::Show { .. }
+        | Command::JournalId
+        | Command::Session { .. }
+        | Command::Retry { .. }
+        | Command::Abandon { .. } => {
+            unreachable!("device writes were dispatched before loading the origin context")
+        }
     };
 
     if let Err(error) = result {
@@ -930,7 +906,7 @@ impl From<SessionContext> for commands::SessionContext {
     }
 }
 
-fn run_device_read(cli: &Cli) {
+fn device_identity(cli: &Cli) -> EnrolledIdentity {
     let identity_dir = cli
         .identity_dir
         .as_deref()
@@ -939,10 +915,12 @@ fn run_device_read(cli: &Cli) {
         .ca_file
         .as_deref()
         .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
-    let client = EnrolledIdentity::load(identity_dir, ca_file)
-        .and_then(AgentClient::new)
-        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    EnrolledIdentity::load(identity_dir, ca_file).unwrap_or_else(|error| fail(error.to_string(), 1))
+}
 
+fn run_device_read(cli: &Cli) {
+    let client =
+        AgentClient::new(device_identity(cli)).unwrap_or_else(|error| fail(error.to_string(), 1));
     let (operation, result) = match &cli.command {
         Command::MessageGet {
             item_id: Some(id),
@@ -1018,6 +996,145 @@ fn run_device_read(cli: &Cli) {
             fail(error.to_string(), commands::EXIT_REFUSED)
         }
         Err(error) => fail(error.to_string(), 1),
+    }
+}
+
+fn run_device_write(cli: &Cli) {
+    use writes::ControlWrite;
+
+    let identity = device_identity(cli);
+    let state_root = cli
+        .state_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_state_root)
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    let mut journal = JournalStore::open(&state_root, &identity.device_id, Uuid::nil())
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let result = match &cli.command {
+        Command::Retract {
+            item_id,
+            in_reply_to,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Retract {
+                item_id,
+                in_reply_to: in_reply_to.as_deref(),
+            },
+        ),
+        Command::Lifecycle {
+            item_id,
+            action,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Lifecycle {
+                item_id,
+                action: action.as_str(),
+            },
+        ),
+        Command::Session {
+            action: SessionCommand::End { session, op_id },
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::EndSession(*session),
+        ),
+        Command::Result {
+            item_id,
+            status,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Result {
+                item_id,
+                status: (*status).into(),
+            },
+        ),
+        Command::Receipt {
+            item_id,
+            entry_id,
+            agent,
+            rerouted,
+            not_handed,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Receipt {
+                item_id,
+                entry_id: entry_id.as_deref(),
+                agent: agent.as_deref(),
+                rerouted: *rerouted,
+                not_handed: not_handed.as_deref(),
+            },
+        ),
+        Command::FileUse {
+            item_id,
+            entry_id,
+            file_id,
+            reason,
+            op_id,
+            ..
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::FileUse {
+                item_id,
+                entry_id,
+                file_id,
+                reason: reason.as_deref(),
+            },
+        ),
+        Command::Show {
+            item_id,
+            chat,
+            device,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Show {
+                item_id,
+                chat: *chat,
+                device_name: device.as_deref(),
+            },
+        ),
+        Command::Retry { op_id, journal_id } => {
+            let journal_id = journal_id.map(|id| id.to_string());
+            writes::retry(&client, &mut journal, *op_id, journal_id.as_deref())
+        }
+        Command::JournalId => journal
+            .journal_id()
+            .map(|id| {
+                serde_json::json!({
+                    "kind":"journal","journal_id":id
+                })
+            })
+            .map_err(writes::WriteFailure::from),
+        Command::Abandon { op_id } => writes::abandon(&mut journal, *op_id),
+        _ => unreachable!("device write dispatch requires a write command"),
+    };
+    match result {
+        Ok(output) => println!("{output}"),
+        Err(error) => {
+            if let Some(output) = &error.output {
+                println!("{output}");
+            }
+            fail(error.to_string(), error.exit_code)
+        }
     }
 }
 
@@ -1599,47 +1716,21 @@ mod tests {
     fn focus_and_show_parse_their_contract_arguments() {
         let focus = Cli::try_parse_from(["harklight-agent", "focus", "--follow"]).unwrap();
         assert!(matches!(focus.command, Command::Focus { follow: true }));
-
         let show = Cli::try_parse_from([
             "harklight-agent",
             "show",
-            "--sender-id",
-            "app:example",
-            "--message-id",
-            "message-1",
+            "--item-id",
+            "item/one",
             "--chat",
             "--device",
-            "Owner's iPhone",
+            "Office",
         ])
         .unwrap();
         assert!(matches!(
             show.command,
-            Command::Show {
-                sender_id,
-                message_id,
-                chat: true,
-                device: Some(device),
-                client: None,
-            } if sender_id == "app:example"
-                && message_id == "message-1"
-                && device == "Owner's iPhone"
+            Command::Show { item_id, chat: true, device: Some(device), .. }
+            if item_id == "item/one" && device == "Office"
         ));
-
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "show",
-                "--sender-id",
-                "app:example",
-                "--message-id",
-                "message-1",
-                "--device",
-                "iPhone",
-                "--client",
-                "a".repeat(64).as_str(),
-            ])
-            .is_err()
-        );
     }
 
     #[test]
@@ -1811,112 +1902,84 @@ mod tests {
     }
 
     #[test]
-    fn ack2_is_a_separate_receiver_command_and_controller_capability_is_declared_by_flag() {
-        let handle = "123e4567-e89b-42d3-a456-426614174000";
-        let attach = Cli::try_parse_from([
-            "harklight-agent",
-            "attach",
-            "--session",
-            handle,
-            "--vendor-session-id",
-            "none",
-            "--route",
-            "other",
-            "--controller",
-            "--ack2",
-        ])
-        .unwrap();
-        assert!(matches!(
-            attach.command,
-            Command::Attach {
-                controller: true,
-                ack2: true,
-                ..
-            }
-        ));
-
-        let listen = Cli::try_parse_from([
-            "harklight-agent",
-            "listen",
-            "--session",
-            handle,
-            "--follow",
-            "--controller",
-            "--ack2",
-        ])
-        .unwrap();
-        assert!(matches!(
-            listen.command,
-            Command::Listen(ListenArgs {
-                controller: true,
-                ack2: true,
-                ..
-            })
-        ));
-
+    fn receipts_distinguish_answer_and_entry_and_require_a_reason_for_refusal() {
         let handed = Cli::try_parse_from([
-            "harklight-agent",
-            "ack2",
-            "--session",
-            handle,
-            "--event",
-            "812",
+            "agent",
+            "receipt",
+            "--item-id",
+            "item",
             "--agent",
-            "Studio",
+            "Desk",
             "--rerouted",
         ])
         .unwrap();
         assert!(matches!(
             handed.command,
-            Command::Ack2 {
-                agent: Some(agent),
+            Command::Receipt {
+                entry_id: None,
                 rerouted: true,
                 not_handed: None,
                 ..
-            } if agent == "Studio"
+            }
         ));
-        let not_handed = Cli::try_parse_from([
-            "harklight-agent",
-            "ack2",
-            "--session",
-            handle,
-            "--event",
-            "812",
+        let chat = Cli::try_parse_from([
+            "agent",
+            "receipt",
+            "--item-id",
+            "item",
+            "--entry-id",
+            "entry",
             "--not-handed",
-            "The receiver could not hand off this entry.",
+            "failed",
         ])
         .unwrap();
         assert!(matches!(
-            not_handed.command,
-            Command::Ack2 {
-                agent: None,
-                rerouted: false,
-                not_handed: Some(reason),
-                ..
-            } if reason == "The receiver could not hand off this entry."
+            chat.command,
+            Command::Receipt { entry_id: Some(id), not_handed: Some(reason), .. }
+            if id == "entry" && reason == "failed"
         ));
         assert!(
+            Cli::try_parse_from(["agent", "receipt", "--item-id", "item", "--not-handed"]).is_err()
+        );
+        assert!(
             Cli::try_parse_from([
-                "harklight-agent",
-                "ack2",
-                "--session",
-                handle,
-                "--event",
-                "812",
+                "agent",
+                "receipt",
+                "--item-id",
+                "item",
                 "--rerouted",
                 "--not-handed",
-                "not available",
+                "failed"
             ])
             .is_err()
         );
-
-        let mut command = Cli::command();
-        let ack2_help = command
-            .find_subcommand_mut("ack2")
-            .unwrap()
-            .render_long_help()
-            .to_string();
-        assert!(ack2_help.contains("receiving-system ACK2"));
-        assert!(ack2_help.contains("separate from the agent Seen command `ack`"));
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "file-use",
+                "--item-id",
+                "item",
+                "--entry-id",
+                "entry",
+                "--file-id",
+                "a",
+                "--unusable",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "file-use",
+                "--item-id",
+                "item",
+                "--entry-id",
+                "entry",
+                "--file-id",
+                "a",
+                "--used",
+            ])
+            .is_ok()
+        );
     }
 }
