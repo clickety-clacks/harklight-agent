@@ -1266,6 +1266,31 @@ impl JournalStore {
         })
     }
 
+    /// Recover only the old local sender reference, never a pending write.
+    pub fn legacy_sender(
+        &self,
+        session: Uuid,
+        local_id: &str,
+    ) -> Result<Option<String>, JournalError> {
+        self.with_read(|connection| {
+            let mut query = connection.prepare(
+                "SELECT sender_id FROM entries WHERE session_handle=?1 AND request_id=?2 AND sender_id IS NOT NULL
+                 UNION
+                 SELECT json_extract(payload,'$.request.message.sender_id') FROM operations
+                 WHERE session_handle=?1 AND message_id=?2 AND kind='send' AND state='committed'
+                   AND coalesce(json_extract(payload,'$.protocol_v2'),0)=0
+                   AND json_extract(payload,'$.request.message.sender_id') IS NOT NULL
+                 LIMIT 2",
+            )?;
+            let senders = query.query_map(params![session.to_string(),local_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            match senders.as_slice() {
+                [sender] => Ok(Some(sender.clone())),
+                _ => Ok(None),
+            }
+        })
+    }
+
     pub fn v2_item_id(&self, sender: &str, local_id: &str) -> Result<Option<String>, JournalError> {
         self.with_read(|connection| read_v2_item_id(connection, sender, local_id))
     }

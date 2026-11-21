@@ -139,7 +139,7 @@ pub struct Revision<'a> {
     pub item_id: &'a str,
     pub revision: u64,
     pub message: Value,
-    pub file_ids: &'a [String],
+    pub file_ids: Option<&'a [String]>,
     pub files: &'a [PathBuf],
     pub operation: &'a str,
     pub session: Option<Uuid>,
@@ -158,7 +158,10 @@ pub fn revise(
         .ok_or_else(|| WriteFailure::local("a revision message must be a JSON object"))?;
     content.remove("sender_id");
     content.remove("message_id");
-    let mut body = json!({"message":message,"file_ids":revision.file_ids});
+    let mut body = json!({"message":message});
+    if let Some(ids) = revision.file_ids {
+        body["file_ids"] = json!(ids);
+    }
     if let Some(entry) = revision.in_reply_to {
         body["in_reply_to"] = entry.into();
     }
@@ -189,7 +192,7 @@ pub struct InteractiveRevision<'a> {
     pub choices: &'a [String],
     pub clear_choices: bool,
     pub fields: &'a MessageFieldOptions,
-    pub file_ids: &'a [String],
+    pub file_ids: Option<&'a [String]>,
     pub files: &'a [PathBuf],
     pub in_reply_to: Option<&'a str>,
 }
@@ -244,6 +247,7 @@ pub fn progress(
     session: Uuid,
     request: &str,
     report: &ProgressReport,
+    legacy_sender: Option<&str>,
     op_id: Option<Uuid>,
 ) -> Result<Value, WriteFailure> {
     if let Some(key) = op_id
@@ -270,9 +274,42 @@ pub fn progress(
     {
         item_id = remote.to_owned();
     }
-    let snapshot = client
-        .message(&item_id)
-        .map_err(|error| read_failure("progress", error))?;
+    let legacy_sender = match legacy_sender {
+        Some(sender) => Some(sender.to_owned()),
+        None if item_id == request => journal.legacy_sender(session, request)?,
+        None => None,
+    };
+    let snapshot = if let Some(sender) = legacy_sender {
+        if let Some(mapped) = journal.v2_item_id(&sender, request)? {
+            item_id = mapped;
+            client
+                .message(&item_id)
+                .map_err(|error| read_failure("progress", error))?
+        } else if let Some(found) = client
+            .legacy_message(&sender, request)
+            .map_err(|error| read_failure("progress", error))?
+        {
+            item_id = found["message"]["item_id"]
+                .as_str()
+                .ok_or_else(|| WriteFailure::local("legacy lookup lacked the item ID"))?
+                .to_owned();
+            if found["message"]["session"] != session.to_string() {
+                return Err(WriteFailure::local_refusal(
+                    "the message is outside this session",
+                ));
+            }
+            journal.remember_v2_item(&sender, request, &item_id)?;
+            found
+        } else {
+            client
+                .message(&item_id)
+                .map_err(|error| read_failure("progress", error))?
+        }
+    } else {
+        client
+            .message(&item_id)
+            .map_err(|error| read_failure("progress", error))?
+    };
     let item = &snapshot["message"];
     if item["item_id"] != item_id || item["session"] != session.to_string() {
         return Err(WriteFailure::local_refusal(
@@ -285,21 +322,6 @@ pub fn progress(
         .ok_or_else(|| WriteFailure::local("message read has no revision"))?;
     let message = progress_content(&item["message"], report, now_ms())
         .map_err(|error| WriteFailure::local_refusal(error.message))?;
-    let files = item["files"]
-        .as_array()
-        .ok_or_else(|| WriteFailure::local("message read has no file manifest"))?;
-    let mut file_ids = Vec::with_capacity(files.len());
-    for file in files {
-        let id = file["file_id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                WriteFailure::local_refusal(
-                    "the current revision has a file without a retained file ID",
-                )
-            })?;
-        file_ids.push(id.to_owned());
-    }
     revise(
         client,
         journal,
@@ -307,7 +329,7 @@ pub fn progress(
             item_id: &item_id,
             revision,
             message,
-            file_ids: &file_ids,
+            file_ids: None,
             files: &[],
             operation: "progress",
             session: Some(session),
@@ -405,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_put_replays_current_revision_and_same_read_file_ids() {
+    fn progress_put_replays_current_revision_without_replacing_attachments() {
         let mut journal = TestJournal::new();
         let session = Uuid::new_v4();
         let key = Uuid::new_v4();
@@ -435,6 +457,7 @@ mod tests {
             session,
             "opaque/item",
             &report,
+            None,
             Some(key),
         )
         .unwrap_err();
@@ -451,7 +474,7 @@ mod tests {
         );
         assert!(put.headers.contains(&("if-match".into(), "3".into())));
         let body: Value = serde_json::from_slice(&put.body).unwrap();
-        assert_eq!(body["file_ids"], json!(["retained-a", "retained-b"]));
+        assert!(body.get("file_ids").is_none());
         assert_eq!(body["message"]["body"], "Keep this body");
         assert_eq!(body["message"]["progress"]["percent"], 30);
 
@@ -495,6 +518,7 @@ mod tests {
             "opaque/item",
             &report,
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(failure.exit_code, 1);
@@ -516,7 +540,7 @@ mod tests {
             item_id: "opaque",
             revision: 4,
             message: json!({"title":"Changed","created_at":1}),
-            file_ids: &[],
+            file_ids: None,
             files: &[],
             operation: "revise",
             session: None,
