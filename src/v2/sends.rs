@@ -192,45 +192,7 @@ pub(super) fn freeze_send(
     lock: &OperationLock,
     operation: OperationRecord,
 ) -> Result<OperationRecord, WriteFailure> {
-    let mut file_ids = Vec::with_capacity(operation.uploads.len());
-    for upload in &operation.uploads {
-        if let Some(file_id) = &upload.upload_id {
-            file_ids.push(file_id.clone());
-            continue;
-        }
-        let key = upload
-            .upload_key
-            .ok_or_else(|| WriteFailure::local("upload has no saved key"))?;
-        let path = files::verified_staged_path(upload)
-            .map_err(|error| writes::unknown(&operation, &error, None))?;
-        journal.mark_operation_unknown(operation.op_id)?;
-        let response = match client.upload_file(key, path, &upload.name, upload.size_bytes) {
-            Ok(response) => response,
-            Err(error) => return Err(writes::record_failure(journal, &operation, error)?),
-        };
-        let Some(file_id) = response["file_id"].as_str().filter(|id| !id.is_empty()) else {
-            return Err(writes::unknown(
-                &operation,
-                "upload response lacked its file ID",
-                None,
-            ));
-        };
-        if response["name"] != upload.name
-            || response["sha256"] != upload.sha256
-            || response["size"] != upload.size_bytes
-        {
-            return Err(writes::unknown(
-                &operation,
-                "upload response did not match the saved file",
-                None,
-            ));
-        }
-        journal
-            .record_v2_upload(operation.op_id, key, file_id.to_owned())
-            .map_err(|error| writes::unknown(&operation, &error.to_string(), None))?;
-        file_ids.push(file_id.to_owned());
-    }
-
+    let file_ids = staged_file_ids(client, journal, &operation)?;
     let mut body = operation.request;
     if !file_ids.is_empty() {
         body["file_ids"] = json!(file_ids);
@@ -244,6 +206,53 @@ pub(super) fn freeze_send(
             body: body.to_string(),
         },
     )?)
+}
+
+pub(super) fn staged_file_ids(
+    client: &AgentClient,
+    journal: &mut JournalStore,
+    operation: &OperationRecord,
+) -> Result<Vec<String>, WriteFailure> {
+    let mut file_ids = Vec::with_capacity(operation.uploads.len());
+    for upload in &operation.uploads {
+        if let Some(file_id) = &upload.upload_id {
+            file_ids.push(file_id.clone());
+            continue;
+        }
+        let key = upload
+            .upload_key
+            .ok_or_else(|| WriteFailure::local("upload has no saved key"))?;
+        let path = files::verified_staged_path(upload)
+            .map_err(|error| writes::unknown(operation, &error, None))?;
+        journal.mark_operation_unknown(operation.op_id)?;
+        let response = match client.upload_file(key, path, &upload.name, upload.size_bytes) {
+            Ok(response) => response,
+            Err(error) => return Err(writes::record_failure(journal, operation, error)?),
+        };
+        let Some(file_id) = response["file_id"].as_str().filter(|id| !id.is_empty()) else {
+            return Err(writes::unknown(
+                operation,
+                "upload response lacked its file ID",
+                None,
+            ));
+        };
+        if response["name"] != upload.name
+            || response["sha256"] != upload.sha256
+            || response["size"] != upload.size_bytes
+        {
+            return Err(writes::unknown(
+                operation,
+                "upload response did not match the saved file",
+                None,
+            ));
+        }
+        journal
+            .record_v2_upload(operation.op_id, key, file_id.to_owned())
+            .map_err(|error| writes::unknown(operation, &error.to_string(), None))?;
+        file_ids.push(file_id.to_owned());
+    }
+
+    Ok(file_ids)
 }
 
 #[cfg(test)]

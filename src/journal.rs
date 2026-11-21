@@ -58,6 +58,8 @@ pub enum JournalError {
     OperationConflict(Uuid),
     #[error("local message reference already has a different server item ID")]
     ItemBindingConflict,
+    #[error("a revision is unresolved for this item; retry operation {0}")]
+    PendingRevision(Uuid),
     #[error("journal has no operation with key {0}")]
     MissingOperation(Uuid),
     #[error("operation {op_id} is {state}; only an unresolved operation can be abandoned")]
@@ -1175,6 +1177,23 @@ impl JournalStore {
                     return Err(JournalError::OperationConflict(op_id));
                 }
                 return Ok(existing);
+            }
+            if protocol_v2 && let Some(item_id) = request["revision_intent"].as_str() {
+                let pending: Option<String> = tx
+                    .query_row(
+                        "SELECT op_id FROM operations
+                     WHERE state IN ('prepared','unknown')
+                       AND json_extract(payload,'$.request.revision_intent')=?1
+                     LIMIT 1",
+                        [item_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(pending) = pending {
+                    let existing_key = Uuid::parse_str(&pending)
+                        .map_err(|_| JournalError::OperationConflict(op_id))?;
+                    return Err(JournalError::PendingRevision(existing_key));
+                }
             }
             let now = now_ms();
             let operation = OperationRecord {

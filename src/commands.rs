@@ -1355,7 +1355,7 @@ fn revised_message(
     .map(|(message, _warnings)| message)
 }
 
-fn revised_message_with_fields(
+pub(crate) fn revised_message_with_fields(
     current: &Value,
     title: &str,
     body: Option<&str>,
@@ -1479,6 +1479,24 @@ fn revised_message_with_fields(
         }
     }
     Ok((message, warnings))
+}
+
+pub(crate) fn progress_content(
+    current: &Value,
+    report: &ProgressReport,
+    at_ms: u64,
+) -> Result<Value, CommandError> {
+    report.validate()?;
+    if current["message_type"] != "fyi" || current.get("progress").is_none() {
+        return Err(CommandError::new(
+            "only a Progress FYI can be updated",
+            EXIT_REFUSED,
+        ));
+    }
+    let mut message = current.clone();
+    message["progress"] = progress::next_progress(current, report, at_ms)?;
+    message["created_at"] = at_ms.into();
+    Ok(message)
 }
 
 fn options_field<'a>(options: &'a MessageFieldOptions, field: &str) -> Option<&'a str> {
