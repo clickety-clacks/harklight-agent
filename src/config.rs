@@ -47,6 +47,7 @@ struct ServerFile {
     name: String,
     port: u16,
     device_port: Option<u16>,
+    device_url: Option<String>,
     ca_sha256: String,
 }
 
@@ -110,10 +111,22 @@ impl EnrolledIdentity {
             return Err(ConfigError::CaMismatch);
         }
 
+        let (address, name) = match server.device_url {
+            Some(device_url) => {
+                let url = Url::parse(&device_url)
+                    .map_err(|_| ConfigError::Invalid("invalid saved device_url".into()))?;
+                let host = url
+                    .host_str()
+                    .ok_or_else(|| ConfigError::Invalid("invalid saved device_url".into()))?
+                    .to_owned();
+                (host.clone(), host)
+            }
+            None => (server.address, server.name),
+        };
         Ok(Self {
             directory: directory.to_path_buf(),
-            address: server.address,
-            name: server.name,
+            address,
+            name,
             port: server.device_port.unwrap_or(server.port),
             person_id: enrollment.person_id,
             device_id: enrollment.device_id,

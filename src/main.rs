@@ -404,7 +404,13 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum EnrollCommand {
-    Start(EnrollStartArgs),
+    Start {
+        #[command(flatten)]
+        manual: EnrollStartArgs,
+        /// Private JSON invitation file or file containing a native join link.
+        #[arg(long, conflicts_with_all = ["connect", "name", "port"])]
+        invitation: Option<PathBuf>,
+    },
     Retry(EnrollStartArgs),
     Status(EnrollStatusArgs),
 }
@@ -504,7 +510,18 @@ fn main() {
     let cli = Cli::parse();
     if let Command::Enroll { action } = &cli.command {
         let result = match action {
-            EnrollCommand::Start(args) => enrollment::start(
+            EnrollCommand::Start {
+                manual,
+                invitation: Some(path),
+            } => enrollment::start_invitation(
+                cli.identity_dir.as_deref(),
+                path,
+                manual.label.as_deref(),
+            ),
+            EnrollCommand::Start {
+                manual: args,
+                invitation: None,
+            } => enrollment::start(
                 cli.identity_dir.as_deref(),
                 cli.ca_file.as_deref(),
                 args.endpoint.connect.as_deref(),
@@ -593,9 +610,11 @@ fn device_identity(cli: &Cli) -> EnrolledIdentity {
         .identity_dir
         .as_deref()
         .unwrap_or_else(|| fail("provide --identity-dir or HARKLIGHT_IDENTITY_DIR".into(), 1));
+    let invitation_ca = identity_dir.join("invitation-ca.pem");
     let ca_file = cli
         .ca_file
         .as_deref()
+        .or_else(|| invitation_ca.is_file().then_some(invitation_ca.as_path()))
         .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
     let mut identity = EnrolledIdentity::load(identity_dir, ca_file)
         .unwrap_or_else(|error| fail(error.to_string(), 1));

@@ -497,3 +497,145 @@ fn internal_error_response() -> test_tls::FixtureResponse {
         truncate: false,
     }
 }
+
+#[test]
+fn enroll_accepts_v2_invitation_and_saves_its_device_endpoint() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use test_tls::FixtureResponse;
+    let server = SlowServer::sequence(vec![
+        FixtureResponse {
+            status: "200 OK",
+            headers: &[],
+            body: String::new(),
+            truncate: true,
+        },
+        FixtureResponse::json(json!({"state":"pending","approval_code":"ABCDEFG234"})),
+        FixtureResponse::json(
+            json!({"state":"approved","person_id":"person","device_id":"device"}),
+        ),
+    ]);
+    let device_port = 24680;
+    let mut invitation = join_fixture(server.port, 2, &format!("https://localhost:{device_port}"));
+    let der = invitation_ca_der(&server.ca_pem);
+    invitation["ca_pem"] = server.ca_pem.clone().into();
+    invitation["ca_sha256"] = hex::encode(Sha256::digest(der)).into();
+    let root = std::env::temp_dir().join(format!("agent-invitation-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let fixture = CliFixture(root);
+    let identity = fixture.0.join("new-identity");
+    let path = fixture.0.join("invite");
+    fs::write(
+        &path,
+        format!(
+            "harklight://join#{}",
+            URL_SAFE_NO_PAD.encode(invitation.to_string())
+        ),
+    )
+    .unwrap();
+    let start = enroll_invitation_cli(
+        &identity,
+        &["start", "--invitation", path.to_str().unwrap()],
+    );
+    assert_eq!(start.status.code(), Some(7), "{start:?}");
+    let retry = enroll_invitation_cli(&identity, &["retry"]);
+    assert!(retry.status.success(), "{retry:?}");
+    let saved: Value =
+        serde_json::from_slice(&fs::read(identity.join("server.json")).unwrap()).unwrap();
+    assert_eq!(saved["port"], server.port);
+    assert_eq!(saved["device_port"], device_port);
+    assert_eq!(
+        saved["device_url"],
+        format!("https://localhost:{device_port}")
+    );
+    let approved = enroll_invitation_cli(&identity, &["status"]);
+    assert!(approved.status.success(), "{approved:?}");
+    let enrolled = harklight_agent::config::EnrolledIdentity::load(
+        &identity,
+        &identity.join("invitation-ca.pem"),
+    )
+    .unwrap();
+    assert_eq!(enrolled.port, device_port);
+    assert_eq!(
+        enrolled.device_url("/v2/me").unwrap().as_str(),
+        format!("https://localhost:{device_port}/v2/me")
+    );
+    let requests = server.requests();
+    assert_eq!(requests[0].line.trim_end(), "POST /enroll HTTP/1.1");
+    let first: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(first["invite_token"], "synthetic-invite");
+    assert!(
+        first["public_certificate"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN CERTIFICATE")
+    );
+    assert_eq!(first["status_secret"].as_str().unwrap().len(), 64);
+    assert_eq!(requests[0].line, requests[1].line);
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(requests[2].line.trim_end(), "POST /enroll/status HTTP/1.1");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[2].body).unwrap(),
+        json!({"status_secret":first["status_secret"]})
+    );
+}
+
+#[test]
+fn enroll_refuses_v1_and_malformed_device_urls_before_creating_identity() {
+    let root = std::env::temp_dir().join(format!("agent-invalid-invitation-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let fixture = CliFixture(root);
+    let identity = fixture.0.join("new-identity");
+    let path = fixture.0.join("invite");
+    let mut version_one = join_fixture(12345, 1, "https://localhost:12346");
+    version_one.as_object_mut().unwrap().remove("device_url");
+    version_one["relay_url"] = "wss://localhost:12346".into();
+    let mut cases = vec![(version_one, "ask for a new one")];
+    for device_url in [
+        "http://localhost:12346",
+        "https://localhost",
+        "https://localhost:12346/v2",
+        "https://localhost:0",
+    ] {
+        cases.push((join_fixture(12345, 2, device_url), "device_url"));
+    }
+    for (document, expected) in cases {
+        fs::write(&path, document.to_string()).unwrap();
+        let result = enroll_invitation_cli(
+            &identity,
+            &["start", "--invitation", path.to_str().unwrap()],
+        );
+        assert!(!result.status.success(), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(expected),
+            "{result:?}"
+        );
+        assert!(!identity.exists());
+    }
+}
+
+fn join_fixture(enrollment_port: u16, version: u32, device_url: &str) -> Value {
+    json!({"v":version,"person_id":"person","server_name":"Fixture",
+        "enrollment_url":format!("https://localhost:{enrollment_port}"),"device_url":device_url,
+        "ca_pem":"","ca_sha256":"","invite_token":"synthetic-invite","expires_at":null})
+}
+
+fn invitation_ca_der(pem: &str) -> Vec<u8> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    STANDARD.decode(body).unwrap()
+}
+
+fn enroll_invitation_cli(identity: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_harklight-agent"))
+        .env_remove("HARKLIGHT_CA_FILE")
+        .env_remove("HARKLIGHT_DEVICE_PORT")
+        .arg("--identity-dir")
+        .arg(identity)
+        .arg("enroll")
+        .args(args)
+        .output()
+        .unwrap()
+}
