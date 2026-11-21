@@ -613,9 +613,48 @@ fn enroll_refuses_v1_and_malformed_device_urls_before_creating_identity() {
     }
 }
 
+#[test]
+fn enroll_removes_unaccepted_identity_after_definite_invitation_refusal() {
+    use test_tls::FixtureResponse;
+
+    let root = std::env::temp_dir().join(format!("agent-spent-invitation-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let fixture = CliFixture(root);
+    let identity = fixture.0.join("new-identity");
+    let path = fixture.0.join("invite");
+    for (status, error, diagnostic) in [
+        ("409 Conflict", "used", "invitation already used"),
+        ("404 Not Found", "refused", "ask for a new one"),
+    ] {
+        let server = SlowServer::sequence(vec![FixtureResponse {
+            status,
+            headers: &[],
+            body: json!({"error": error}).to_string(),
+            truncate: false,
+        }]);
+        let mut invitation = join_fixture(server.port, 2, "https://localhost:24680");
+        invitation["ca_pem"] = server.ca_pem.clone().into();
+        invitation["ca_sha256"] =
+            hex::encode(Sha256::digest(invitation_ca_der(&server.ca_pem))).into();
+        fs::write(&path, invitation.to_string()).unwrap();
+        let result = enroll_invitation_cli(
+            &identity,
+            &["start", "--invitation", path.to_str().unwrap()],
+        );
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(result.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            "{result:?}"
+        );
+        assert!(!identity.exists());
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
 fn join_fixture(enrollment_port: u16, version: u32, device_url: &str) -> Value {
     json!({"v":version,"person_id":"person","server_name":"Fixture",
-        "enrollment_url":format!("https://localhost:{enrollment_port}"),"device_url":device_url,
+        "enrollment_url":format!("https://localhost:{enrollment_port}/enroll"),"device_url":device_url,
         "ca_pem":"","ca_sha256":"","invite_token":"synthetic-invite","expires_at":null})
 }
 

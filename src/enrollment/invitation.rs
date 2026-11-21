@@ -54,9 +54,13 @@ pub fn start_invitation(
     if document["v"] != 2 {
         return Err(invalid());
     }
-    let device = invitation_endpoint(document["device_url"].as_str(), "device_url")?;
+    let device = invitation_endpoint(document["device_url"].as_str(), "device_url", "/")?;
     let invitation: Invitation = serde_json::from_value(document).map_err(|_| invalid())?;
-    let endpoint = invitation_endpoint(Some(&invitation.enrollment_url), "enrollment_url")?;
+    let endpoint = invitation_endpoint(
+        Some(&invitation.enrollment_url),
+        "enrollment_url",
+        "/enroll",
+    )?;
     if invitation.person_id.is_empty() || invitation.invite_token.is_empty() {
         return Err(invalid());
     }
@@ -86,17 +90,30 @@ pub fn start_invitation(
     SavedInvitation { directory, state }.redeem(&transport, &context.endpoint)
 }
 
-fn invitation_endpoint(value: Option<&str>, field: &str) -> Result<Endpoint, EnrollmentError> {
+fn invitation_endpoint(
+    value: Option<&str>,
+    field: &str,
+    path: &str,
+) -> Result<Endpoint, EnrollmentError> {
     let invalid = || {
+        let target = if path == "/" {
+            "an HTTPS origin"
+        } else {
+            "an HTTPS /enroll URL"
+        };
         EnrollmentError::local(format!(
-            "invitation {field} must be an HTTPS origin with an explicit port"
+            "invitation {field} must be {target} with an explicit port"
         ))
     };
     let value = value.ok_or_else(invalid)?;
     // Url normalizes an explicit default port away. Read the port from the
     // supplied authority, then validate the full URL separately.
     let authority = value.strip_prefix("https://").ok_or_else(invalid)?;
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    let authority = if path == "/" {
+        authority.strip_suffix('/').unwrap_or(authority)
+    } else {
+        authority.strip_suffix(path).ok_or_else(invalid)?
+    };
     let (_, port) = authority.rsplit_once(':').ok_or_else(invalid)?;
     let port = port
         .parse::<u16>()
@@ -109,8 +126,8 @@ fn invitation_endpoint(value: Option<&str>, field: &str) -> Result<Endpoint, Enr
         .filter(|host| !host.is_empty())
         .ok_or_else(invalid)?;
     if authority.contains(['/', '\\', '@', '?', '#'])
-        || value.trim() != value
-        || url.path() != "/"
+        || value.chars().any(char::is_whitespace)
+        || url.path() != path
         || url.port_or_known_default() != Some(port)
     {
         return Err(invalid());
@@ -224,6 +241,41 @@ impl SavedInvitation {
     }
 
     fn redeem(
+        self,
+        transport: &impl EnrollmentTransport,
+        endpoint: &Endpoint,
+    ) -> Result<(), EnrollmentError> {
+        let directory = self.directory.clone();
+        let result = self.submit(transport, endpoint);
+        if let Err(error) = &result
+            && error.exit_code == EXIT_REFUSED
+        {
+            // Remove only files created for this unaccepted enrollment.
+            for name in [
+                INVITATION_STATE,
+                "identity.key",
+                "identity.pem",
+                CA_FILE,
+                "server.json",
+            ] {
+                fs::remove_file(directory.join(name)).map_err(|cleanup| {
+                    EnrollmentError::local(format!(
+                        "{}; could not remove enrollment files: {cleanup}",
+                        error.message
+                    ))
+                })?;
+            }
+            fs::remove_dir(directory).map_err(|cleanup| {
+                EnrollmentError::local(format!(
+                    "{}; could not remove enrollment directory: {cleanup}",
+                    error.message
+                ))
+            })?;
+        }
+        result
+    }
+
+    fn submit(
         mut self,
         transport: &impl EnrollmentTransport,
         endpoint: &Endpoint,
@@ -247,6 +299,27 @@ impl SavedInvitation {
             .post("/enroll", &payload)
             .map_err(|error| request_error(error, endpoint))?;
         let response = parse_response(response, endpoint)?;
+        match (
+            response["status"].as_u64(),
+            response["body"]["error"].as_str(),
+        ) {
+            (Some(409), Some("used")) => {
+                return Err(EnrollmentError::refused(
+                    "invitation already used; ask for a new one",
+                ));
+            }
+            (Some(404), Some("refused")) | (Some(410), Some("expired")) => {
+                return Err(EnrollmentError::refused(
+                    "the Server refused this invitation; ask for a new one",
+                ));
+            }
+            (Some(503), Some("capacity" | "unavailable")) => {
+                return Err(EnrollmentError::refused(
+                    "the Server cannot accept enrollment right now; try the invitation again later",
+                ));
+            }
+            _ => {}
+        }
         if let Some(error) = refusal_response(&response, endpoint)? {
             return Err(error);
         }
