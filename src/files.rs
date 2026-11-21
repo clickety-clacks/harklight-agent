@@ -433,6 +433,40 @@ fn stage_upload(
     })
 }
 
+pub(crate) fn stage_v2_uploads(
+    paths: &[PathBuf],
+    directory: &Path,
+    upload_cap: Option<u64>,
+) -> Result<Vec<UploadSource>, String> {
+    let selections = inspect(paths)?;
+    let mut uploads: Vec<UploadSource> = Vec::with_capacity(selections.len());
+    for (index, selected) in selections.iter().enumerate() {
+        let path = directory.join(format!("{index}.upload"));
+        match stage_upload(selected, &path, upload_cap) {
+            Ok(upload) => uploads.push(upload),
+            Err(error) => {
+                cleanup_staged_uploads(&uploads);
+                return Err(error);
+            }
+        }
+    }
+    Ok(uploads)
+}
+
+pub(crate) fn verified_staged_path(upload: &UploadSource) -> Result<&Path, String> {
+    let path = upload
+        .staged_path
+        .as_deref()
+        .ok_or_else(|| format!("staged bytes for {} are unavailable", upload.name))?;
+    if existing_file_matches_digest(path, upload.size_bytes, &upload.sha256)? != Some(true) {
+        return Err(format!(
+            "staged bytes for {} do not match the saved digest",
+            upload.name
+        ));
+    }
+    Ok(path)
+}
+
 pub fn cleanup_staged_uploads(uploads: &[UploadSource]) {
     for upload in uploads {
         if let Some(path) = upload.staged_path.as_ref() {
@@ -762,43 +796,7 @@ fn persist_reader(
             return Err(format!("could not create local file: {error}"));
         }
     };
-    let mut size = 0u64;
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let copy_result = (|| -> Result<(), String> {
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|error| format!("could not fetch file bytes: {error}"))?;
-            if count == 0 {
-                break;
-            }
-            size = size
-                .checked_add(count as u64)
-                .ok_or_else(|| "downloaded file exceeds the supported size range".to_owned())?;
-            if size > expected_size {
-                return Err("downloaded file exceeds the entry's declared byte size".into());
-            }
-            output
-                .write_all(&buffer[..count])
-                .map_err(|error| format!("could not write downloaded file: {error}"))?;
-            digest.update(&buffer[..count]);
-        }
-        if size != expected_size {
-            return Err(format!(
-                "downloaded file is incomplete: expected {expected_size} bytes, received {size}"
-            ));
-        }
-        let actual_sha256 = hex::encode(digest.finalize());
-        if actual_sha256 != expected_sha256 {
-            return Err("downloaded file SHA-256 does not match the entry".into());
-        }
-        output
-            .sync_all()
-            .and_then(|()| set_private_file(&output))
-            .map_err(|error| format!("could not persist downloaded file: {error}"))?;
-        Ok(())
-    })();
+    let copy_result = copy_verified(reader, &mut output, expected_size, expected_sha256);
     drop(output);
     if let Err(reason) = copy_result {
         let _ = fs::remove_file(&temporary);
@@ -816,6 +814,85 @@ fn persist_reader(
     }
     let _ = FileExt::unlock(&lock);
     Ok(path)
+}
+
+/// Verify a streamed download before making its contents visible at the
+/// requested path. Creating the destination never replaces an existing file.
+pub(crate) fn persist_download(
+    path: &Path,
+    reader: &mut dyn Read,
+    size: u64,
+    sha256: &str,
+) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = directory.join(format!(".harklight-download-{}.tmp", uuid::Uuid::new_v4()));
+    let mut output = create_private_new_file(&temporary)
+        .map_err(|error| format!("could not create temporary download: {error}"))?;
+    let copied = copy_verified(reader, &mut output, size, sha256);
+    drop(output);
+    let result = copied.and_then(|()| match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            if let Ok(parent) = File::open(directory) {
+                let _ = parent.sync_all();
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if existing_file_matches_digest(path, size, sha256)? == Some(true) {
+                Ok(())
+            } else {
+                Err("a different file already exists at the requested path".into())
+            }
+        }
+        Err(error) => Err(format!("could not publish downloaded file: {error}")),
+    });
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
+fn copy_verified(
+    reader: &mut dyn Read,
+    output: &mut File,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    let mut size = 0u64;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("could not fetch file bytes: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| "downloaded file exceeds the supported size range".to_owned())?;
+        if size > expected_size {
+            return Err("downloaded file exceeds the declared byte size".into());
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("could not write downloaded file: {error}"))?;
+        digest.update(&buffer[..count]);
+    }
+    if size != expected_size {
+        return Err(format!(
+            "downloaded file is incomplete: expected {expected_size} bytes, received {size}"
+        ));
+    }
+    let actual_sha256 = hex::encode(digest.finalize());
+    if actual_sha256 != expected_sha256 {
+        return Err("downloaded file SHA-256 does not match the declared digest".into());
+    }
+    output
+        .sync_all()
+        .and_then(|()| set_private_file(output))
+        .map_err(|error| format!("could not persist downloaded file: {error}"))
 }
 
 fn persist_file_locked(directory: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
