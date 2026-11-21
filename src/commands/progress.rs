@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::{
-    CommandContext, CommandError, EXIT_REFUSED, OperationTransport, emit_committed, journal_error,
-    now_ms, request_context, submit_operation_with_transport,
+    CommandContext, CommandError, EXIT_REFUSED, OperationTransport, emit_committed,
+    ensure_request_open, journal_error, now_ms, request_context, submit_operation_with_transport,
 };
 use crate::files::{self, PreparedFiles, ServerFileLimits};
 use crate::journal::JournalStore;
@@ -196,6 +196,7 @@ fn update_with(
         .request_snapshot(session, message_id, None)
         .map_err(|error| journal_error(error, 1))?;
     let request = request_context(&snapshot, session, message_id)?;
+    ensure_request_open(&snapshot, session, &request)?;
     let is_progress = request.message.get("message_type").and_then(Value::as_str) == Some("fyi")
         && request.message.get("progress").is_some();
     if !is_progress {
