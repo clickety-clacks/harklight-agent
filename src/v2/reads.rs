@@ -17,6 +17,19 @@ impl AgentClient {
         self.read(&["agent", "messages", item_id], &[])
     }
 
+    pub fn message_revision(&self, item_id: &str, revision: u64) -> Result<Value, V2Error> {
+        self.read(
+            &[
+                "agent",
+                "messages",
+                item_id,
+                "revisions",
+                &revision.to_string(),
+            ],
+            &[],
+        )
+    }
+
     pub fn message_entries(
         &self,
         item_id: &str,
@@ -114,6 +127,21 @@ mod tests {
         assert_eq!(
             server.request_line().trim_end(),
             format!("GET /v2/agent/messages?session={session}&page=opaque%26start HTTP/1.1"),
+        );
+    }
+
+    #[test]
+    fn historical_revision_preserves_the_selected_revision_and_file_ids() {
+        let server = SlowServer::answer_after(
+            Duration::ZERO,
+            r#"{"rev":24,"message":{"item_id":"item/one","revision":2,"files":[{"file_id":"older"}]}}"#,
+        );
+        let result = client_for(&server).message_revision("item/one", 2).unwrap();
+        assert_eq!(result["message"]["revision"], 2);
+        assert_eq!(result["message"]["files"][0]["file_id"], "older");
+        assert_eq!(
+            server.request_line().trim_end(),
+            "GET /v2/agent/messages/item%2Fone/revisions/2 HTTP/1.1",
         );
     }
 

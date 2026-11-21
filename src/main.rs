@@ -205,7 +205,7 @@ enum Command {
         sender_id: Option<String>,
         #[arg(long, requires = "sender_id")]
         message_id: Option<String>,
-        #[arg(long, requires = "sender_id")]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         revision: Option<u64>,
     },
     /// List sent messages, newest first.
@@ -567,9 +567,7 @@ fn main() {
 
     if matches!(
         cli.command,
-        Command::MessageGet { revision: None, .. }
-            | Command::Messages { .. }
-            | Command::MessageEntries { .. }
+        Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. }
     ) {
         run_device_read(&cli);
         return;
@@ -722,12 +720,6 @@ fn main() {
             args.ack2,
         ),
         Command::Read { session } => commands::read(&context, session),
-        Command::MessageGet {
-            sender_id: Some(sender_id),
-            message_id: Some(message_id),
-            revision: Some(revision),
-            ..
-        } => commands::message_get(&context, &sender_id, &message_id, Some(revision)),
         Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. } => {
             unreachable!("device reads were dispatched before loading the origin context")
         }
@@ -953,22 +945,40 @@ fn run_device_read(cli: &Cli) {
 
     let (operation, result) = match &cli.command {
         Command::MessageGet {
-            item_id: Some(id), ..
-        } => ("message-get", client.message(id)),
+            item_id: Some(id),
+            revision,
+            ..
+        } => (
+            "message-get",
+            revision.map_or_else(
+                || client.message(id),
+                |revision| client.message_revision(id, revision),
+            ),
+        ),
         Command::MessageGet {
             sender_id: Some(sender),
             message_id: Some(id),
+            revision,
             ..
         } => (
             "message-get",
             client.legacy_message(sender, id).and_then(|message| {
-                message.ok_or_else(|| V2Error::Http {
+                let message = message.ok_or_else(|| V2Error::Http {
                     status: 404,
                     token: Some("not_found".into()),
                     field: None,
                     request_id: None,
                     retry_after: None,
-                })
+                })?;
+                match revision {
+                    Some(revision) => {
+                        let item_id = message["message"]["item_id"]
+                            .as_str()
+                            .ok_or(V2Error::InvalidResponse { request_id: None })?;
+                        client.message_revision(item_id, *revision)
+                    }
+                    None => Ok(message),
+                }
             }),
         ),
         Command::Messages { session, page } => {
