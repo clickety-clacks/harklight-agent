@@ -323,8 +323,8 @@ unchanged inputs; do not submit a changed operation.
 
 ### Reattach an existing handle
 
-After a restart on the same host, update an existing handle's vendor session
-ID with the same enrolled origin and local journal:
+After a restart, or on another host with the same enrollment, update an existing
+handle's vendor session ID:
 
 ```sh
 harklight-agent attach --session "$HARKLIGHT_SESSION" \
@@ -333,12 +333,13 @@ harklight-agent attach --session "$HARKLIGHT_SESSION" \
 ```
 
 Pass `--vendor-session-id none` when there is no current vendor session ID; the
-origin receives JSON `null`. `attach` requires the local journal to contain the
-committed send that created the handle. It updates only the handle's vendor ID,
+origin receives JSON `null`. `attach` confirms the handle with the Server; if
+this host's journal did not create it, the CLI rebuilds its local feed state from
+the Server's feed. It refuses only if the Server does not know the handle or the
+handle is not this enrollment's. It updates only the handle's vendor ID,
 then records the requested route through the existing support operation. It
 does not create a request or change the handle or conversation history. Use the
-same host, enrollment and journal; this command does not migrate an origin to a
-different host or session.
+same enrollment; this command does not migrate an origin to a different session.
 
 Run a separate `listen` only after `attach` confirms both operations. `listen`
 checks the current route support again before opening the stream and leaves
@@ -407,8 +408,10 @@ harklight-agent reconnect --session "$HARKLIGHT_SESSION" \
 ```
 
 Use the existing vendor session ID in place of `none` when applicable. With only
-`--session`, reconnect uses the confirmed attachment and route in the same-origin
-journal. It refuses a missing attachment or a held listener lock. It does not
+`--session`, reconnect uses the confirmed attachment and route in the journal.
+Like `attach`, it confirms the handle with the Server and rebuilds local feed
+state when this host has none. It refuses a missing attachment or a held listener
+lock. It does not
 create a session, move its origin, resend a message, or replay reply/result
 operations. Uncertain attachment/support operations first recover with their
 original keys and inputs.

@@ -21,8 +21,6 @@ pub(crate) use progress_files::is_progress;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
-    #[error("the enrolled origin has no existing local journal")]
-    MissingOriginJournal,
     #[error("journal I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("journal JSON is invalid: {0}")]
@@ -319,20 +317,6 @@ pub struct JournalStore {
 }
 
 impl JournalStore {
-    /// Recovery may use existing durable history, but must not initialize a
-    /// new origin journal when that history is missing.
-    pub fn open_existing(
-        state_root: &Path,
-        device_id: &str,
-        session_handle: Uuid,
-    ) -> Result<Self, JournalError> {
-        let directory = state_root.join(hex::encode(Sha256::digest(device_id.as_bytes())));
-        if !directory.join("origin-feed.sqlite3").is_file() {
-            return Err(JournalError::MissingOriginJournal);
-        }
-        Self::open(state_root, device_id, session_handle)
-    }
-
     pub fn open(
         state_root: &Path,
         device_id: &str,

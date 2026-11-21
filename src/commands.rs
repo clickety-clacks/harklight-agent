@@ -2615,6 +2615,49 @@ fn local_journal_proves_existing_session(
     }))
 }
 
+/// Confirm an existing handle with the Server instead of requiring this host's
+/// journal to have created it. The Server refuses a handle it does not know or
+/// that belongs to another enrollment; when this host's journal has no proof of
+/// its own, rebuild the local feed state from the Server's feed.
+fn confirm_existing_session_with_server(
+    context: &CommandContext,
+    store: &mut JournalStore,
+    session: Uuid,
+) -> Result<(), CommandError> {
+    confirm_existing_session_with(
+        store,
+        session,
+        |request| post_read(context, request),
+        |raw, directory| {
+            files::materialize_incoming(raw, directory, &context.api)
+                .map_err(|error| CommandError::new(error, 1))
+        },
+    )
+}
+
+fn confirm_existing_session_with(
+    store: &mut JournalStore,
+    session: Uuid,
+    mut post: impl FnMut(&Value) -> Result<Value, CommandError>,
+    materialize: impl FnMut(&mut Value, &Path) -> Result<BTreeMap<String, FileTransfer>, CommandError>,
+) -> Result<(), CommandError> {
+    post(&json!({"v":1,"type":"status","session_handle":session.to_string()})).map_err(
+        |mut error| {
+            if error.exit_code == EXIT_REFUSED {
+                error.message = format!(
+                    "the Server does not recognize this existing handle for this enrollment ({})",
+                    error.message
+                );
+            }
+            error
+        },
+    )?;
+    if !local_journal_proves_existing_session(store, session)? {
+        fetch_feed_with(store, post, materialize)?;
+    }
+    Ok(())
+}
+
 fn ensure_attach_recovery_compatible(
     store: &JournalStore,
     session: Uuid,
@@ -2731,12 +2774,7 @@ pub fn attach_with_origin(
     store
         .acquire_listener()
         .map_err(|error| journal_error(error, EXIT_LISTENER_ACTIVE))?;
-    if !local_journal_proves_existing_session(&store, session)? {
-        return Err(CommandError::new(
-            "the local origin journal does not prove this existing handle; attach requires the same enrolled origin and host journal",
-            EXIT_REFUSED,
-        ));
-    }
+    confirm_existing_session_with_server(context, &mut store, session)?;
 
     let mut support_request =
         attachment_support_request(Uuid::new_v4(), session, route, controller, ack2);
@@ -2841,13 +2879,6 @@ fn attachment_route_for_listen(
             EXIT_REFUSED,
         ));
     }
-    if !local_journal_proves_existing_session(store, session)? {
-        return Err(CommandError::new(
-            "the local origin journal no longer proves this existing handle; do not listen",
-            EXIT_REFUSED,
-        ));
-    }
-
     let support = operations[attachment_index + 1..]
         .iter()
         .rev()
@@ -10303,5 +10334,72 @@ mod tests {
             store.abandon_operation(Uuid::new_v4()),
             Err(JournalError::MissingOperation(_))
         ));
+    }
+
+    #[test]
+    fn attach_confirms_an_unseen_handle_with_the_server_and_rebuilds_state_from_the_feed() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        assert!(!local_journal_proves_existing_session(&store, session).unwrap());
+
+        let mut posts = Vec::new();
+        confirm_existing_session_with(
+            &mut store,
+            session,
+            |request| {
+                posts.push(request.clone());
+                match request["type"].as_str() {
+                    Some("status") => post_read_response(json!({"v":1,"type":"ok"})),
+                    _ => Ok(json!({
+                        "v":1,
+                        "type":"ok",
+                        "cursor":1,
+                        "entries":[{
+                            "event_id":"1",
+                            "session_handle":session.to_string(),
+                            "kind":"revision",
+                            "author":"origin",
+                            "sender_id":"app:example",
+                            "message_id":"message-1",
+                            "request_revision":1,
+                            "message":{"sender_id":"app:example","message_id":"message-1","title":"Request"}
+                        }]
+                    })),
+                }
+            },
+            |_raw, _directory| Ok(BTreeMap::new()),
+        )
+        .unwrap();
+
+        assert_eq!(posts[0]["type"], "status");
+        assert_eq!(posts[1], json!({"v":1,"type":"feed","since":0}));
+        let snapshot = store.snapshot().unwrap();
+        let request = request_context(&snapshot, session, "message-1").unwrap();
+        assert_eq!(request.message["title"], "Request");
+    }
+
+    #[test]
+    fn attach_refuses_a_handle_the_server_does_not_recognize_without_touching_the_feed() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let mut posts = 0;
+        let error = confirm_existing_session_with(
+            &mut store,
+            session,
+            |request| {
+                posts += 1;
+                assert_eq!(request["type"], "status");
+                post_read_response(json!({"v":1,"type":"error","reason":"not_found"}))
+            },
+            |_raw, _directory| Ok(BTreeMap::new()),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code, EXIT_REFUSED);
+        assert!(error.message.contains("does not recognize"));
+        assert!(error.message.contains("not_found"));
+        assert_eq!(posts, 1);
+        assert_eq!(store.cursor().unwrap(), 0);
     }
 }
