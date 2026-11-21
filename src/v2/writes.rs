@@ -51,6 +51,28 @@ pub enum ControlWrite<'a> {
         action: &'a str,
     },
     EndSession(Uuid),
+    Result {
+        item_id: &'a str,
+        status: &'a str,
+    },
+    Receipt {
+        item_id: &'a str,
+        entry_id: Option<&'a str>,
+        not_handed: Option<&'a str>,
+        agent: Option<&'a str>,
+        rerouted: bool,
+    },
+    FileUse {
+        item_id: &'a str,
+        entry_id: &'a str,
+        file_id: &'a str,
+        reason: Option<&'a str>,
+    },
+    Show {
+        item_id: &'a str,
+        chat: bool,
+        device_name: Option<&'a str>,
+    },
 }
 
 pub fn control(
@@ -93,6 +115,82 @@ pub fn control(
             &["agent", "sessions", &session.to_string(), "end"],
             json!({}),
         ),
+        ControlWrite::Result { item_id, status } => post(
+            client,
+            journal,
+            "result",
+            None,
+            op_id,
+            &["agent", "messages", item_id, "result"],
+            json!({"status":status}),
+        ),
+        ControlWrite::Receipt {
+            item_id,
+            entry_id,
+            not_handed,
+            agent,
+            rerouted,
+        } => {
+            let mut body = json!({"outcome": "handed"});
+            if let Some(reason) = not_handed {
+                body["outcome"] = "not_handed".into();
+                body["reason"] = reason.into();
+            }
+            if let Some(agent) = agent {
+                body["agent"] = agent.into();
+            }
+            if rerouted {
+                body["rerouted"] = true.into();
+            }
+            let path = match entry_id {
+                Some(id) => vec!["agent", "messages", item_id, "entries", id, "receipt"],
+                None => vec!["agent", "messages", item_id, "receipt"],
+            };
+            post(client, journal, "receipt", None, op_id, &path, body)
+        }
+        ControlWrite::FileUse {
+            item_id,
+            entry_id,
+            file_id,
+            reason,
+        } => {
+            let mut body = json!({"file_id":file_id, "outcome":"used"});
+            if let Some(reason) = reason {
+                body["outcome"] = "unusable".into();
+                body["reason"] = reason.into();
+            }
+            post(
+                client,
+                journal,
+                "file-use",
+                None,
+                op_id,
+                &[
+                    "agent", "messages", item_id, "entries", entry_id, "file-use",
+                ],
+                body,
+            )
+        }
+        ControlWrite::Show {
+            item_id,
+            chat,
+            device_name,
+        } => {
+            let mut body =
+                json!({"item_id":item_id,"target":if chat { "chat" } else { "message" }});
+            if let Some(name) = device_name {
+                body["device_name"] = name.into();
+            }
+            post(
+                client,
+                journal,
+                "show",
+                None,
+                op_id,
+                &["agent", "show"],
+                body,
+            )
+        }
     }
 }
 
@@ -123,13 +221,20 @@ pub fn post(
         body: body.to_string(),
         if_match: None,
     };
-    journal.prepare_operation(
+    let lock = journal.lock_operation(op_id)?;
+    let operation = journal.prepare_v2_operation(
         op_id,
         session.unwrap_or_else(Uuid::nil),
         operation.to_owned(),
-        json!({"api":2,"method":"POST","path":path,"body":body}),
+        json!({"method":"POST","path":path,"body":body}),
+        Vec::new(),
     )?;
-    let operation = journal.begin_v2_write(op_id, request)?;
+    let operation = match operation.state {
+        OperationState::Prepared | OperationState::Unknown => {
+            journal.begin_v2_write(&lock, request)?
+        }
+        OperationState::Committed | OperationState::Rejected => operation,
+    };
     deliver(client, journal, operation)
 }
 
@@ -137,14 +242,46 @@ pub fn retry(
     client: &AgentClient,
     journal: &mut JournalStore,
     op_id: Uuid,
+    expected_journal_id: Option<&str>,
 ) -> Result<Value, WriteFailure> {
-    let operation = journal
-        .operation(op_id)?
-        .ok_or(JournalError::MissingOperation(op_id))?;
+    let _lock = journal.lock_operation(op_id)?;
+    let journal_id = journal.journal_id()?;
+    if expected_journal_id.is_some_and(|id| id != journal_id) {
+        return Err(operation_unresolved(
+            op_id,
+            &journal_id,
+            "journal identity changed",
+        ));
+    }
+    let Some(operation) = journal.operation(op_id)? else {
+        if expected_journal_id == Some(journal_id.as_str()) {
+            return Err(WriteFailure {
+                exit_code: 1,
+                output: Some(
+                    json!({"kind":"operation_absent","op_id":op_id,"journal_id":journal_id}),
+                ),
+                detail: "no such operation in the expected journal".into(),
+            });
+        }
+        return Err(operation_unresolved(
+            op_id,
+            &journal_id,
+            "operation cannot be located",
+        ));
+    };
     deliver(client, journal, operation)
 }
 
+fn operation_unresolved(op_id: Uuid, journal_id: &str, detail: &str) -> WriteFailure {
+    WriteFailure {
+        exit_code: 7,
+        output: Some(json!({"kind":"operation_unresolved","op_id":op_id,"journal_id":journal_id})),
+        detail: detail.into(),
+    }
+}
+
 pub fn abandon(journal: &mut JournalStore, op_id: Uuid) -> Result<Value, WriteFailure> {
+    let _lock = journal.lock_operation(op_id)?;
     let operation = journal.abandon_operation(op_id).map_err(|error| {
         if matches!(error, JournalError::NotUnresolved { .. }) {
             let mut failure = WriteFailure::local(error.to_string());
@@ -166,10 +303,11 @@ fn deliver(
     operation: OperationRecord,
 ) -> Result<Value, WriteFailure> {
     let key = operation.op_id;
-    let request = operation
-        .prepared_request
-        .as_ref()
-        .ok_or_else(|| WriteFailure::local("operation has no saved v2 request"))?;
+    if !operation.protocol_v2 {
+        return Err(WriteFailure::local(
+            "operation belongs to the earlier protocol",
+        ));
+    }
     match operation.state {
         OperationState::Committed => {
             let response = operation
@@ -193,23 +331,39 @@ fn deliver(
         OperationState::Prepared | OperationState::Unknown => {}
     }
 
+    let request = operation
+        .prepared_request
+        .as_ref()
+        .ok_or_else(|| WriteFailure::local("operation has no saved v2 request"))?;
     let path: Vec<_> = request.path.iter().map(String::as_str).collect();
     let method = match request.method {
         RequestMethod::Post => Method::POST,
         RequestMethod::Put => Method::PUT,
         RequestMethod::Delete => Method::DELETE,
     };
-    let response = client.write(
-        method,
-        &path,
-        JsonWrite {
-            key,
-            body: request.body.as_bytes(),
-            if_match: request.if_match.as_deref(),
-        },
-    );
+    let response = if method == Method::DELETE {
+        client.delete(&path, key).map(|()| json!({}))
+    } else {
+        client.write(
+            method.clone(),
+            &path,
+            JsonWrite {
+                key,
+                body: request.body.as_bytes(),
+                if_match: request.if_match.as_deref(),
+            },
+        )
+    };
     match response {
-        Ok(response) if response["rev"].as_u64().is_some() => {
+        Ok(response)
+            if method == Method::DELETE
+                || response["rev"].as_u64().is_some()
+                || (operation.kind == "show"
+                    && response["show_id"].is_string()
+                    && response["device_id"].is_string()
+                    && response["device_name"].is_string()
+                    && matches!(response["state"].as_str(), Some("sent" | "held"))) =>
+        {
             journal
                 .settle_operation(key, response.clone(), None)
                 .map_err(|error| unknown(&operation, &error.to_string(), None))?;
@@ -224,6 +378,7 @@ fn deliver(
             if let V2Error::Http {
                 status,
                 ref token,
+                ref field,
                 ref request_id,
                 retry_after,
             } = error
@@ -233,13 +388,23 @@ fn deliver(
                         "kind":"refused","operation":operation.kind,"op_id":key,
                         "status":status,"error":token,
                     });
+                    if let Some(field) = field {
+                        output["field"] = field.as_str().into();
+                    }
                     if let Some(request_id) = request_id {
                         output["request_id"] = request_id.as_str().into();
                     }
                     journal.reject_operation(key, output.clone())?;
                     return Err(WriteFailure::from_saved_refusal(output));
                 }
-                return Err(unknown(&operation, &error.to_string(), retry_after));
+                let mut failure = unknown(&operation, &error.to_string(), retry_after);
+                if let Some(output) = failure.output.as_mut() {
+                    output["status"] = status.into();
+                    if let Some(id) = request_id {
+                        output["request_id"] = id.as_str().into();
+                    }
+                }
+                return Err(failure);
             }
             if error.outcome_unknown() {
                 return Err(unknown(&operation, &error.to_string(), None));
@@ -379,7 +544,9 @@ mod tests {
             "lifecycle-req"
         );
         assert_eq!(
-            retry(&client, &mut journal.store, key).unwrap_err().output,
+            retry(&client, &mut journal.store, key, None)
+                .unwrap_err()
+                .output,
             refused.output
         );
     }
@@ -419,7 +586,7 @@ mod tests {
             &[("Idempotent-Replayed", "true")],
             r#"{"rev":2}"#,
         );
-        let output = retry(&client_for(&replayed), &mut reopened, key).unwrap();
+        let output = retry(&client_for(&replayed), &mut reopened, key, None).unwrap();
         let second = replayed.request();
         assert_eq!(output["session_handle"], session.to_string());
         assert_eq!(first.line, second.line);
@@ -431,5 +598,189 @@ mod tests {
                     .contains(&("idempotency-key".into(), key.to_string()))
             );
         }
+    }
+    #[test]
+    fn answer_and_chat_receipts_use_distinct_targets() {
+        let mut journal = TestJournal::new();
+        for (entry_id, target) in [
+            (None, "POST /v2/agent/messages/item/receipt HTTP/1.1"),
+            (
+                Some("entry/1"),
+                "POST /v2/agent/messages/item/entries/entry%2F1/receipt HTTP/1.1",
+            ),
+        ] {
+            let server = SlowServer::answer_after(
+                Duration::ZERO,
+                r#"{"rev":3,"status":"recorded","stage_outcome":"handed"}"#,
+            );
+            let output = control(
+                &client_for(&server),
+                &mut journal.store,
+                None,
+                ControlWrite::Receipt {
+                    item_id: "item",
+                    entry_id,
+                    not_handed: None,
+                    agent: Some("Desk"),
+                    rerouted: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(output["response"]["status"], "recorded");
+            let request = server.request();
+            assert_eq!(request.line.trim_end(), target);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap(),
+                json!({"outcome":"handed","agent":"Desk","rerouted":true})
+            );
+        }
+    }
+
+    #[test]
+    fn file_use_reports_one_file_on_the_separate_route() {
+        let mut journal = TestJournal::new();
+        let server = SlowServer::answer_after(
+            Duration::ZERO,
+            r#"{"rev":4,"entry":{},"file_id":"file/1","outcome":"unusable"}"#,
+        );
+        let output = control(
+            &client_for(&server),
+            &mut journal.store,
+            None,
+            ControlWrite::FileUse {
+                item_id: "item",
+                entry_id: "entry",
+                file_id: "file/1",
+                reason: Some("wrong format"),
+            },
+        )
+        .unwrap();
+        assert_eq!(output["response"]["outcome"], "unusable");
+        let request = server.request();
+        assert_eq!(
+            request.line.trim_end(),
+            "POST /v2/agent/messages/item/entries/entry/file-use HTTP/1.1"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
+            json!({"file_id":"file/1","outcome":"unusable","reason":"wrong format"})
+        );
+    }
+
+    #[test]
+    fn result_uses_the_item_and_keeps_not_answered_as_a_definite_refusal() {
+        let mut journal = TestJournal::new();
+        let server = SlowServer::respond(
+            Duration::ZERO,
+            "409 Conflict",
+            &[],
+            r#"{"error":"not_answered","retryable":false,"request_id":"result-req"}"#,
+        );
+        let failure = control(
+            &client_for(&server),
+            &mut journal.store,
+            None,
+            ControlWrite::Result {
+                item_id: "item",
+                status: "applied",
+            },
+        )
+        .unwrap_err();
+        assert_eq!(failure.exit_code, 2);
+        assert_eq!(failure.output.unwrap()["error"], "not_answered");
+        let request = server.request();
+        assert_eq!(
+            request.line.trim_end(),
+            "POST /v2/agent/messages/item/result HTTP/1.1"
+        );
+        assert_eq!(request.body, br#"{"status":"applied"}"#);
+    }
+
+    #[test]
+    fn show_targets_device_name_and_accepts_a_held_response_without_a_position() {
+        let mut journal = TestJournal::new();
+        let server = SlowServer::answer_after(
+            Duration::ZERO,
+            r#"{"show_id":"s","device_id":"d","device_name":"Desk","state":"held"}"#,
+        );
+        let output = control(
+            &client_for(&server),
+            &mut journal.store,
+            None,
+            ControlWrite::Show {
+                item_id: "item",
+                chat: true,
+                device_name: Some("Desk"),
+            },
+        )
+        .unwrap();
+        assert_eq!(output["response"]["state"], "held");
+        let request = server.request();
+        assert_eq!(request.line.trim_end(), "POST /v2/agent/show HTTP/1.1");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
+            json!({"item_id":"item","target":"chat","device_name":"Desk"})
+        );
+    }
+
+    #[test]
+    fn only_a_matching_journal_proves_a_missing_operation_never_started() {
+        let mut journal = TestJournal::new();
+        let server = SlowServer::answer_after(Duration::ZERO, "{}");
+        let client = client_for(&server);
+        let journal_id = journal.store.journal_id().unwrap();
+        let op_id = Uuid::new_v4();
+        let missing = retry(&client, &mut journal.store, op_id, Some(&journal_id)).unwrap_err();
+        assert_eq!(missing.exit_code, 1);
+        assert_eq!(missing.output.unwrap()["kind"], "operation_absent");
+
+        for expected in [None, Some("different-journal")] {
+            let unresolved = retry(&client, &mut journal.store, op_id, expected).unwrap_err();
+            assert_eq!(unresolved.exit_code, 7);
+            assert_eq!(unresolved.output.unwrap()["kind"], "operation_unresolved");
+        }
+    }
+
+    #[test]
+    fn simultaneous_same_key_writes_share_a_single_http_request() {
+        use std::sync::{Arc, Barrier};
+        let mut journal = TestJournal::new();
+        let server = SlowServer::answer_after(Duration::from_millis(120), r#"{"rev":3}"#);
+        let client = client_for(&server);
+        let second_client = client.clone();
+        let op_id = Uuid::new_v4();
+        let root = journal.root.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let second_barrier = Arc::clone(&barrier);
+        let other = std::thread::spawn(move || {
+            let mut reopened = JournalStore::open(&root, "fixture", Uuid::nil()).unwrap();
+            second_barrier.wait();
+            control(
+                &second_client,
+                &mut reopened,
+                Some(op_id),
+                ControlWrite::Retract {
+                    item_id: "item",
+                    in_reply_to: None,
+                },
+            )
+            .unwrap()
+        });
+        barrier.wait();
+        let first = control(
+            &client,
+            &mut journal.store,
+            Some(op_id),
+            ControlWrite::Retract {
+                item_id: "item",
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(first, other.join().unwrap());
+        assert_eq!(
+            server.request_line().trim_end(),
+            "POST /v2/agent/messages/item/retract HTTP/1.1"
+        );
     }
 }

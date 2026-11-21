@@ -521,6 +521,23 @@ impl JournalStore {
         Ok(result)
     }
 
+    /// Identifies this journal instance for callers recovering an intent.
+    pub fn journal_id(&self) -> Result<String, JournalError> {
+        self.with_transaction(|tx| {
+            let current: Option<String> = tx
+                .query_row("SELECT value FROM meta WHERE key='journal_id'", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(current) = current {
+                return Ok(current);
+            }
+            let id = Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO meta(key,value) VALUES('journal_id',?1)", [&id])?;
+            Ok(id)
+        })
+    }
+
     pub fn cursor(&self) -> Result<u64, JournalError> {
         self.with_read(read_cursor)
     }
