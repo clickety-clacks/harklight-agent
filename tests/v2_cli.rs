@@ -255,3 +255,127 @@ fn explicit_legacy_progress_miss_does_not_fall_through_to_current_id() {
         "GET /v2/agent/messages?sender=app%3Aother&legacy_message_id=opaque HTTP/1.1"
     );
 }
+
+#[test]
+fn journal_known_legacy_progress_miss_does_not_fall_through_to_current_id() {
+    use harklight_agent::journal::{JournalEntry, JournalStore};
+
+    let session = Uuid::new_v4();
+    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":2,"messages":[]}"#);
+    let fixture = CliFixture::new(&server, identity);
+    let mut journal = JournalStore::open(&fixture.0.join("state"), "fixture", session).unwrap();
+    journal
+        .record_entry(JournalEntry::fetched(
+            1,
+            "old-event".into(),
+            session,
+            "reply".into(),
+            "person".into(),
+            true,
+            Some("app:test".into()),
+            Some("opaque".into()),
+            Some(1),
+            json!({}),
+        ))
+        .unwrap();
+
+    let output = fixture.run(&[
+        "progress",
+        "--session",
+        &session.to_string(),
+        "--request",
+        "opaque",
+        "--percent",
+        "25",
+        "--stage",
+        "Verify",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{:?}", output);
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"], "not_found");
+    assert_eq!(
+        server.request_line().trim_end(),
+        "GET /v2/agent/messages?sender=app%3Atest&legacy_message_id=opaque HTTP/1.1"
+    );
+}
+
+#[test]
+fn malformed_or_mismatched_write_responses_keep_the_saved_operation() {
+    use harklight_agent::journal::{JournalStore, OperationState};
+    use test_tls::FixtureResponse;
+
+    let reply = [
+        "reply",
+        "--item-id",
+        "item",
+        "--body",
+        "Expected",
+        "--in-reply-to",
+        "original",
+    ];
+    let wrong_reply = |field: &str, value: &str| {
+        let mut entry = json!({
+            "entry_id":"new","item_id":"item","rev":4,"position":1,"request_revision":1,
+            "author":"origin","kind":"reply","text":"Expected","in_reply_to":"original",
+        });
+        entry[field] = value.into();
+        json!({"rev":4,"entry":entry})
+    };
+    let cases: &[(&[&str], Value)] = &[
+        (
+            &[
+                "file-use",
+                "--item-id",
+                "item",
+                "--entry-id",
+                "entry",
+                "--file-id",
+                "file",
+                "--used",
+            ],
+            json!({"rev":4}),
+        ),
+        (
+            &[
+                "advisory-ack",
+                "--item-id",
+                "item",
+                "--advisory-id",
+                "pending",
+            ],
+            json!({"rev":4}),
+        ),
+        (&reply, wrong_reply("author", "person")),
+        (&reply, wrong_reply("text", "Different")),
+        (&reply, wrong_reply("in_reply_to", "wrong")),
+        (
+            &["show", "--item-id", "item", "--device-id", "wanted"],
+            json!({"show_id":"show","device_id":"different","device_name":"Example","state":"held"}),
+        ),
+    ];
+    for (command, response) in cases {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![FixtureResponse {
+            status: "200 OK",
+            headers: &[("Request-Id", "uncorrelated-response")],
+            body: response.to_string(),
+            truncate: false,
+        }]);
+        let fixture = CliFixture::new(&server, identity);
+        let op_id = Uuid::new_v4().to_string();
+        let mut args = command.to_vec();
+        args.extend(["--op-id", &op_id]);
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(7), "{args:?}: {output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["kind"], "outcome_unknown");
+        assert_eq!(result["op_id"], op_id);
+        assert_eq!(result["request_id"], "uncorrelated-response");
+        let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+        let saved = journal
+            .operation(Uuid::parse_str(&op_id).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.state, OperationState::Unknown);
+        assert_eq!(server.requests().len(), 1);
+    }
+}

@@ -594,19 +594,18 @@ pub(super) fn deliver(
 }
 
 fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value) -> bool {
-    if kind == "show" {
-        return response["show_id"].is_string()
-            && response["device_id"].is_string()
-            && response["device_name"].is_string()
-            && matches!(response["state"].as_str(), Some("sent" | "held"));
-    }
     if request.method == RequestMethod::Delete {
         return response.is_object();
+    }
+    let Ok(request_body) = serde_json::from_str::<Value>(&request.body) else {
+        return false;
+    };
+    if kind == "show" {
+        return valid_show_response(&request_body, response);
     }
     let Some(rev) = response["rev"].as_u64() else {
         return false;
     };
-    let request_body: Value = serde_json::from_str(&request.body).unwrap_or_default();
     let item_id = request.path.get(2).map(String::as_str);
     let valid_message = |message: &Value| {
         super::reads::valid_sent_message(message, rev)
@@ -637,8 +636,9 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
             valid_message(message)
                 && message["sender"] == request_body["sender"]
                 && message["session"] == request_body["session"]
-                && message["message"]["title"] == request_body["message"]["title"]
-                && message["message"]["body"] == request_body["message"]["body"]
+                && ["title", "body", "created_at", "message_type", "progress"]
+                    .into_iter()
+                    .all(|field| message["message"][field] == request_body["message"][field])
         }
         "revise" | "progress" | "retract" | "lifecycle" => {
             valid_message(message)
@@ -646,7 +646,13 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
                     .as_str()
                     .is_none_or(|id| valid_entry() && entry["entry_id"] == id)
         }
-        "reply" => valid_entry() && entry["kind"] == "reply",
+        "reply" => {
+            valid_entry()
+                && entry["kind"] == "reply"
+                && entry["author"] == "origin"
+                && entry["text"] == request_body["text"]
+                && entry["in_reply_to"] == request_body["in_reply_to"]
+        }
         "result" => valid_message(message) && valid_entry(),
         "receipt" => {
             if !matches!(
@@ -664,8 +670,60 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
                 _ => false,
             }
         }
-        _ => true,
+        "file-use" => {
+            valid_entry()
+                && request
+                    .path
+                    .get(4)
+                    .is_some_and(|id| entry["entry_id"] == *id)
+                && response["file_id"] == request_body["file_id"]
+                && file_use_outcomes_match(&request_body, response)
+        }
+        "advisory-ack" => {
+            response["advisory_id"] == request_body["advisory_id"]
+                && response["delivered"] == true
+                && response["already_delivered"].is_boolean()
+        }
+        "session-end" => true,
+        _ => false,
     }
+}
+
+fn valid_show_response(request: &Value, response: &Value) -> bool {
+    let normalized_name = |name: &str| name.replace('’', "'").to_lowercase();
+    response["show_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty())
+        && response["device_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+        && request["device_id"]
+            .as_str()
+            .is_none_or(|id| response["device_id"] == id)
+        && response["device_name"].as_str().is_some_and(|name| {
+            request["device_name"]
+                .as_str()
+                .is_none_or(|requested| normalized_name(name) == normalized_name(requested))
+        })
+        && matches!(response["state"].as_str(), Some("sent" | "held"))
+}
+
+fn file_use_outcomes_match(request: &Value, response: &Value) -> bool {
+    (response["duplicate"].is_null() || response["duplicate"].is_boolean())
+        && [
+            ("transfer", ["transferred", "not_transferred"]),
+            ("use", ["used", "unusable"]),
+        ]
+        .into_iter()
+        .all(|(dimension, allowed)| match response.get(dimension) {
+            Some(value) => {
+                value.as_str().is_some_and(|value| allowed.contains(&value))
+                    && request
+                        .get(dimension)
+                        .is_none_or(|requested| requested == value)
+            }
+            None => request.get(dimension).is_none(),
+        })
 }
 
 fn correlated_unknown(
@@ -982,7 +1040,7 @@ mod tests {
         let mut journal = TestJournal::new();
         let server = SlowServer::answer_after(
             Duration::ZERO,
-            r#"{"rev":4,"entry":{},"file_id":"file/1","outcome":"unusable"}"#,
+            r#"{"rev":4,"entry":{"entry_id":"entry","item_id":"item","rev":4,"position":1,"request_revision":1,"author":"person","kind":"reply"},"file_id":"file/1","use":"unusable"}"#,
         );
         let output = control(
             &client_for(&server),
@@ -998,7 +1056,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(output["response"]["outcome"], "unusable");
+        assert_eq!(output["response"]["use"], "unusable");
         let request = server.request();
         assert_eq!(
             request.line.trim_end(),
@@ -1044,7 +1102,7 @@ mod tests {
         let mut journal = TestJournal::new();
         let server = SlowServer::answer_after(
             Duration::ZERO,
-            r#"{"show_id":"s","device_id":"d","device_name":"Desk","state":"held"}"#,
+            r#"{"show_id":"s","device_id":"d","device_name":"Agent’s Desk","state":"held"}"#,
         );
         let output = control(
             &client_for(&server),
@@ -1053,7 +1111,7 @@ mod tests {
             ControlWrite::Show {
                 item_id: "item",
                 chat: true,
-                device_name: Some("Desk"),
+                device_name: Some("agent's desk"),
                 device_id: None,
             },
         )
@@ -1063,7 +1121,7 @@ mod tests {
         assert_eq!(request.line.trim_end(), "POST /v2/agent/show HTTP/1.1");
         assert_eq!(
             serde_json::from_slice::<Value>(&request.body).unwrap(),
-            json!({"item_id":"item","target":"chat","device_name":"Desk"})
+            json!({"item_id":"item","target":"chat","device_name":"agent's desk"})
         );
     }
 

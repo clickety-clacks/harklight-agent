@@ -333,31 +333,45 @@ mod tests {
             session: Some(&session),
             ..input
         };
-        let server = SlowServer::sequence(vec![
-            FixtureResponse {
-                status: "200 OK",
-                headers: &[("Request-Id", "send-req")],
-                body: r#"{"rev":1,"message":"#.into(),
-                truncate: true,
-            },
-            FixtureResponse {
-                status: "200 OK",
-                headers: &[("Request-Id", "wrong-content")],
-                body: json!({"rev":1,"message":{
-                    "item_id":"opaque/id","sender":"app:sample","session":session,
-                    "revision":1,"rev":1,"message":{"title":"Different title","body":"Body"},
-                    "seen":false,"files":[],
-                }})
-                .to_string(),
-                truncate: false,
-            },
-            FixtureResponse::json(json!({"rev":1,"message":{
-                "item_id":"opaque/id","sender":"app:sample","session":session,
-                "revision":1,"rev":1,"message":{"title":"Update","body":"Body"},"seen":false,"files":[],
-            }})),
-        ]);
+        let (responses, responses_receiver) = std::sync::mpsc::channel();
+        let server = SlowServer::sequence_from(responses_receiver);
         let client = client_for(&server);
         let prepared = send(&client, &mut journal, &input, Some(key), true).unwrap();
+        let content = prepared["prepared"]["message"].clone();
+        let sent = |content: Value| {
+            json!({"rev":1,"message":{
+                "item_id":"opaque/id","sender":"app:sample","session":session,
+                "revision":1,"rev":1,"message":content,"seen":false,"files":[],
+            }})
+        };
+        let mut wrong_title = content.clone();
+        wrong_title["title"] = "Different title".into();
+        let mut wrong_time = content.clone();
+        wrong_time["created_at"] = 1.into();
+        responses
+            .send(vec![
+                FixtureResponse {
+                    status: "200 OK",
+                    headers: &[("Request-Id", "send-req")],
+                    body: r#"{"rev":1,"message":"#.into(),
+                    truncate: true,
+                },
+                FixtureResponse {
+                    status: "200 OK",
+                    headers: &[("Request-Id", "wrong-content")],
+                    body: sent(wrong_title).to_string(),
+                    truncate: false,
+                },
+                FixtureResponse {
+                    status: "200 OK",
+                    headers: &[("Request-Id", "wrong-created-at")],
+                    body: sent(wrong_time).to_string(),
+                    truncate: false,
+                },
+                FixtureResponse::json(sent(content)),
+            ])
+            .ok()
+            .unwrap();
         assert_eq!(prepared["kind"], "prepared");
         assert_eq!(prepared["request_id"], key.to_string());
         assert_eq!(prepared["prepared"]["sender"], "app:sample");
@@ -374,6 +388,9 @@ mod tests {
         let malformed = writes::retry(&revived_client, &mut reopened, key, None).unwrap_err();
         assert_eq!(malformed.exit_code, 7);
         assert_eq!(malformed.output.unwrap()["request_id"], "wrong-content");
+        let wrong_time = writes::retry(&revived_client, &mut reopened, key, None).unwrap_err();
+        assert_eq!(wrong_time.exit_code, 7);
+        assert_eq!(wrong_time.output.unwrap()["request_id"], "wrong-created-at");
         let committed = writes::retry(&revived_client, &mut reopened, key, None).unwrap();
         assert_eq!(committed["item_id"], "opaque/id");
         assert_eq!(committed["prepared"], prepared["prepared"]);
@@ -391,6 +408,7 @@ mod tests {
         let mut requests = server.requests().into_iter();
         let first = requests.next().unwrap();
         let wrong_content = requests.next().unwrap();
+        let wrong_time = requests.next().unwrap();
         let second = requests.next().unwrap();
         assert_eq!(first.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
         let body: Value = serde_json::from_slice(&first.body).unwrap();
@@ -399,7 +417,8 @@ mod tests {
         assert!(body["message"].get("message_id").is_none());
         assert_eq!(first.body, second.body);
         assert_eq!(first.body, wrong_content.body);
-        for attempt in [first, wrong_content, second] {
+        assert_eq!(first.body, wrong_time.body);
+        for attempt in [first, wrong_content, wrong_time, second] {
             assert!(
                 attempt
                     .headers
