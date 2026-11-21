@@ -24,6 +24,7 @@ pub struct SendInput<'a> {
     pub body: Option<&'a str>,
     pub choices: &'a [String],
     pub supersedes: &'a [String],
+    pub supersedes_local: &'a [String],
     pub files: &'a [PathBuf],
     pub fields: &'a MessageFieldOptions,
     pub answer_ui: Option<&'a Path>,
@@ -51,7 +52,8 @@ pub fn send(
     let manifest = files::identify(input.files).map_err(WriteFailure::local)?;
     let inputs = json!({
         "session":input.session,"sender":input.sender,"message":normalized,
-        "supersedes":input.supersedes,"files":manifest,
+        "supersedes":input.supersedes,"supersedes_local":input.supersedes_local,
+        "server_binding":client.server_binding(),"files":manifest,
     });
     if let Some(saved) = journal.operation(key)? {
         if saved.protocol_v2
@@ -78,42 +80,22 @@ pub fn send(
             .filter(|id| !id.is_nil())
             .ok_or_else(|| WriteFailure::local("--session must be a UUID or new"))?,
     };
-    let mut supersedes = Vec::new();
-    for local in input.supersedes {
-        if let Some(item) = journal.v2_item_id(input.sender, local)? {
-            supersedes.push(item);
-            continue;
-        }
-        let existing = client
-            .legacy_message(input.sender, local)
-            .map_err(|error| WriteFailure::local(error.to_string()))?;
-        if let Some(found) = existing {
-            let item_id = found["message"]["item_id"]
-                .as_str()
-                .ok_or_else(|| WriteFailure::local("legacy message lacked its item ID"))?;
-            journal.remember_v2_item(input.sender, local, item_id)?;
-            supersedes.push(item_id.to_owned());
-        } else {
-            supersedes.push(local.clone());
-        }
-    }
     let content = build_send_content(input.title, input.body, input.choices, &fields, now_ms())
         .map_err(|error| WriteFailure::local(error.message))?;
     let mut body = json!({"sender":input.sender,"message":content});
     if !session.is_nil() {
         body["session"] = session.to_string().into();
     }
-    if !supersedes.is_empty() {
-        body["supersedes"] = json!(supersedes);
+    if !input.supersedes.is_empty() {
+        body["supersedes"] = json!(input.supersedes);
     }
     let uploads = if input.files.is_empty() {
         Vec::new()
     } else {
-        let cap = writes::upload_cap(client)?;
         files::stage_v2_uploads(
             input.files,
             &journal.upload_staging_directory(session, key),
-            cap,
+            None,
         )
         .map_err(WriteFailure::local)?
     };
@@ -182,6 +164,7 @@ pub(super) fn prepared_metadata(prepared: &PreparedSend) -> Value {
         "session":prepared.request["session"],
         "message":prepared.request["message"],
         "supersedes":prepared.request["supersedes"],
+        "supersedes_local":prepared.inputs["supersedes_local"],
         "files":prepared.files,
     })
 }
@@ -192,8 +175,49 @@ pub(super) fn freeze_send(
     lock: &OperationLock,
     operation: OperationRecord,
 ) -> Result<OperationRecord, WriteFailure> {
+    let mut body = operation
+        .prepared_send
+        .as_ref()
+        .ok_or_else(|| WriteFailure::local("missing prepared send"))?
+        .request
+        .clone();
+    let local_targets = operation
+        .prepared_send
+        .as_ref()
+        .and_then(|prepared| prepared.inputs["supersedes_local"].as_array());
+    if let Some(local_targets) = local_targets.filter(|targets| !targets.is_empty()) {
+        if let Some(resolved) = operation.request.get("_resolved_supersedes") {
+            body["supersedes"] = resolved.clone();
+        } else {
+            let sender = body["sender"]
+                .as_str()
+                .ok_or_else(|| WriteFailure::local("prepared send lacked a sender"))?;
+            let mut targets = body["supersedes"].as_array().cloned().unwrap_or_default();
+            for local in local_targets {
+                let local = local
+                    .as_str()
+                    .ok_or_else(|| WriteFailure::local("invalid local supersedes reference"))?;
+                if let Some(id) = journal.v2_item_id(sender, local)? {
+                    targets.push(id.into());
+                } else {
+                    let matched = client
+                        .legacy_message(sender, local)
+                        .map_err(|error| writes::unknown(&operation, &error.to_string(), None))?;
+                    let found = matched
+                        .as_ref()
+                        .and_then(|found| found["message"]["item_id"].as_str())
+                        .ok_or_else(|| {
+                            WriteFailure::local("local supersedes reference could not be resolved")
+                        })?;
+                    journal.remember_v2_item(sender, local, found)?;
+                    targets.push(found.into());
+                }
+            }
+            body["supersedes"] = Value::Array(targets);
+            journal.record_v2_supersedes(operation.op_id, body["supersedes"].clone())?;
+        }
+    }
     let file_ids = staged_file_ids(client, journal, &operation)?;
-    let mut body = operation.request;
     if !file_ids.is_empty() {
         body["file_ids"] = json!(file_ids);
     }
@@ -257,8 +281,6 @@ pub(super) fn staged_file_ids(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use crate::{
         config::EnrolledIdentity,
         test_tls::{SlowServer, TLS_NAME},
@@ -297,6 +319,7 @@ mod tests {
             body: Some("Body"),
             choices: &[],
             supersedes: &[],
+            supersedes_local: &[],
             files: &[],
             fields: &MessageFieldOptions {
                 message_type: Some("fyi".into()),
@@ -304,11 +327,24 @@ mod tests {
             },
             answer_ui: None,
         };
-        let server = SlowServer::truncated(
-            "200 OK",
-            &[("Request-Id", "send-req")],
-            r#"{"rev":1,"message":"#,
-        );
+        use crate::test_tls::FixtureResponse;
+        let session = Uuid::new_v4().to_string();
+        let input = SendInput {
+            session: Some(&session),
+            ..input
+        };
+        let server = SlowServer::sequence(vec![
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[("Request-Id", "send-req")],
+                body: r#"{"rev":1,"message":"#.into(),
+                truncate: true,
+            },
+            FixtureResponse::json(json!({"rev":1,"message":{
+                "item_id":"opaque/id","sender":"app:sample","session":session,
+                "revision":1,"rev":1,"message":{},"seen":false,"files":[],
+            }})),
+        ]);
         let client = client_for(&server);
         let prepared = send(&client, &mut journal, &input, Some(key), true).unwrap();
         assert_eq!(prepared["kind"], "prepared");
@@ -322,28 +358,7 @@ mod tests {
 
         let outcome = execute(&client, &mut journal, key).unwrap_err();
         assert_eq!(outcome.exit_code, 7);
-        let first = server.request();
-        assert_eq!(first.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
-        let body: Value = serde_json::from_slice(&first.body).unwrap();
-        assert_eq!(body["session"], prepared["session_handle"]);
-        assert_eq!(body["message"], prepared["prepared"]["message"]);
-        assert!(body["message"].get("message_id").is_none());
-        assert!(body["message"].get("sender_id").is_none());
-
-        let response = Box::leak(
-            json!({"rev":1,"message":{
-                "item_id":"opaque/id","sender":"app:sample","session":body["session"],
-            }})
-            .to_string()
-            .into_boxed_str(),
-        );
-        let replay = SlowServer::respond(
-            Duration::ZERO,
-            "200 OK",
-            &[("Idempotent-Replayed", "true")],
-            response,
-        );
-        let revived_client = client_for(&replay);
+        let revived_client = client_for(&server);
         let mut reopened = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
         let committed = writes::retry(&revived_client, &mut reopened, key, None).unwrap();
         assert_eq!(committed["item_id"], "opaque/id");
@@ -359,7 +374,14 @@ mod tests {
             send(&revived_client, &mut reopened, &input, Some(key), true).unwrap(),
             committed
         );
-        let second = replay.request();
+        let mut requests = server.requests().into_iter();
+        let first = requests.next().unwrap();
+        let second = requests.next().unwrap();
+        assert_eq!(first.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
+        let body: Value = serde_json::from_slice(&first.body).unwrap();
+        assert_eq!(body["session"], prepared["session_handle"]);
+        assert_eq!(body["message"], prepared["prepared"]["message"]);
+        assert!(body["message"].get("message_id").is_none());
         assert_eq!(first.body, second.body);
         for attempt in [first, second] {
             assert!(
@@ -368,5 +390,56 @@ mod tests {
                     .contains(&("idempotency-key".into(), key.to_string()))
             );
         }
+    }
+    #[test]
+    fn prepare_with_files_is_offline_and_execute_rejects_a_different_server() {
+        let root =
+            Scratch(std::env::temp_dir().join(format!("agent-prepare-test-{}", Uuid::new_v4())));
+        let mut journal = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
+        let source = root.0.join("attachment.txt");
+        std::fs::write(&source, b"saved bytes").unwrap();
+        let paths = [source.clone()];
+        let targets = ["server/opaque".to_owned()];
+        let fields = MessageFieldOptions {
+            message_type: Some("fyi".into()),
+            ..MessageFieldOptions::default()
+        };
+        let input = SendInput {
+            session: Some("new"),
+            sender: "app:sample",
+            title: "Prepare",
+            body: None,
+            choices: &[],
+            supersedes: &targets,
+            supersedes_local: &[],
+            files: &paths,
+            fields: &fields,
+            answer_ui: None,
+        };
+        let first = SlowServer::sequence(Vec::new());
+        let target = client_for(&first);
+        assert!(first.requests().is_empty());
+        let key = Uuid::new_v4();
+        let prepared = send(&target, &mut journal, &input, Some(key), true).unwrap();
+        assert_eq!(prepared["prepared"]["supersedes"], json!(targets));
+        assert_eq!(prepared["prepared"]["files"][0]["name"], "attachment.txt");
+        let operation = journal.operation(key).unwrap().unwrap();
+        assert!(operation.response.is_none());
+        assert!(operation.prepared_request.is_none());
+        assert_eq!(
+            std::fs::read(operation.uploads[0].staged_path.as_ref().unwrap()).unwrap(),
+            b"saved bytes"
+        );
+        std::fs::remove_file(source).unwrap();
+
+        let second = SlowServer::sequence(Vec::new());
+        let conflicting = client_for(&second);
+        assert!(second.requests().is_empty());
+        let error = execute(&conflicting, &mut journal, key).unwrap_err();
+        assert!(error.to_string().contains("different enrolled Server"));
+        assert_eq!(
+            journal.operation(key).unwrap().unwrap().state,
+            crate::journal::OperationState::Prepared
+        );
     }
 }
