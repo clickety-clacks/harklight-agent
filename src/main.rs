@@ -8,7 +8,7 @@ use harklight_agent::{
     config::{EnrolledIdentity, default_state_root},
     enrollment,
     journal::JournalStore,
-    v2::{AgentClient, V2Error, writes},
+    v2::{AgentClient, V2Error, sends, writes},
 };
 
 #[derive(Debug, Parser)]
@@ -37,10 +37,10 @@ enum Command {
         action: EnrollCommand,
     },
     #[command(
-        after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --route claude-code --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
+        after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
     )]
     Send {
-        #[arg(long, value_name = "UUID|new", required_unless_present = "execute")]
+        #[arg(long, value_name = "UUID|new")]
         session: Option<String>,
         #[arg(long, required_unless_present = "execute")]
         sender_id: Option<String>,
@@ -93,14 +93,6 @@ enum Command {
         default_at: Option<String>,
         #[arg(long = "choice-style", action = clap::ArgAction::Append)]
         choice_styles: Vec<String>,
-        #[arg(long)]
-        vendor_session_id: Option<String>,
-        #[arg(long, value_enum)]
-        route: Option<Route>,
-        #[arg(long)]
-        controller: bool,
-        #[arg(long)]
-        origin_listener: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
         #[arg(
@@ -133,7 +125,12 @@ enum Command {
         progress_note: Option<String>,
         #[arg(long, conflicts_with = "execute")]
         prepare: bool,
-        #[arg(long, conflicts_with = "prepare")]
+        #[arg(long, requires = "op_id", conflicts_with_all = [
+            "prepare", "session", "sender_id", "display_name", "title", "body", "choices",
+            "message_type", "message_kind", "importance", "reply", "supersedes", "by_when",
+            "stake", "thread", "default_choice", "default_at", "choice_styles", "files",
+            "answer_ui_file", "progress", "progress_stage", "progress_note"
+        ])]
         execute: bool,
         #[arg(long)]
         op_id: Option<Uuid>,
@@ -606,7 +603,8 @@ fn main() {
 
     if matches!(
         cli.command,
-        Command::Retract { .. }
+        Command::Send { .. }
+            | Command::Retract { .. }
             | Command::Lifecycle { .. }
             | Command::Result { .. }
             | Command::Receipt { .. }
@@ -650,85 +648,6 @@ fn main() {
 
     let result = match cli.command {
         Command::Enroll { .. } => unreachable!("enroll was dispatched before loading an identity"),
-        Command::Send {
-            session,
-            sender_id,
-            display_name,
-            title,
-            body,
-            choices,
-            message_type,
-            message_kind,
-            importance,
-            reply,
-            supersedes,
-            by_when,
-            stake,
-            thread,
-            default_choice,
-            default_at,
-            choice_styles,
-            vendor_session_id,
-            route,
-            controller,
-            origin_listener,
-            files,
-            answer_ui_file,
-            progress,
-            progress_stage,
-            progress_note,
-            prepare,
-            execute,
-            op_id,
-        } => {
-            let progress = match (progress, progress_stage) {
-                (Some(percent), Some(stage)) => Some(ProgressReport {
-                    percent,
-                    stage,
-                    note: progress_note,
-                }),
-                _ => None,
-            };
-            let message_type = if progress.is_some() && message_type.is_none() {
-                Some("fyi".to_string())
-            } else {
-                message_type
-            };
-            commands::send_command_with_answer_ui_file(
-                &context,
-                session.as_deref(),
-                sender_id.as_deref(),
-                title.as_deref(),
-                body.as_deref(),
-                &choices,
-                &supersedes,
-                vendor_session_id.as_deref(),
-                route.map(Into::into),
-                controller,
-                &files,
-                prepare,
-                execute,
-                op_id,
-                &MessageFieldOptions {
-                    origin_listener,
-                    message_type,
-                    message_kind,
-                    reply,
-                    importance,
-                    by_when,
-                    stake,
-                    thread,
-                    display_name,
-                    default_choice,
-                    default_at,
-                    choice_styles,
-                    clear_default: false,
-                    answer_ui: None,
-                    progress,
-                },
-                answer_ui_file.as_deref(),
-            )
-        }
         Command::Attach {
             session,
             vendor_session_id,
@@ -878,7 +797,8 @@ fn main() {
             op_id,
         } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
         Command::Status { session } => commands::status(&context, session),
-        Command::Retract { .. }
+        Command::Send { .. }
+        | Command::Retract { .. }
         | Command::Lifecycle { .. }
         | Command::Result { .. }
         | Command::Receipt { .. }
@@ -933,46 +853,49 @@ fn device_identity(cli: &Cli) -> EnrolledIdentity {
 }
 
 fn run_device_read(cli: &Cli) {
-    let client =
-        AgentClient::new(device_identity(cli)).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let identity = device_identity(cli);
+    let device_id = identity.device_id.clone();
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
     let (operation, result) = match &cli.command {
         Command::MessageGet {
             item_id: Some(id),
             revision,
             ..
-        } => (
-            "message-get",
-            revision.map_or_else(
-                || client.message(id),
-                |revision| client.message_revision(id, revision),
-            ),
-        ),
+        } => ("message-get", read_message_revision(&client, id, *revision)),
         Command::MessageGet {
             sender_id: Some(sender),
             message_id: Some(id),
             revision,
             ..
-        } => (
-            "message-get",
-            client.legacy_message(sender, id).and_then(|message| {
-                let message = message.ok_or_else(|| V2Error::Http {
-                    status: 404,
-                    token: Some("not_found".into()),
-                    field: None,
-                    request_id: None,
-                    retry_after: None,
-                })?;
-                match revision {
-                    Some(revision) => {
-                        let item_id = message["message"]["item_id"]
-                            .as_str()
-                            .ok_or(V2Error::InvalidResponse { request_id: None })?;
-                        client.message_revision(item_id, *revision)
+        } => {
+            let journal = device_journal(cli, &device_id);
+            let saved = journal
+                .v2_item_id(sender, id)
+                .unwrap_or_else(|error| fail(error.to_string(), 1));
+            let result = match saved {
+                Some(item_id) => read_message_revision(&client, &item_id, *revision),
+                None => client.legacy_message(sender, id).and_then(|message| {
+                    let message = message.ok_or_else(|| V2Error::Http {
+                        status: 404,
+                        token: Some("not_found".into()),
+                        field: None,
+                        request_id: None,
+                        retry_after: None,
+                    })?;
+                    let item_id = message["message"]["item_id"]
+                        .as_str()
+                        .ok_or(V2Error::InvalidResponse { request_id: None })?;
+                    journal
+                        .remember_v2_item(sender, id, item_id)
+                        .unwrap_or_else(|error| fail(error.to_string(), 1));
+                    match revision {
+                        Some(revision) => client.message_revision(item_id, *revision),
+                        None => Ok(message),
                     }
-                    None => Ok(message),
-                }
-            }),
-        ),
+                }),
+            };
+            ("message-get", result)
+        }
         Command::Messages { session, page } => {
             ("messages", client.messages(*session, page.as_deref()))
         }
@@ -1023,20 +946,109 @@ fn run_device_read(cli: &Cli) {
     }
 }
 
-fn run_device_write(cli: &Cli) {
-    use writes::ControlWrite;
+fn read_message_revision(
+    client: &AgentClient,
+    item_id: &str,
+    revision: Option<u64>,
+) -> Result<serde_json::Value, V2Error> {
+    revision.map_or_else(
+        || client.message(item_id),
+        |rev| client.message_revision(item_id, rev),
+    )
+}
 
-    let identity = device_identity(cli);
+fn device_journal(cli: &Cli, device_id: &str) -> JournalStore {
     let state_root = cli
         .state_dir
         .clone()
         .map(Ok)
         .unwrap_or_else(default_state_root)
         .unwrap_or_else(|error| fail(error.to_string(), 1));
-    let mut journal = JournalStore::open(&state_root, &identity.device_id, Uuid::nil())
-        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    JournalStore::open(&state_root, device_id, Uuid::nil())
+        .unwrap_or_else(|error| fail(error.to_string(), 1))
+}
+
+fn run_device_write(cli: &Cli) {
+    use writes::ControlWrite;
+
+    let identity = device_identity(cli);
+    let mut journal = device_journal(cli, &identity.device_id);
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
     let result = match &cli.command {
+        Command::Send {
+            execute: true,
+            op_id: Some(key),
+            ..
+        } => sends::execute(&client, &mut journal, *key),
+        Command::Send {
+            session,
+            sender_id: Some(sender),
+            display_name,
+            title: Some(title),
+            body,
+            choices,
+            message_type,
+            message_kind,
+            importance,
+            reply,
+            supersedes,
+            by_when,
+            stake,
+            thread,
+            default_choice,
+            default_at,
+            choice_styles,
+            files,
+            answer_ui_file,
+            progress,
+            progress_stage,
+            progress_note,
+            prepare,
+            op_id,
+            ..
+        } => {
+            let progress = progress
+                .zip(progress_stage.as_ref())
+                .map(|(percent, stage)| ProgressReport {
+                    percent,
+                    stage: stage.clone(),
+                    note: progress_note.clone(),
+                });
+            let fields = MessageFieldOptions {
+                message_type: message_type
+                    .clone()
+                    .or_else(|| progress.as_ref().map(|_| "fyi".into())),
+                message_kind: message_kind.clone(),
+                reply: *reply,
+                importance: importance.clone(),
+                by_when: by_when.clone(),
+                stake: stake.clone(),
+                thread: thread.clone(),
+                display_name: display_name.clone(),
+                default_choice: default_choice.clone(),
+                default_at: default_at.clone(),
+                choice_styles: choice_styles.clone(),
+                progress,
+                ..MessageFieldOptions::default()
+            };
+            sends::send(
+                &client,
+                &mut journal,
+                &sends::SendInput {
+                    session: session.as_deref(),
+                    sender,
+                    title,
+                    body: body.as_deref(),
+                    choices,
+                    supersedes,
+                    files,
+                    fields: &fields,
+                    answer_ui: answer_ui_file.as_deref(),
+                },
+                *op_id,
+                *prepare,
+            )
+        }
         Command::Retract {
             item_id,
             in_reply_to,
@@ -1366,8 +1378,6 @@ mod tests {
             "app:example",
             "--title",
             "A title",
-            "--route",
-            "claude-code",
             "--type",
             "request",
             "--kind",
@@ -1419,8 +1429,6 @@ mod tests {
             "new",
             "--sender-id",
             "app:example",
-            "--route",
-            "claude-code",
             "--title",
             "Ship the release",
             "--progress",
@@ -1523,8 +1531,6 @@ mod tests {
             "app:example",
             "--title",
             "A notice",
-            "--route",
-            "claude-code",
         ];
         assert!(Cli::try_parse_from(base).is_err());
         assert!(Cli::try_parse_from(base.into_iter().chain(["--type", "fyi"])).is_ok());
@@ -1560,8 +1566,6 @@ mod tests {
             "app:example",
             "--title",
             "Updated plan",
-            "--route",
-            "claude-code",
             "--type",
             "fyi",
             "--supersedes",
@@ -1591,8 +1595,6 @@ mod tests {
             display_name,
             "--title",
             "A title",
-            "--route",
-            "claude-code",
             "--type",
             "fyi",
         ])

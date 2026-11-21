@@ -56,6 +56,8 @@ pub enum JournalError {
     InvalidAdvisoryId(String),
     #[error("operation key {0} was already used with different content")]
     OperationConflict(Uuid),
+    #[error("local message reference already has a different server item ID")]
+    ItemBindingConflict,
     #[error("journal has no operation with key {0}")]
     MissingOperation(Uuid),
     #[error("operation {op_id} is {state}; only an unresolved operation can be abandoned")]
@@ -327,6 +329,8 @@ pub struct UploadSource {
     pub sha256: String,
     pub upload_cap_bytes_per_file: Option<u64>,
     pub upload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,6 +407,10 @@ impl JournalStore {
                 op_id TEXT PRIMARY KEY NOT NULL, session_handle TEXT NOT NULL,
                 kind TEXT NOT NULL, state TEXT NOT NULL, message_id TEXT,
                 request_revision INTEGER, in_reply_to TEXT, payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS v2_item_ids (
+                sender TEXT NOT NULL, local_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                PRIMARY KEY(sender, local_id)
              );
              CREATE TABLE IF NOT EXISTS advisory_cursors (
                 session_handle TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL
@@ -1188,6 +1196,62 @@ impl JournalStore {
         })
     }
 
+    /// Reserve the session and normalized send inputs under the supplied
+    /// operation key. An identical lookup returns the original prepared send.
+    pub fn prepare_v2_send(
+        &mut self,
+        lock: &OperationLock,
+        session: Uuid,
+        prepared: PreparedSend,
+        uploads: Vec<UploadSource>,
+    ) -> Result<OperationRecord, JournalError> {
+        let op_id = lock.op_id;
+        self.with_transaction(|tx| {
+            if let Some(existing) = read_operation(tx, op_id)? {
+                if existing.protocol_v2
+                    && existing.kind == "send"
+                    && existing
+                        .prepared_send
+                        .as_ref()
+                        .is_some_and(|saved| saved.inputs == prepared.inputs)
+                {
+                    return Ok(existing);
+                }
+                return Err(JournalError::OperationConflict(op_id));
+            }
+            let now = now_ms();
+            let operation = OperationRecord {
+                op_id,
+                session_handle: session,
+                kind: "send".into(),
+                request: prepared.request.clone(),
+                state: OperationState::Prepared,
+                created_at_ms: now,
+                updated_at_ms: now,
+                response: None,
+                uploads,
+                prepared_send: Some(prepared),
+                prepared_request: None,
+                protocol_v2: true,
+            };
+            write_operation(tx, &operation)?;
+            Ok(operation)
+        })
+    }
+
+    pub fn v2_item_id(&self, sender: &str, local_id: &str) -> Result<Option<String>, JournalError> {
+        self.with_read(|connection| read_v2_item_id(connection, sender, local_id))
+    }
+
+    pub fn remember_v2_item(
+        &self,
+        sender: &str,
+        local_id: &str,
+        item_id: &str,
+    ) -> Result<(), JournalError> {
+        self.with_transaction(|tx| write_v2_item_id(tx, sender, local_id, item_id))
+    }
+
     pub fn prepare_send_operation(
         &mut self,
         op_id: Uuid,
@@ -1236,6 +1300,30 @@ impl JournalStore {
             };
             write_operation(tx, &operation)?;
             Ok(operation)
+        })
+    }
+
+    pub(crate) fn record_v2_upload(
+        &self,
+        op_id: Uuid,
+        upload_key: Uuid,
+        file_id: String,
+    ) -> Result<(), JournalError> {
+        self.update_operation(op_id, |operation| {
+            let upload = operation
+                .uploads
+                .iter_mut()
+                .find(|upload| upload.upload_key == Some(upload_key))
+                .ok_or(JournalError::OperationConflict(op_id))?;
+            if let Some(previous) = &upload.upload_id {
+                return if previous == &file_id {
+                    Ok(false)
+                } else {
+                    Err(JournalError::OperationConflict(op_id))
+                };
+            }
+            upload.upload_id = Some(file_id);
+            Ok(true)
         })
     }
 
@@ -1366,6 +1454,22 @@ impl JournalStore {
         let result = self.with_transaction(|tx| {
             let mut operation =
                 read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
+            if operation.protocol_v2 && operation.kind == "send" {
+                let sender = operation.request["sender"]
+                    .as_str()
+                    .ok_or(JournalError::OperationConflict(op_id))?;
+                let item = &response["message"];
+                let item_id = item["item_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or(JournalError::OperationConflict(op_id))?;
+                let session = (!operation.session_handle.is_nil())
+                    .then(|| operation.session_handle.to_string());
+                if item["sender"] != sender || item["session"].as_str() != session.as_deref() {
+                    return Err(JournalError::OperationConflict(op_id));
+                }
+                write_v2_item_id(tx, sender, &op_id.to_string(), item_id)?;
+            }
             let session = operation.session_handle;
             operation.state = OperationState::Committed;
             operation.updated_at_ms = now_ms();
@@ -1858,6 +1962,40 @@ fn read_entry_by_event(
         .transpose()
 }
 
+fn read_v2_item_id(
+    connection: &Connection,
+    sender: &str,
+    local_id: &str,
+) -> Result<Option<String>, JournalError> {
+    connection
+        .query_row(
+            "SELECT item_id FROM v2_item_ids WHERE sender=?1 AND local_id=?2",
+            params![sender, local_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn write_v2_item_id(
+    tx: &Transaction<'_>,
+    sender: &str,
+    local_id: &str,
+    item_id: &str,
+) -> Result<(), JournalError> {
+    if let Some(saved) = read_v2_item_id(tx, sender, local_id)? {
+        if saved != item_id {
+            return Err(JournalError::ItemBindingConflict);
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO v2_item_ids(sender,local_id,item_id) VALUES(?1,?2,?3)",
+        params![sender, local_id, item_id],
+    )?;
+    Ok(())
+}
+
 fn read_operation(
     connection: &Connection,
     op_id: Uuid,
@@ -2216,7 +2354,7 @@ fn set_private_file(_file: &File) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2714,6 +2852,57 @@ mod tests {
         assert_eq!(snapshot.cursor, 1);
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.pending_for(session).len(), 0);
+    }
+
+    #[test]
+    fn v2_send_lookup_and_server_item_binding_survive_a_reopened_journal() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let sender = "app:example";
+        let prepared = PreparedSend {
+            inputs: json!({"session":"new","sender":sender,"message":{"title":"Example"}}),
+            request: json!({"session":session,"sender":sender,"message":{"title":"Example"}}),
+            files: Vec::new(),
+        };
+        {
+            let mut store = open(&root, session);
+            let lock = store.lock_operation(key).unwrap();
+            let operation = store
+                .prepare_v2_send(&lock, session, prepared.clone(), Vec::new())
+                .unwrap();
+            assert_eq!(operation.session_handle, session);
+            assert_eq!(store.v2_item_id(sender, &key.to_string()).unwrap(), None);
+            let recovered = store
+                .prepare_v2_send(&lock, Uuid::new_v4(), prepared.clone(), Vec::new())
+                .unwrap();
+            assert_eq!(recovered.session_handle, session);
+            let mut changed = prepared.clone();
+            changed.inputs["sender"] = "app:changed".into();
+            assert!(matches!(
+                store.prepare_v2_send(&lock, session, changed, Vec::new()),
+                Err(JournalError::OperationConflict(id)) if id == key
+            ));
+            let admitted = json!({"rev":2,"message":{"sender":sender,"session":session,"item_id":"server/opaque"}});
+            let wrong_sender = json!({"rev":2,"message":{"sender":"app:other","session":session,"item_id":"server/opaque"}});
+            assert!(store.settle_operation(key, wrong_sender, None).is_err());
+            assert_eq!(store.v2_item_id(sender, &key.to_string()).unwrap(), None);
+            store.settle_operation(key, admitted, None).unwrap();
+        }
+        let store = open(&root, session);
+        let saved = store.operation(key).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Committed);
+        assert_eq!(
+            store
+                .v2_item_id(sender, &key.to_string())
+                .unwrap()
+                .as_deref(),
+            Some("server/opaque")
+        );
+        assert_eq!(
+            store.v2_item_id("app:other", &key.to_string()).unwrap(),
+            None
+        );
     }
 
     fn sample_wire_request() -> PreparedRequest {

@@ -237,6 +237,7 @@ mod tests {
             sha256: hash.clone(),
             upload_cap_bytes_per_file: None,
             upload_id: Some(Uuid::new_v4().to_string()),
+            upload_key: None,
         };
         let original = json!({"type":"send","session_handle":session,"op_id":first,
             "message":{"sender_id":"app:test","message_id":"progress","message_type":"fyi","progress":{}},

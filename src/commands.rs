@@ -201,7 +201,7 @@ impl<'de> Deserialize<'de> for UniqueJsonMembers {
     }
 }
 
-fn read_answer_ui_file(path: &Path) -> Result<Value, CommandError> {
+pub(crate) fn read_answer_ui_file(path: &Path) -> Result<Value, CommandError> {
     let source = std::fs::read_to_string(path).map_err(|error| {
         CommandError::new(
             format!(
@@ -1850,34 +1850,9 @@ fn build_send_request_with_fields(
     file_entries: &[Value],
     fields: &MessageFieldOptions,
 ) -> Result<Value, CommandError> {
-    let (message_type, normalized) = validate_send_options(choices, fields, true)?;
-    let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
-    let created_at = now_ms();
-    let mut message = json!({
-        "sender_id": sender_id,
-        "message_id": message_id,
-        "created_at": created_at,
-        "title": title
-    });
-    if let Some(report) = &fields.progress {
-        message["progress"] = progress::initial_progress(report, created_at);
-    }
-    if let Some(body) = body {
-        message["body"] = Value::String(body.to_owned());
-    }
-    if let Some(message_type) = message_type {
-        message["message_type"] = Value::String(message_type.as_str().to_owned());
-    }
-    if let Some(message_kind) = fields.message_kind.as_deref() {
-        message["message_kind"] = Value::String(message_kind.to_owned());
-    }
-    message["answer_ui"] = answer_ui;
-    if let Some(display_name) = &fields.display_name {
-        message["display_name"] = Value::String(display_name.clone());
-    }
-    for (field, value) in normalized.members {
-        message[field] = value;
-    }
+    let mut message = build_send_content(title, body, choices, fields, now_ms())?;
+    message["sender_id"] = sender_id.into();
+    message["message_id"] = message_id.into();
 
     let mut request = json!({
         "v": 1,
@@ -1901,6 +1876,42 @@ fn build_send_request_with_fields(
         request["files"] = Value::Array(file_entries.to_vec());
     }
     Ok(request)
+}
+
+pub(crate) fn build_send_content(
+    title: &str,
+    body: Option<&str>,
+    choices: &[String],
+    fields: &MessageFieldOptions,
+    created_at: u64,
+) -> Result<Value, CommandError> {
+    let (message_type, normalized) = validate_send_options(choices, fields, true)?;
+    let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
+    let mut message = json!({
+        "created_at": created_at,
+        "title": title
+    });
+    if let Some(report) = &fields.progress {
+        message["progress"] = progress::initial_progress(report, created_at);
+    }
+    if let Some(body) = body {
+        message["body"] = Value::String(body.to_owned());
+    }
+    if let Some(message_type) = message_type {
+        message["message_type"] = Value::String(message_type.as_str().to_owned());
+    }
+    if let Some(message_kind) = fields.message_kind.as_deref() {
+        message["message_kind"] = Value::String(message_kind.to_owned());
+    }
+    message["answer_ui"] = answer_ui;
+    if let Some(display_name) = &fields.display_name {
+        message["display_name"] = Value::String(display_name.clone());
+    }
+    for (field, value) in normalized.members {
+        message[field] = value;
+    }
+
+    Ok(message)
 }
 
 fn with_supersedes(mut request: Value, supersedes: &[String]) -> Value {

@@ -430,6 +430,7 @@ fn stage_upload(
         sha256,
         upload_cap_bytes_per_file: upload_cap,
         upload_id: None,
+        upload_key: None,
     })
 }
 
@@ -443,7 +444,10 @@ pub(crate) fn stage_v2_uploads(
     for (index, selected) in selections.iter().enumerate() {
         let path = directory.join(format!("{index}.upload"));
         match stage_upload(selected, &path, upload_cap) {
-            Ok(upload) => uploads.push(upload),
+            Ok(mut upload) => {
+                upload.upload_key = Some(uuid::Uuid::new_v4());
+                uploads.push(upload);
+            }
             Err(error) => {
                 cleanup_staged_uploads(&uploads);
                 return Err(error);
