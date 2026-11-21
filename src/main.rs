@@ -376,13 +376,23 @@ enum Command {
         #[arg(long)]
         session: Uuid,
     },
+    /// Upload a file for use in a message or reply.
+    FileUpload {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        op_id: Option<Uuid>,
+    },
+    /// Verify and save a file from a message or chat entry.
+    FileGet {
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     DiscardUploads {
         #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        message_id: String,
-        #[arg(long)]
-        revision: u64,
+        file_id: String,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -585,7 +595,10 @@ fn main() {
 
     if matches!(
         cli.command,
-        Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. }
+        Command::MessageGet { .. }
+            | Command::Messages { .. }
+            | Command::MessageEntries { .. }
+            | Command::FileGet { .. }
     ) {
         run_device_read(&cli);
         return;
@@ -598,6 +611,8 @@ fn main() {
             | Command::Result { .. }
             | Command::Receipt { .. }
             | Command::FileUse { .. }
+            | Command::FileUpload { .. }
+            | Command::DiscardUploads { .. }
             | Command::Show { .. }
             | Command::JournalId
             | Command::Session { .. }
@@ -755,7 +770,10 @@ fn main() {
             args.ack2,
         ),
         Command::Read { session } => commands::read(&context, session),
-        Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. } => {
+        Command::MessageGet { .. }
+        | Command::Messages { .. }
+        | Command::MessageEntries { .. }
+        | Command::FileGet { .. } => {
             unreachable!("device reads were dispatched before loading the origin context")
         }
         Command::Focus { follow } => commands::focus(&context, follow),
@@ -860,17 +878,13 @@ fn main() {
             op_id,
         } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
         Command::Status { session } => commands::status(&context, session),
-        Command::DiscardUploads {
-            sender_id,
-            message_id,
-            revision,
-            op_id,
-        } => commands::discard_uploads(&context, &sender_id, &message_id, revision, op_id),
         Command::Retract { .. }
         | Command::Lifecycle { .. }
         | Command::Result { .. }
         | Command::Receipt { .. }
         | Command::FileUse { .. }
+        | Command::FileUpload { .. }
+        | Command::DiscardUploads { .. }
         | Command::Show { .. }
         | Command::JournalId
         | Command::Session { .. }
@@ -969,6 +983,16 @@ fn run_device_read(cli: &Cli) {
         } => (
             "message-entries",
             client.message_entries(item_id, before.as_deref(), *limit),
+        ),
+        Command::FileGet { file_id, output } => (
+            "file-get",
+            client.download_file(file_id).map(|mut file| {
+                file.save(output).unwrap_or_else(|error| fail(error, 1));
+                serde_json::json!({
+                    "kind":"file_saved","file_id":file_id,
+                    "size":file.size,"sha256":file.sha256,"path":output,
+                })
+            }),
         ),
         _ => unreachable!("clap requires a complete message selector"),
     };
@@ -1112,6 +1136,12 @@ fn run_device_write(cli: &Cli) {
                 device_name: device.as_deref(),
             },
         ),
+        Command::FileUpload { file, op_id } => {
+            writes::upload_file(&client, &mut journal, file, *op_id)
+        }
+        Command::DiscardUploads { file_id, op_id } => {
+            writes::discard_upload(&client, &mut journal, file_id, *op_id)
+        }
         Command::Retry { op_id, journal_id } => {
             let journal_id = journal_id.map(|id| id.to_string());
             writes::retry(&client, &mut journal, *op_id, journal_id.as_deref())

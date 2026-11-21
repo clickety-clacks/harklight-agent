@@ -1,8 +1,11 @@
+use std::path::Path;
+
 use reqwest::Method;
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::{Uuid, Variant};
 
+use crate::files;
 use crate::journal::{
     JournalError, JournalStore, OperationRecord, OperationState, PreparedRequest, RequestMethod,
 };
@@ -205,10 +208,47 @@ pub fn post(
     path: &[&str],
     body: Value,
 ) -> Result<Value, WriteFailure> {
-    let op_id = op_id.unwrap_or_else(Uuid::new_v4);
-    if op_id.get_version_num() != 4 || op_id.get_variant() != Variant::RFC4122 {
-        return Err(WriteFailure::local("--op-id must be a UUIDv4"));
-    }
+    write(
+        client,
+        journal,
+        operation,
+        session,
+        op_id,
+        RequestMethod::Post,
+        path,
+        body,
+    )
+}
+
+pub fn discard_upload(
+    client: &AgentClient,
+    journal: &mut JournalStore,
+    file_id: &str,
+    op_id: Option<Uuid>,
+) -> Result<Value, WriteFailure> {
+    write(
+        client,
+        journal,
+        "discard-uploads",
+        None,
+        op_id,
+        RequestMethod::Delete,
+        &["files", file_id],
+        Value::Null,
+    )
+}
+
+fn write(
+    client: &AgentClient,
+    journal: &mut JournalStore,
+    operation: &str,
+    session: Option<Uuid>,
+    op_id: Option<Uuid>,
+    method: RequestMethod,
+    path: &[&str],
+    body: Value,
+) -> Result<Value, WriteFailure> {
+    let op_id = operation_key(op_id)?;
     if path
         .iter()
         .any(|segment| matches!(*segment, "" | "." | ".."))
@@ -216,9 +256,13 @@ pub fn post(
         return Err(WriteFailure::local("invalid server request path"));
     }
     let request = PreparedRequest {
-        method: RequestMethod::Post,
+        body: if method == RequestMethod::Delete {
+            String::new()
+        } else {
+            body.to_string()
+        },
+        method,
         path: path.iter().map(|part| (*part).to_owned()).collect(),
-        body: body.to_string(),
         if_match: None,
     };
     let lock = journal.lock_operation(op_id)?;
@@ -226,7 +270,7 @@ pub fn post(
         op_id,
         session.unwrap_or_else(Uuid::nil),
         operation.to_owned(),
-        json!({"method":"POST","path":path,"body":body}),
+        json!({"method":request.method,"path":path,"body":body}),
         Vec::new(),
     )?;
     let operation = match operation.state {
@@ -235,6 +279,57 @@ pub fn post(
         }
         OperationState::Committed | OperationState::Rejected => operation,
     };
+    deliver(client, journal, operation)
+}
+
+fn operation_key(op_id: Option<Uuid>) -> Result<Uuid, WriteFailure> {
+    let key = op_id.unwrap_or_else(Uuid::new_v4);
+    if key.get_version_num() != 4 || key.get_variant() != Variant::RFC4122 {
+        return Err(WriteFailure::local("--op-id must be a UUIDv4"));
+    }
+    Ok(key)
+}
+
+pub fn upload_file(
+    client: &AgentClient,
+    journal: &mut JournalStore,
+    file: &Path,
+    op_id: Option<Uuid>,
+) -> Result<Value, WriteFailure> {
+    let op_id = operation_key(op_id)?;
+    let _lock = journal.lock_operation(op_id)?;
+    let paths = [file.to_owned()];
+    let manifest = files::identify(&paths).map_err(WriteFailure::local)?;
+    let request = json!({"files":manifest});
+    if let Some(operation) = journal.operation(op_id)? {
+        if operation.protocol_v2 && operation.kind == "file-upload" && operation.request == request
+        {
+            return deliver(client, journal, operation);
+        }
+        return Err(JournalError::OperationConflict(op_id).into());
+    }
+
+    let me = client
+        .read(&["me"], &[])
+        .map_err(|error| WriteFailure::local(error.to_string()))?;
+    let cap = match &me["limits"]["upload_cap_bytes_per_file"] {
+        Value::String(value) if value == "none" => None,
+        value => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| WriteFailure::local("invalid Server upload limit"))?,
+        ),
+    };
+    let staging = journal.upload_staging_directory(Uuid::nil(), op_id);
+    let uploads = files::stage_v2_uploads(&paths, &staging, cap).map_err(WriteFailure::local)?;
+    let upload = &uploads[0];
+    if upload.sha256 != manifest[0].sha256 || upload.size_bytes != manifest[0].size_bytes {
+        files::cleanup_staged_uploads(&uploads);
+        return Err(WriteFailure::local("file changed during staging"));
+    }
+
+    let operation =
+        journal.prepare_v2_operation(op_id, Uuid::nil(), "file-upload".into(), request, uploads)?;
     deliver(client, journal, operation)
 }
 
@@ -331,6 +426,43 @@ fn deliver(
         OperationState::Prepared | OperationState::Unknown => {}
     }
 
+    if operation.kind == "file-upload" {
+        let upload = operation
+            .uploads
+            .first()
+            .ok_or_else(|| WriteFailure::local("operation has no staged upload"))?;
+        let path = files::verified_staged_path(upload).map_err(|error| {
+            if operation.state == OperationState::Unknown {
+                unknown(&operation, &error, None)
+            } else {
+                WriteFailure::local(error)
+            }
+        })?;
+        journal.mark_operation_unknown(key)?;
+        return match client.upload_file(key, path, &upload.name, upload.size_bytes) {
+            Ok(response)
+                if response["file_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+                    && response["name"] == upload.name
+                    && response["size"] == upload.size_bytes
+                    && response["sha256"] == upload.sha256 =>
+            {
+                journal
+                    .settle_operation(key, response.clone(), None)
+                    .map_err(|error| unknown(&operation, &error.to_string(), None))?;
+                files::cleanup_staged_uploads(&operation.uploads);
+                Ok(committed(&operation, response))
+            }
+            Ok(_) => Err(unknown(
+                &operation,
+                "upload response did not match the saved file",
+                None,
+            )),
+            Err(error) => Err(record_failure(journal, &operation, error)?),
+        };
+    }
+
     let request = operation
         .prepared_request
         .as_ref()
@@ -374,44 +506,64 @@ fn deliver(
             "server response lacked a position",
             None,
         )),
-        Err(error) => {
-            if let V2Error::Http {
-                status,
-                ref token,
-                ref field,
-                ref request_id,
-                retry_after,
-            } = error
-            {
-                if (400..500).contains(&status) {
-                    let mut output = json!({
-                        "kind":"refused","operation":operation.kind,"op_id":key,
-                        "status":status,"error":token,
-                    });
-                    if let Some(field) = field {
-                        output["field"] = field.as_str().into();
-                    }
-                    if let Some(request_id) = request_id {
-                        output["request_id"] = request_id.as_str().into();
-                    }
-                    journal.reject_operation(key, output.clone())?;
-                    return Err(WriteFailure::from_saved_refusal(output));
-                }
-                let mut failure = unknown(&operation, &error.to_string(), retry_after);
-                if let Some(output) = failure.output.as_mut() {
-                    output["status"] = status.into();
-                    if let Some(id) = request_id {
-                        output["request_id"] = id.as_str().into();
-                    }
-                }
-                return Err(failure);
-            }
-            if error.outcome_unknown() {
-                return Err(unknown(&operation, &error.to_string(), None));
-            }
-            Err(WriteFailure::local(error.to_string()))
-        }
+        Err(error) => Err(record_failure(journal, &operation, error)?),
     }
+}
+
+fn record_failure(
+    journal: &mut JournalStore,
+    operation: &OperationRecord,
+    error: V2Error,
+) -> Result<WriteFailure, WriteFailure> {
+    if let V2Error::Http {
+        status,
+        ref token,
+        ref field,
+        ref request_id,
+        retry_after,
+    } = error
+    {
+        if (400..500).contains(&status) {
+            let mut output = json!({
+                "kind":"refused","operation":operation.kind,"op_id":operation.op_id,
+                "status":status,"error":token,
+            });
+            if let Some(field) = field {
+                output["field"] = field.as_str().into();
+            }
+            if let Some(id) = request_id {
+                output["request_id"] = id.as_str().into();
+            }
+            journal.reject_operation(operation.op_id, output.clone())?;
+            files::cleanup_staged_uploads(&operation.uploads);
+            return Ok(WriteFailure::from_saved_refusal(output));
+        }
+        let mut failure = unknown(operation, &error.to_string(), retry_after);
+        if let Some(output) = failure.output.as_mut() {
+            output["status"] = status.into();
+            if let Some(id) = request_id {
+                output["request_id"] = id.as_str().into();
+            }
+        }
+        return Ok(failure);
+    }
+    if error.outcome_unknown() {
+        let mut failure = unknown(operation, &error.to_string(), None);
+        if let V2Error::ResponseRead {
+            status,
+            ref request_id,
+            ..
+        } = error
+            && let Some(output) = failure.output.as_mut()
+        {
+            output["status"] = status.into();
+            if let Some(id) = request_id {
+                output["request_id"] = id.as_str().into();
+            }
+        }
+        return Ok(failure);
+    }
+    Ok(WriteFailure::local(error.to_string()))
 }
 
 fn committed(operation: &OperationRecord, response: Value) -> Value {
@@ -781,6 +933,80 @@ mod tests {
         assert_eq!(
             server.request_line().trim_end(),
             "POST /v2/agent/messages/item/retract HTTP/1.1"
+        );
+    }
+    #[test]
+    fn lost_upload_response_replays_the_staged_bytes_even_after_source_changes() {
+        let mut journal = TestJournal::new();
+        let key = Uuid::new_v4();
+        let source = journal.root.join("report.txt");
+        std::fs::write(&source, b"original contents").unwrap();
+        let files = [source.clone()];
+        let staging = journal.store.upload_staging_directory(Uuid::nil(), key);
+        let uploads = files::stage_v2_uploads(&files, &staging, None).unwrap();
+        let digest = uploads[0].sha256.clone();
+        journal
+            .store
+            .prepare_v2_operation(key, Uuid::nil(), "file-upload".into(), json!({}), uploads)
+            .unwrap();
+        let dropped = SlowServer::truncated(
+            "201 Created",
+            &[("Request-Id", "upload-request")],
+            r#"{"file_id":"opaque"#,
+        );
+        let fail = retry(&client_for(&dropped), &mut journal.store, key, None).unwrap_err();
+        assert_eq!(fail.exit_code, 7);
+        assert_eq!(fail.output.unwrap()["request_id"], "upload-request");
+        let first = dropped.request();
+        std::fs::write(source, b"changed caller file").unwrap();
+        let response = Box::leak(
+            json!({
+                "file_id":"opaque","name":"report.txt","size":17,"sha256":digest,
+            })
+            .to_string()
+            .into_boxed_str(),
+        );
+        let replay = SlowServer::respond(
+            Duration::ZERO,
+            "201 Created",
+            &[("Idempotent-Replayed", "true")],
+            response,
+        );
+        let recovered = retry(&client_for(&replay), &mut journal.store, key, None).unwrap();
+        assert_eq!(recovered["response"]["file_id"], "opaque");
+        let second = replay.request();
+        assert_eq!(first.body, b"original contents");
+        assert_eq!(first.body, second.body);
+        for attempt in [first, second] {
+            assert!(
+                attempt
+                    .headers
+                    .contains(&("idempotency-key".into(), key.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn discard_upload_commits_a_bodyless_result_and_reuses_its_saved_key() {
+        let mut journal = TestJournal::new();
+        let key = Uuid::new_v4();
+        let server = SlowServer::respond(Duration::ZERO, "204 No Content", &[], "");
+        let client = client_for(&server);
+        let output = discard_upload(&client, &mut journal.store, "file/one", Some(key)).unwrap();
+        assert_eq!(output["response"], json!({}));
+        assert_eq!(
+            retry(&client, &mut journal.store, key, None).unwrap(),
+            output
+        );
+        let request = server.request();
+        assert_eq!(
+            request.line.trim_end(),
+            "DELETE /v2/files/file%2Fone HTTP/1.1"
+        );
+        assert!(
+            request
+                .headers
+                .contains(&("idempotency-key".into(), key.to_string()))
         );
     }
 }

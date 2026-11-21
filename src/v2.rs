@@ -201,6 +201,8 @@ pub enum V2Error {
     },
     #[error("invalid server request path")]
     InvalidPath,
+    #[error("local file failed before the request: {0}")]
+    LocalFile(#[source] std::io::Error),
     #[error("server sent an unexpected response (request ID {request_id:?})")]
     InvalidResponse { request_id: Option<String> },
     #[error("could not read HTTP {status} response (request ID {request_id:?}): {source}")]
@@ -227,7 +229,7 @@ impl V2Error {
                 true
             }
             Self::Http { status, .. } => *status >= 500,
-            Self::InvalidPath => false,
+            Self::InvalidPath | Self::LocalFile(_) => false,
         }
     }
 }
@@ -431,3 +433,6 @@ mod tests {
 
 mod reads;
 pub mod writes;
+
+mod files;
+pub use files::Download;
