@@ -7,7 +7,8 @@ use uuid::{Uuid, Variant};
 
 use crate::files;
 use crate::journal::{
-    JournalError, JournalStore, OperationRecord, OperationState, PreparedRequest, RequestMethod,
+    JournalError, JournalStore, OperationLock, OperationRecord, OperationState, PreparedRequest,
+    RequestMethod,
 };
 
 use super::{AgentClient, JsonWrite, V2Error};
@@ -21,7 +22,7 @@ pub struct WriteFailure {
 }
 
 impl WriteFailure {
-    fn local(detail: impl Into<String>) -> Self {
+    pub(super) fn local(detail: impl Into<String>) -> Self {
         Self {
             exit_code: 1,
             output: None,
@@ -279,15 +280,28 @@ fn write(
         }
         OperationState::Committed | OperationState::Rejected => operation,
     };
-    deliver(client, journal, operation)
+    deliver(client, journal, &lock, operation)
 }
 
-fn operation_key(op_id: Option<Uuid>) -> Result<Uuid, WriteFailure> {
+pub(super) fn operation_key(op_id: Option<Uuid>) -> Result<Uuid, WriteFailure> {
     let key = op_id.unwrap_or_else(Uuid::new_v4);
     if key.get_version_num() != 4 || key.get_variant() != Variant::RFC4122 {
         return Err(WriteFailure::local("--op-id must be a UUIDv4"));
     }
     Ok(key)
+}
+
+pub(super) fn upload_cap(client: &AgentClient) -> Result<Option<u64>, WriteFailure> {
+    let me = client
+        .read(&["me"], &[])
+        .map_err(|error| WriteFailure::local(error.to_string()))?;
+    match &me["limits"]["upload_cap_bytes_per_file"] {
+        Value::String(value) if value == "none" => Ok(None),
+        value => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| WriteFailure::local("invalid Server upload limit")),
+    }
 }
 
 pub fn upload_file(
@@ -297,29 +311,19 @@ pub fn upload_file(
     op_id: Option<Uuid>,
 ) -> Result<Value, WriteFailure> {
     let op_id = operation_key(op_id)?;
-    let _lock = journal.lock_operation(op_id)?;
+    let lock = journal.lock_operation(op_id)?;
     let paths = [file.to_owned()];
     let manifest = files::identify(&paths).map_err(WriteFailure::local)?;
     let request = json!({"files":manifest});
     if let Some(operation) = journal.operation(op_id)? {
         if operation.protocol_v2 && operation.kind == "file-upload" && operation.request == request
         {
-            return deliver(client, journal, operation);
+            return deliver(client, journal, &lock, operation);
         }
         return Err(JournalError::OperationConflict(op_id).into());
     }
 
-    let me = client
-        .read(&["me"], &[])
-        .map_err(|error| WriteFailure::local(error.to_string()))?;
-    let cap = match &me["limits"]["upload_cap_bytes_per_file"] {
-        Value::String(value) if value == "none" => None,
-        value => Some(
-            value
-                .as_u64()
-                .ok_or_else(|| WriteFailure::local("invalid Server upload limit"))?,
-        ),
-    };
+    let cap = upload_cap(client)?;
     let staging = journal.upload_staging_directory(Uuid::nil(), op_id);
     let uploads = files::stage_v2_uploads(&paths, &staging, cap).map_err(WriteFailure::local)?;
     let upload = &uploads[0];
@@ -330,7 +334,7 @@ pub fn upload_file(
 
     let operation =
         journal.prepare_v2_operation(op_id, Uuid::nil(), "file-upload".into(), request, uploads)?;
-    deliver(client, journal, operation)
+    deliver(client, journal, &lock, operation)
 }
 
 pub fn retry(
@@ -339,7 +343,7 @@ pub fn retry(
     op_id: Uuid,
     expected_journal_id: Option<&str>,
 ) -> Result<Value, WriteFailure> {
-    let _lock = journal.lock_operation(op_id)?;
+    let lock = journal.lock_operation(op_id)?;
     let journal_id = journal.journal_id()?;
     if expected_journal_id.is_some_and(|id| id != journal_id) {
         return Err(operation_unresolved(
@@ -364,7 +368,7 @@ pub fn retry(
             "operation cannot be located",
         ));
     };
-    deliver(client, journal, operation)
+    deliver(client, journal, &lock, operation)
 }
 
 fn operation_unresolved(op_id: Uuid, journal_id: &str, detail: &str) -> WriteFailure {
@@ -392,10 +396,11 @@ pub fn abandon(journal: &mut JournalStore, op_id: Uuid) -> Result<Value, WriteFa
     }))
 }
 
-fn deliver(
+pub(super) fn deliver(
     client: &AgentClient,
     journal: &mut JournalStore,
-    operation: OperationRecord,
+    lock: &OperationLock,
+    mut operation: OperationRecord,
 ) -> Result<Value, WriteFailure> {
     let key = operation.op_id;
     if !operation.protocol_v2 {
@@ -463,6 +468,10 @@ fn deliver(
         };
     }
 
+    if operation.kind == "send" && operation.prepared_request.is_none() {
+        operation = super::sends::freeze_send(client, journal, lock, operation)?;
+    }
+
     let request = operation
         .prepared_request
         .as_ref()
@@ -499,6 +508,9 @@ fn deliver(
             journal
                 .settle_operation(key, response.clone(), None)
                 .map_err(|error| unknown(&operation, &error.to_string(), None))?;
+            if !crate::journal::is_progress(&operation.request["message"]) {
+                files::cleanup_staged_uploads(&operation.uploads);
+            }
             Ok(committed(&operation, response))
         }
         Ok(_) => Err(unknown(
@@ -510,7 +522,7 @@ fn deliver(
     }
 }
 
-fn record_failure(
+pub(super) fn record_failure(
     journal: &mut JournalStore,
     operation: &OperationRecord,
     error: V2Error,
@@ -566,17 +578,28 @@ fn record_failure(
     Ok(WriteFailure::local(error.to_string()))
 }
 
-fn committed(operation: &OperationRecord, response: Value) -> Value {
+pub(super) fn committed(operation: &OperationRecord, response: Value) -> Value {
     let mut output = json!({
         "kind":"committed","operation":operation.kind,"op_id":operation.op_id,"response":response,
     });
     if !operation.session_handle.is_nil() {
         output["session_handle"] = operation.session_handle.to_string().into();
     }
+    if operation.kind == "send" {
+        output["request_id"] = operation.op_id.to_string().into();
+        output["item_id"] = output["response"]["message"]["item_id"].clone();
+        if let Some(prepared) = &operation.prepared_send {
+            output["prepared"] = super::sends::prepared_metadata(prepared);
+        }
+    }
     output
 }
 
-fn unknown(operation: &OperationRecord, detail: &str, retry_after: Option<u64>) -> WriteFailure {
+pub(super) fn unknown(
+    operation: &OperationRecord,
+    detail: &str,
+    retry_after: Option<u64>,
+) -> WriteFailure {
     let mut output = json!({
         "kind":"outcome_unknown","operation":operation.kind,"op_id":operation.op_id,
     });
