@@ -572,7 +572,7 @@ mod tests {
     fn reply_preserves_the_correlation_and_uses_opaque_file_ids() {
         let mut journal = TestJournal::new();
         let server = SlowServer::sequence(vec![FixtureResponse::json(
-            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item","rev":9,"position":1,"request_revision":1,"author":"origin","kind":"reply","in_reply_to":"entry/1"}}),
+            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item","rev":9,"position":1,"request_revision":1,"author":"origin","kind":"reply","in_reply_to":"entry/1","text":""}}),
         )]);
         let output = reply(
             &client(&server),

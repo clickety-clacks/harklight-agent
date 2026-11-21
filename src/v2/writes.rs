@@ -647,10 +647,14 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
                     .is_none_or(|id| valid_entry() && entry["entry_id"] == id)
         }
         "reply" => {
+            let submitted_text = &request_body["text"];
+            let returned_text = &entry["text"];
             valid_entry()
                 && entry["kind"] == "reply"
                 && entry["author"] == "origin"
-                && entry["text"] == request_body["text"]
+                && (returned_text == submitted_text
+                    || (submitted_text.is_null() && returned_text == "")
+                    || (submitted_text == "" && returned_text.is_null()))
                 && entry["in_reply_to"] == request_body["in_reply_to"]
         }
         "result" => valid_message(message) && valid_entry(),
