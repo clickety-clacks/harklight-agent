@@ -12,29 +12,31 @@ impl AgentClient {
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect();
-        let response = self.read(&["agent", "messages"], &query)?;
-        let (_, messages) = message_page(&response, page)?;
+        let (response, request_id) = self.read_correlated(&["agent", "messages"], &query)?;
+        let (_, messages) = message_page(&response, page, &request_id)?;
         if let Some(session) = session {
             let session = session.to_string();
             if messages.iter().any(|message| message["session"] != session) {
-                return Err(invalid_response());
+                return Err(invalid_response(&request_id));
             }
         }
         Ok(response)
     }
 
     pub fn message(&self, item_id: &str) -> Result<Value, V2Error> {
-        let response = self.read(&["agent", "messages", item_id], &[])?;
-        let position = response["rev"].as_u64().ok_or_else(invalid_response)?;
+        let (response, request_id) = self.read_correlated(&["agent", "messages", item_id], &[])?;
+        let position = response["rev"]
+            .as_u64()
+            .ok_or_else(|| invalid_response(&request_id))?;
         let message = &response["message"];
         if message["item_id"] != item_id || !valid_sent_message(message, position) {
-            return Err(invalid_response());
+            return Err(invalid_response(&request_id));
         }
         Ok(response)
     }
 
     pub fn message_revision(&self, item_id: &str, revision: u64) -> Result<Value, V2Error> {
-        let response = self.read(
+        let (response, request_id) = self.read_correlated(
             &[
                 "agent",
                 "messages",
@@ -50,7 +52,7 @@ impl AgentClient {
             || !observed["message"].is_object()
             || !valid_files(&observed["files"])
         {
-            return Err(invalid_response());
+            return Err(invalid_response(&request_id));
         }
         Ok(response)
     }
@@ -66,12 +68,17 @@ impl AgentClient {
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect();
-        let response = self.read(&["agent", "messages", item_id, "entries"], &query)?;
-        let rev = response["rev"].as_u64().ok_or_else(invalid_response)?;
+        let (response, request_id) =
+            self.read_correlated(&["agent", "messages", item_id, "entries"], &query)?;
+        let rev = response["rev"]
+            .as_u64()
+            .ok_or_else(|| invalid_response(&request_id))?;
         let entries = response["entries"]
             .as_array()
-            .ok_or_else(invalid_response)?;
-        let older = response["older"].as_bool().ok_or_else(invalid_response)?;
+            .ok_or_else(|| invalid_response(&request_id))?;
+        let older = response["older"]
+            .as_bool()
+            .ok_or_else(|| invalid_response(&request_id))?;
         if (older && entries.is_empty())
             || entries.iter().any(|entry| {
                 entry["item_id"] != item_id
@@ -84,7 +91,7 @@ impl AgentClient {
                 .windows(2)
                 .any(|pair| pair[0]["position"].as_u64() >= pair[1]["position"].as_u64())
         {
-            return Err(invalid_response());
+            return Err(invalid_response(&request_id));
         }
         Ok(response)
     }
@@ -102,16 +109,16 @@ impl AgentClient {
             if let Some(page) = token.as_deref() {
                 query.push(("page", page));
             }
-            let response = self.read(&["agent", "messages"], &query)?;
-            let (position, messages) = message_page(&response, token.as_deref())?;
+            let (response, request_id) = self.read_correlated(&["agent", "messages"], &query)?;
+            let (position, messages) = message_page(&response, token.as_deref(), &request_id)?;
             for message in messages {
                 if message["sender"] != sender || message["legacy_message_id"] != legacy_message_id
                 {
-                    return Err(invalid_response());
+                    return Err(invalid_response(&request_id));
                 }
                 if let Some(prior) = &matched {
                     if prior["message"]["item_id"] != message["item_id"] {
-                        return Err(invalid_response());
+                        return Err(invalid_response(&request_id));
                     }
                     if prior["message"]["rev"].as_u64() >= message["rev"].as_u64() {
                         continue;
@@ -122,14 +129,16 @@ impl AgentClient {
             match response["next_page"].as_str() {
                 Some(next) if seen_tokens.insert(next.to_owned()) => token = Some(next.to_owned()),
                 None => return Ok(matched),
-                _ => return Err(invalid_response()),
+                _ => return Err(invalid_response(&request_id)),
             }
         }
     }
 }
 
-fn invalid_response() -> V2Error {
-    V2Error::InvalidResponse { request_id: None }
+fn invalid_response(request_id: &Option<String>) -> V2Error {
+    V2Error::InvalidResponse {
+        request_id: request_id.clone(),
+    }
 }
 
 fn nonempty_string(value: &Value) -> bool {
@@ -171,11 +180,14 @@ pub(super) fn valid_sent_message(message: &Value, position: u64) -> bool {
 fn message_page<'a>(
     response: &'a Value,
     requested_page: Option<&str>,
+    request_id: &Option<String>,
 ) -> Result<(u64, &'a [Value]), V2Error> {
-    let position = response["rev"].as_u64().ok_or_else(invalid_response)?;
+    let position = response["rev"]
+        .as_u64()
+        .ok_or_else(|| invalid_response(request_id))?;
     let messages = response["messages"]
         .as_array()
-        .ok_or_else(invalid_response)?;
+        .ok_or_else(|| invalid_response(request_id))?;
     let next = &response["next_page"];
     if (!next.is_null()
         && next
@@ -185,7 +197,7 @@ fn message_page<'a>(
             .iter()
             .any(|message| !valid_sent_message(message, position))
     {
-        return Err(invalid_response());
+        return Err(invalid_response(request_id));
     }
     Ok((position, messages))
 }

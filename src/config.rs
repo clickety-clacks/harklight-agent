@@ -194,6 +194,7 @@ impl EnrolledIdentity {
             .tls_version_min(reqwest::tls::Version::TLS_1_3)
             .tls_version_max(reqwest::tls::Version::TLS_1_3)
             .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
             // Wait for the Server's answer or a real connection failure. The
             // blocking client otherwise abandons a working request after its
             // built-in default deadline.

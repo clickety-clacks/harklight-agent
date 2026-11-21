@@ -39,11 +39,19 @@ impl AgentClient {
     }
 
     pub fn read(&self, path: &[&str], query: &[(&str, &str)]) -> Result<Value, V2Error> {
+        self.read_correlated(path, query).map(|(value, _)| value)
+    }
+
+    fn read_correlated(
+        &self,
+        path: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<(Value, Option<String>), V2Error> {
         let mut url = self.url(path)?;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
-        self.read_json(self.client.get(url).header(ACCEPT, "application/json"))
+        self.read_json_correlated(self.client.get(url).header(ACCEPT, "application/json"))
     }
 
     /// The caller provides the journaled bytes and key for both first
@@ -442,6 +450,30 @@ mod tests {
             request
                 .headers
                 .contains(&("idempotency-key".into(), key.to_string()))
+        );
+    }
+
+    #[test]
+    fn enrolled_https_calls_do_not_follow_redirects() {
+        let server = SlowServer::respond(
+            Duration::ZERO,
+            "307 Temporary Redirect",
+            &[("Location", "/other")],
+            "",
+        );
+        let result = client_for(&server).write(
+            Method::POST,
+            &["agent", "messages"],
+            JsonWrite {
+                key: Uuid::new_v4(),
+                body: b"{}",
+                if_match: None,
+            },
+        );
+        assert!(matches!(result, Err(V2Error::Http { status: 307, .. })));
+        assert_eq!(
+            server.request_line().trim_end(),
+            "POST /v2/agent/messages HTTP/1.1"
         );
     }
 
