@@ -4,7 +4,6 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -29,7 +28,6 @@ const EXIT_LOCAL: i32 = 1;
 const EXIT_REFUSED: i32 = 2;
 const EXIT_UNSUPPORTED: i32 = 5;
 const EXIT_UNKNOWN: i32 = 7;
-const PENDING_LIFETIME_MS: u64 = 86_400_000;
 
 #[derive(Debug)]
 pub struct EnrollmentError {
@@ -112,8 +110,13 @@ struct ServerFile {
 struct PendingFile {
     approval_code: String,
     status_secret: String,
-    expires_at: u64,
-    status_expires_at: u64,
+    // A waiting request does not expire. Current Servers send `null`; older
+    // Servers and pending.json files written by older Agents carry numbers,
+    // which are kept for display only and never enforced here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -239,13 +242,7 @@ pub fn start(
         certificate_pem.as_bytes(),
     )?;
 
-    let pending = submit_existing(
-        &context.identity_dir,
-        label,
-        &transport,
-        &context.endpoint,
-        current_time_ms(),
-    )?;
+    let pending = submit_existing(&context.identity_dir, label, &transport, &context.endpoint)?;
     write_json_private(&context.identity_dir, "pending.json", &pending)?;
     print_pending(&pending)
 }
@@ -263,46 +260,35 @@ pub fn retry(
     verify_existing_server(&context)?;
     resolve_before_mutation(&context.endpoint)?;
     let transport = HttpsTransport::new(context.endpoint.clone(), &context.ca_pem)?;
-    let pending_path = context.identity_dir.join("pending.json");
+    retry_with(&context.identity_dir, label, &transport, &context.endpoint)
+}
 
-    if let Some(pending) = read_optional_pending(&context.identity_dir)? {
-        let state = query_status(
-            &context.identity_dir,
-            &pending,
-            &transport,
-            &context.endpoint,
-        )?;
-        let now = current_time_ms();
-        if matches!(state, StatusOutcome::Expired)
-            || (matches!(state, StatusOutcome::NotFound) && now >= pending.expires_at)
-        {
-            archive_pending(&context.identity_dir, &pending)?;
-            let next = submit_existing(
-                &context.identity_dir,
-                label,
-                &transport,
-                &context.endpoint,
-                now,
-            )?;
-            write_json_private(&context.identity_dir, "pending.json", &next)?;
-            return print_pending(&next);
+fn retry_with(
+    identity_dir: &Path,
+    label: &str,
+    transport: &impl EnrollmentTransport,
+    endpoint: &Endpoint,
+) -> Result<(), EnrollmentError> {
+    if let Some(pending) = read_optional_pending(identity_dir)? {
+        let state = query_status(identity_dir, &pending, transport, endpoint)?;
+        // An older Server may still report `expired`; an unknown secret (for
+        // example one replaced by a later restart) is `not_found`. Either way,
+        // submit the same key again: the Server returns its waiting request.
+        let resubmit = match state {
+            StatusOutcome::Expired => true,
+            StatusOutcome::NotFound => !identity_dir.join("enrollment.json").exists(),
+            _ => false,
+        };
+        if !resubmit {
+            return print_status_outcome(identity_dir, &pending, state);
         }
-        return print_status_outcome(&context.identity_dir, &pending, state);
-    }
-
-    if pending_path.exists() {
+    } else if identity_dir.join("pending.json").exists() {
         return Err(EnrollmentError::local(
             "pending.json exists but could not be read as a pending enrollment",
         ));
     }
-    let pending = submit_existing(
-        &context.identity_dir,
-        label,
-        &transport,
-        &context.endpoint,
-        current_time_ms(),
-    )?;
-    write_json_private(&context.identity_dir, "pending.json", &pending)?;
+    let pending = submit_existing(identity_dir, label, transport, endpoint)?;
+    write_json_private(identity_dir, "pending.json", &pending)?;
     print_pending(&pending)
 }
 
@@ -515,7 +501,6 @@ fn submit_existing(
     label: &str,
     transport: &impl EnrollmentTransport,
     endpoint: &Endpoint,
-    now_ms: u64,
 ) -> Result<PendingFile, EnrollmentError> {
     let certificate_path = identity_dir.join("identity.pem");
     ensure_private_file(&certificate_path)?;
@@ -542,17 +527,7 @@ fn submit_existing(
             "the Server returned an invalid enrollment response: {error}"
         ))
     })?;
-    let expected_deadline = pending
-        .expires_at
-        .checked_add(PENDING_LIFETIME_MS)
-        .ok_or_else(|| {
-            EnrollmentError::unsupported("the Server returned an invalid enrollment deadline")
-        })?;
-    if !valid_code(&pending.approval_code)
-        || !valid_secret(&pending.status_secret)
-        || pending.expires_at <= now_ms
-        || pending.status_expires_at != expected_deadline
-    {
+    if !valid_code(&pending.approval_code) || !valid_secret(&pending.status_secret) {
         return Err(EnrollmentError::unsupported(
             "the Server returned an invalid enrollment response",
         ));
@@ -687,12 +662,7 @@ fn print_status_outcome(
 }
 
 fn print_pending(pending: &PendingFile) -> Result<(), EnrollmentError> {
-    emit_json(&json!({
-        "state":"pending",
-        "approval_code":pending.approval_code,
-        "expires_at":pending.expires_at,
-        "status_expires_at":pending.status_expires_at
-    }))?;
+    emit_json(&pending_output(pending))?;
     print_approval_guidance();
     Ok(())
 }
@@ -746,7 +716,7 @@ fn refusal_response(
     let message = match (status, error) {
         (409, "key_pending") => Some((
             EXIT_REFUSED,
-            "The Server already holds a request for this key, usually because an earlier reply was lost, and its approval code cannot be recovered. Keep this identity directory and wait up to 24 hours for the earlier request to expire, then run `harklight-agent enroll retry`, or start over with `enroll start` in a new identity directory.",
+            "The Server already holds a request for this key. Continue its invitation flow if it came from an invitation, or start over with `enroll start` in a new identity directory.",
         )),
         (409, "key_in_use") => Some((
             EXIT_REFUSED,
@@ -794,10 +764,7 @@ fn read_optional_pending(identity_dir: &Path) -> Result<Option<PendingFile>, Enr
     let pending: PendingFile = serde_json::from_slice(&bytes).map_err(|error| {
         EnrollmentError::local(format!("invalid JSON in {}: {error}", path.display()))
     })?;
-    if !valid_code(&pending.approval_code)
-        || !valid_secret(&pending.status_secret)
-        || pending.expires_at.checked_add(PENDING_LIFETIME_MS) != Some(pending.status_expires_at)
-    {
+    if !valid_code(&pending.approval_code) || !valid_secret(&pending.status_secret) {
         return Err(EnrollmentError::local(
             "pending.json contains an invalid enrollment record",
         ));
@@ -814,27 +781,6 @@ fn read_enrollment(identity_dir: &Path) -> Result<EnrollmentFile, EnrollmentErro
     serde_json::from_slice(&bytes).map_err(|error| {
         EnrollmentError::local(format!("invalid JSON in {}: {error}", path.display()))
     })
-}
-
-fn archive_pending(identity_dir: &Path, pending: &PendingFile) -> Result<(), EnrollmentError> {
-    let source = identity_dir.join("pending.json");
-    let destination = identity_dir.join(format!("pending-{}.json", pending.approval_code));
-    if fs::symlink_metadata(&destination).is_ok() {
-        return Err(EnrollmentError::local(format!(
-            "cannot archive the expired request because {} already exists; no files were changed",
-            destination
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        )));
-    }
-    fs::rename(&source, &destination).map_err(|error| {
-        EnrollmentError::local(format!(
-            "could not archive expired pending request: {error}"
-        ))
-    })?;
-    sync_directory(identity_dir)?;
-    Ok(())
 }
 
 fn write_json_private<T: Serialize>(
@@ -935,13 +881,6 @@ fn valid_secret(secret: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -957,14 +896,15 @@ fn emit_json(value: &Value) -> Result<(), EnrollmentError> {
         .map_err(|error| EnrollmentError::local(format!("stdout write failed: {error}")))
 }
 
-#[cfg(test)]
-fn print_pending_for_test(pending: &PendingFile) -> Value {
-    json!({
-        "state":"pending",
-        "approval_code":pending.approval_code,
-        "expires_at":pending.expires_at,
-        "status_expires_at":pending.status_expires_at
-    })
+fn pending_output(pending: &PendingFile) -> Value {
+    let mut output = json!({"state":"pending","approval_code":pending.approval_code});
+    if let Some(deadline) = pending.expires_at {
+        output["expires_at"] = deadline.into();
+    }
+    if let Some(deadline) = pending.status_expires_at {
+        output["status_expires_at"] = deadline.into();
+    }
+    output
 }
 
 #[cfg(test)]
@@ -983,8 +923,9 @@ mod tests {
 
     use super::{
         Endpoint, EnrollmentError, EnrollmentTransport, HttpResponse, HttpsTransport, PendingFile,
-        RequestFailure, StatusOutcome, archive_pending, generate_identity, parse_endpoint,
-        print_pending_for_test, query_status, start, submit_existing, write_json_private,
+        RequestFailure, StatusOutcome, generate_identity, parse_endpoint, pending_output,
+        query_status, read_optional_pending, retry_with, start, submit_existing,
+        write_json_private,
     };
 
     struct TestDirectory(PathBuf);
@@ -1095,13 +1036,33 @@ mod tests {
         })
     }
 
-    fn pending(code: &str, expires_at: u64) -> PendingFile {
+    fn pending(code: &str) -> PendingFile {
         PendingFile {
             approval_code: code.to_owned(),
             status_secret: "a".repeat(64),
-            expires_at,
-            status_expires_at: expires_at + 86_400_000,
+            expires_at: None,
+            status_expires_at: None,
         }
+    }
+
+    fn waiting(code: &str, secret: &str) -> Result<HttpResponse, RequestFailure> {
+        reply(
+            200,
+            json!({
+                "approval_code":code,
+                "status_secret":secret,
+                "expires_at":null,
+                "status_expires_at":null
+            }),
+        )
+    }
+
+    fn endpoint() -> Endpoint {
+        parse_endpoint(Some("192.0.2.7"), Some("harklight.example"), Some("18444")).unwrap()
+    }
+
+    fn saved_pending(directory: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(directory.join("pending.json")).unwrap()).unwrap()
     }
 
     fn setup_identity(directory: &Path) {
@@ -1133,16 +1094,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         let fake = std::cell::RefCell::new(FakeTransport::with([
             Err(RequestFailure::Unknown("reply lost".into())),
-            reply(409, json!({"error":"key_pending"})),
-            reply(
-                200,
-                json!({
-                    "approval_code":"ABCDEFG234",
-                    "status_secret":"b".repeat(64),
-                    "expires_at":86_600_000,
-                    "status_expires_at":173_000_000
-                }),
-            ),
+            waiting("ABCDEFG234", &"b".repeat(64)),
         ]));
         let transport = FakeTransportRef(&fake);
         let endpoint = parse_endpoint(
@@ -1153,28 +1105,20 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            submit_existing(
-                directory.path(),
-                "Work laptop",
-                &transport,
-                &endpoint,
-                100_000
-            ),
+            submit_existing(directory.path(), "Work laptop", &transport, &endpoint),
             Err(EnrollmentError { exit_code: 7, .. })
         ));
         assert!(!directory.path().join("pending.json").exists());
         assert_eq!(
-            submit_existing(
-                directory.path(),
-                "Work laptop",
-                &transport,
-                &endpoint,
-                100_000
-            )
-            .unwrap_err()
-            .exit_code,
-            2
+            fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            initial_files
         );
+        let accepted =
+            submit_existing(directory.path(), "Work laptop", &transport, &endpoint).unwrap();
+        assert_eq!(accepted.approval_code, "ABCDEFG234");
         assert_eq!(
             fs::read(directory.path().join("identity.key")).unwrap(),
             key_before
@@ -1183,48 +1127,197 @@ mod tests {
             fs::read(directory.path().join("identity.pem")).unwrap(),
             certificate_before
         );
-        assert_eq!(
-            fs::read_dir(directory.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<std::collections::BTreeSet<_>>(),
-            initial_files
-        );
-        let calls_before_expiry = fake.borrow().calls.clone();
-        assert_eq!(calls_before_expiry[1].0, "/enroll");
-        assert_eq!(
-            calls_before_expiry[1].1,
-            json!({"public_certificate":"certificate pem\n","label":"Work laptop"})
-        );
-        let accepted = submit_existing(
+        for call in &fake.borrow().calls {
+            assert_eq!(call.0, "/enroll");
+            assert_eq!(
+                call.1,
+                json!({"public_certificate":"certificate pem\n","label":"Work laptop"})
+            );
+        }
+    }
+
+    #[test]
+    fn null_deadline_response_is_accepted_and_saved_without_deadlines() {
+        let directory = TestDirectory::new();
+        setup_identity(directory.path());
+        let fake = std::cell::RefCell::new(FakeTransport::with([waiting(
+            "ABCDEFG234",
+            &"b".repeat(64),
+        )]));
+
+        retry_with(
             directory.path(),
             "Work laptop",
-            &transport,
-            &endpoint,
-            86_500_001,
+            &FakeTransportRef(&fake),
+            &endpoint(),
         )
         .unwrap();
-        assert_eq!(accepted.approval_code, "ABCDEFG234");
+
+        assert_eq!(
+            saved_pending(directory.path()),
+            json!({"approval_code":"ABCDEFG234","status_secret":"b".repeat(64)})
+        );
+        let loaded = read_optional_pending(directory.path()).unwrap().unwrap();
+        assert_eq!(loaded.expires_at, None);
+        assert_eq!(loaded.status_expires_at, None);
+    }
+
+    #[test]
+    fn repeated_retry_after_lost_replies_saves_the_same_code_with_the_newest_secret() {
+        let directory = TestDirectory::new();
+        setup_identity(directory.path());
+        let fake = std::cell::RefCell::new(FakeTransport::with([
+            // No pending.json: the reply to start was lost, so retry submits.
+            waiting("ABCDEFG234", &"b".repeat(64)),
+            // The saved secret was replaced by another restart elsewhere.
+            reply(404, json!({"error":"not_found"})),
+            waiting("ABCDEFG234", &"c".repeat(64)),
+        ]));
+        let transport = FakeTransportRef(&fake);
+
+        retry_with(directory.path(), "Work laptop", &transport, &endpoint()).unwrap();
+        assert_eq!(
+            saved_pending(directory.path())["status_secret"],
+            "b".repeat(64)
+        );
+
+        retry_with(directory.path(), "Work laptop", &transport, &endpoint()).unwrap();
+        assert_eq!(
+            saved_pending(directory.path()),
+            json!({"approval_code":"ABCDEFG234","status_secret":"c".repeat(64)})
+        );
+        let calls = fake.borrow().calls.clone();
+        assert_eq!(calls[1].0, "/enroll/status");
+        assert_eq!(calls[1].1, json!({"status_secret":"b".repeat(64)}));
+        assert_eq!(calls[2].0, "/enroll");
+    }
+
+    #[test]
+    fn retry_of_a_waiting_request_only_reads_status() {
+        let directory = TestDirectory::new();
+        setup_identity(directory.path());
+        write_json_private(directory.path(), "pending.json", &pending("ABCDEFG234")).unwrap();
+        let fake = std::cell::RefCell::new(FakeTransport::with([reply(
+            200,
+            json!({"state":"pending"}),
+        )]));
+
+        retry_with(
+            directory.path(),
+            "Work laptop",
+            &FakeTransportRef(&fake),
+            &endpoint(),
+        )
+        .unwrap();
+
+        assert_eq!(fake.borrow().calls.len(), 1);
+        assert_eq!(
+            saved_pending(directory.path())["status_secret"],
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn retry_resubmits_the_same_key_when_an_older_server_reports_expired() {
+        let directory = TestDirectory::new();
+        setup_identity(directory.path());
+        write_json_private(directory.path(), "pending.json", &pending("ABCDEFG234")).unwrap();
+        let key_before = fs::read(directory.path().join("identity.key")).unwrap();
+        let fake = std::cell::RefCell::new(FakeTransport::with([
+            reply(200, json!({"state":"expired"})),
+            reply(
+                200,
+                json!({
+                    "approval_code":"HIJKLMN567",
+                    "status_secret":"d".repeat(64),
+                    "expires_at":86_600_000,
+                    "status_expires_at":173_000_000
+                }),
+            ),
+        ]));
+
+        retry_with(
+            directory.path(),
+            "Work laptop",
+            &FakeTransportRef(&fake),
+            &endpoint(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            saved_pending(directory.path())["approval_code"],
+            "HIJKLMN567"
+        );
         assert_eq!(
             fs::read(directory.path().join("identity.key")).unwrap(),
             key_before
         );
-        assert_eq!(fake.borrow().calls[2].0, "/enroll");
-        assert_eq!(fake.borrow().calls[2].1.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pending_file_from_an_older_agent_with_numeric_deadlines_still_loads() {
+        let directory = TestDirectory::new();
+        let old = json!({
+            "approval_code":"ABCDEFG234",
+            "status_secret":"a".repeat(64),
+            "expires_at":200_000,
+            "status_expires_at":86_600_000
+        });
+        fs::write(
+            directory.path().join("pending.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            directory.path().join("pending.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let loaded = read_optional_pending(directory.path()).unwrap().unwrap();
+        assert_eq!(loaded.approval_code, "ABCDEFG234");
+        assert_eq!(loaded.expires_at, Some(200_000));
+        assert_eq!(loaded.status_expires_at, Some(86_600_000));
+    }
+
+    #[test]
+    fn key_pending_is_a_refusal() {
+        let directory = TestDirectory::new();
+        setup_identity(directory.path());
+        let fake = std::cell::RefCell::new(FakeTransport::with([reply(
+            409,
+            json!({"error":"key_pending"}),
+        )]));
+
+        let error = submit_existing(
+            directory.path(),
+            "Work laptop",
+            &FakeTransportRef(&fake),
+            &endpoint(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code, 2);
+        assert!(
+            error
+                .message
+                .contains("already holds a request for this key")
+        );
+        assert!(!directory.path().join("pending.json").exists());
     }
 
     #[test]
     fn status_uses_only_the_status_secret_and_approval_writes_identity_result() {
         let directory = TestDirectory::new();
         setup_identity(directory.path());
-        let pending = pending("ABCDEFG234", 200_000);
+        let pending = pending("ABCDEFG234");
         write_json_private(directory.path(), "pending.json", &pending).unwrap();
         let fake = std::cell::RefCell::new(FakeTransport::with([reply(
             200,
             json!({"state":"approved","person_id":"person-1","device_id":"device-1"}),
         )]));
-        let endpoint =
-            parse_endpoint(Some("192.0.2.7"), Some("harklight.example"), Some("18444")).unwrap();
+        let endpoint = endpoint();
         let state = query_status(
             directory.path(),
             &pending,
@@ -1243,24 +1336,6 @@ mod tests {
         assert_eq!(
             fake.borrow().calls[0].1,
             json!({"status_secret":"a".repeat(64)})
-        );
-    }
-
-    #[test]
-    fn expired_pending_is_archived_without_changing_the_private_key() {
-        let directory = TestDirectory::new();
-        setup_identity(directory.path());
-        let pending = pending("ABCDEFG234", 200_000);
-        write_json_private(directory.path(), "pending.json", &pending).unwrap();
-        let key_before = fs::read(directory.path().join("identity.key")).unwrap();
-
-        archive_pending(directory.path(), &pending).unwrap();
-
-        assert!(!directory.path().join("pending.json").exists());
-        assert!(directory.path().join("pending-ABCDEFG234.json").exists());
-        assert_eq!(
-            fs::read(directory.path().join("identity.key")).unwrap(),
-            key_before
         );
     }
 
@@ -1327,9 +1402,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_output_keeps_the_server_expiry_and_readback_deadline() {
-        let output = print_pending_for_test(&pending("ABCDEFG234", 200_000));
-        assert_eq!(output["expires_at"], 200_000);
-        assert_eq!(output["status_expires_at"], 86_600_000);
+    fn pending_output_omits_deadlines_the_server_did_not_set() {
+        let output = pending_output(&pending("ABCDEFG234"));
+        assert_eq!(
+            output,
+            json!({"state":"pending","approval_code":"ABCDEFG234"})
+        );
     }
 }
