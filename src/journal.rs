@@ -281,6 +281,26 @@ pub struct OperationRecord {
     pub uploads: Vec<UploadSource>,
     #[serde(default)]
     pub prepared_send: Option<PreparedSend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_request: Option<PreparedRequest>,
+}
+
+/// The finalized v2 HTTP request. The enclosing operation ID is its
+/// idempotency key. Store the JSON text intact so a retry sends the same bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedRequest {
+    pub method: RequestMethod,
+    pub path: Vec<String>,
+    pub if_match: Option<String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestMethod {
+    Post,
+    Put,
+    Delete,
 }
 
 /// The caller-visible immutable portion of a two-phase send. `request` is the
@@ -1103,6 +1123,7 @@ impl JournalStore {
                 response: None,
                 uploads,
                 prepared_send: None,
+                prepared_request: None,
             };
             write_operation(tx, &operation)?;
             Ok(operation)
@@ -1152,6 +1173,7 @@ impl JournalStore {
                 response: None,
                 uploads,
                 prepared_send: Some(prepared_send),
+                prepared_request: None,
             };
             write_operation(tx, &operation)?;
             Ok(operation)
@@ -1216,6 +1238,29 @@ impl JournalStore {
                 write_operation(tx, &operation)?;
             }
             Ok(())
+        })
+    }
+
+    /// Freeze the request and record that it may be sent in one commit.
+    /// An earlier protocol's unresolved write has no v2 request to reuse.
+    pub fn begin_v2_write(
+        &mut self,
+        op_id: Uuid,
+        request: PreparedRequest,
+    ) -> Result<OperationRecord, JournalError> {
+        self.with_transaction(|tx| {
+            let mut operation =
+                read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
+            match &operation.prepared_request {
+                Some(saved) if saved == &request => return Ok(operation),
+                None if operation.state == OperationState::Prepared => {}
+                _ => return Err(JournalError::OperationConflict(op_id)),
+            }
+            operation.prepared_request = Some(request);
+            operation.state = OperationState::Unknown;
+            operation.updated_at_ms = now_ms();
+            write_operation(tx, &operation)?;
+            Ok(operation)
         })
     }
 
@@ -2585,6 +2630,77 @@ mod tests {
         assert_eq!(snapshot.cursor, 1);
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.pending_for(session).len(), 0);
+    }
+
+    #[test]
+    fn v2_write_freezes_wire_request_and_key_before_delivery() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let request = PreparedRequest {
+            method: RequestMethod::Put,
+            path: vec!["agent".into(), "messages".into(), "opaque/id".into()],
+            if_match: Some(r#""1""#.into()),
+            body: r#"{ "message" : {"title":"test"} }"#.into(),
+        };
+        {
+            let mut store = open(&root, session);
+            store
+                .prepare_operation(key, session, "revise".into(), json!({}))
+                .unwrap();
+            let operation = store.begin_v2_write(key, request.clone()).unwrap();
+            assert_eq!(operation.state, OperationState::Unknown);
+        }
+
+        let mut store = open(&root, session);
+        let operation = store.operation(key).unwrap().unwrap();
+        assert_eq!(operation.op_id, key);
+        assert_eq!(operation.state, OperationState::Unknown);
+        assert_eq!(operation.prepared_request, Some(request.clone()));
+        let mut changed = request.clone();
+        changed.body = changed.body.replace(" : ", ":");
+        assert!(matches!(
+            store.begin_v2_write(key, changed),
+            Err(JournalError::OperationConflict(id)) if id == key
+        ));
+        assert_eq!(
+            store
+                .begin_v2_write(key, request.clone())
+                .unwrap()
+                .prepared_request,
+            Some(request),
+        );
+    }
+
+    #[test]
+    fn v2_write_does_not_retarget_an_unknown_earlier_protocol_operation() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let mut store = open(&root, session);
+        store
+            .prepare_operation(key, session, "send".into(), json!({"v":1}))
+            .unwrap();
+        store.mark_operation_unknown(key).unwrap();
+
+        let request = PreparedRequest {
+            method: RequestMethod::Post,
+            path: vec!["agent".into(), "messages".into()],
+            if_match: None,
+            body: "{}".into(),
+        };
+        assert!(matches!(
+            store.begin_v2_write(key, request),
+            Err(JournalError::OperationConflict(id)) if id == key
+        ));
+        assert!(
+            store
+                .operation(key)
+                .unwrap()
+                .unwrap()
+                .prepared_request
+                .is_none()
+        );
     }
 
     #[test]
