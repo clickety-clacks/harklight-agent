@@ -10,10 +10,10 @@ impl JournalStore {
     /// cleanup. An idle process cannot know about an unobserved remote closure.
     pub(crate) fn maintain_progress_material(&self, session: Uuid) -> Result<(), JournalError> {
         let ids = self.with_read(|db| {
-            let mut query = db.prepare("SELECT DISTINCT message_id FROM operations WHERE session_handle=?1
+            let mut query = db.prepare("SELECT DISTINCT message_id FROM operations WHERE session_handle=?1 AND message_id IS NOT NULL
                 AND json_extract(payload,'$.request.message.message_type')='fyi'
                 AND json_type(payload,'$.request.message.progress') IS NOT NULL
-                UNION SELECT request_id FROM entries WHERE session_handle=?1 AND kind='revision' AND author='origin'
+                UNION SELECT request_id FROM entries WHERE session_handle=?1 AND request_id IS NOT NULL AND kind='revision' AND author='origin'
                 AND json_extract(payload,'$.raw.message.message_type')='fyi'
                 AND json_type(payload,'$.raw.message.progress') IS NOT NULL")?;
             Ok(query.query_map([session.to_string()], |row| row.get::<_, String>(0))?

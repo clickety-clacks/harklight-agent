@@ -185,3 +185,73 @@ fn binary_device_port_overrides_an_existing_enrollment_port() {
         "GET /v2/agent/messages HTTP/1.1"
     );
 }
+
+#[test]
+fn general_progress_revision_does_not_prevent_journal_reopen() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![FixtureResponse::json(json!({
+        "rev":2,"message":{"item_id":"item","revision":2,"rev":2,"sender":"app:test","seen":false,
+         "files":[],"message":{"title":"Progress","created_at":10,"message_type":"fyi","progress":{}}}
+    }))]);
+    let fixture = CliFixture::new(&server, identity);
+    let draft = fixture.0.join("revision.json");
+    fs::write(
+        &draft,
+        r#"{"title":"Progress","created_at":10,"message_type":"fyi","progress":{}}"#,
+    )
+    .unwrap();
+    let first = fixture.run(&[
+        "revise",
+        "--item-id",
+        "item",
+        "--base-revision",
+        "1",
+        "--message-json",
+        draft.to_str().unwrap(),
+    ]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = fixture.run(&["journal-id"]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn explicit_legacy_progress_miss_does_not_fall_through_to_current_id() {
+    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":2,"messages":[]}"#);
+    let fixture = CliFixture::new(&server, identity);
+    let session = Uuid::new_v4().to_string();
+    let output = fixture.run(&[
+        "progress",
+        "--session",
+        &session,
+        "--request",
+        "opaque",
+        "--sender-id",
+        "app:other",
+        "--percent",
+        "25",
+        "--stage",
+        "Verify",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"], "not_found");
+    assert_eq!(
+        server.request_line().trim_end(),
+        "GET /v2/agent/messages?sender=app%3Aother&legacy_message_id=opaque HTTP/1.1"
+    );
+}

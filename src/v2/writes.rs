@@ -573,28 +573,22 @@ pub(super) fn deliver(
         )
     };
     match response {
-        Ok((response, _)) if valid_write_response(&operation.kind, request, &response) => {
+        Ok((response, request_id)) if valid_write_response(&operation.kind, request, &response) => {
             journal
                 .settle_operation(key, response.clone(), None)
-                .map_err(|error| unknown(&operation, &error.to_string(), None))?;
+                .map_err(|error| {
+                    correlated_unknown(&operation, &error.to_string(), request_id.as_deref())
+                })?;
             if !crate::journal::is_progress(&operation.request["message"]) {
                 files::cleanup_staged_uploads(&operation.uploads);
             }
             Ok(committed(&operation, response))
         }
-        Ok((_, request_id)) => {
-            let mut failure = unknown(
-                &operation,
-                "server response did not match the operation",
-                None,
-            );
-            if let Some(id) = request_id
-                && let Some(output) = failure.output.as_mut()
-            {
-                output["request_id"] = id.into();
-            }
-            Err(failure)
-        }
+        Ok((_, request_id)) => Err(correlated_unknown(
+            &operation,
+            "server response did not match the operation",
+            request_id.as_deref(),
+        )),
         Err(error) => Err(record_failure(journal, &operation, error)?),
     }
 }
@@ -609,47 +603,81 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
     if request.method == RequestMethod::Delete {
         return response.is_object();
     }
-    if !response["rev"].is_u64() {
+    let Some(rev) = response["rev"].as_u64() else {
         return false;
-    }
-    if matches!(kind, "send" | "revise" | "progress") {
-        return (kind == "send"
-            || request
-                .path
-                .get(2)
-                .is_some_and(|item| response["message"]["item_id"] == *item))
-            && super::reads::valid_sent_message(
-                &response["message"],
-                response["rev"].as_u64().unwrap(),
-            );
-    }
-    if kind == "reply" {
-        let entry = &response["entry"];
-        return request
-            .path
-            .get(2)
-            .is_some_and(|item| entry["item_id"] == *item)
-            && entry["entry_id"].as_str().is_some_and(|id| !id.is_empty());
-    }
-    if kind != "receipt" {
-        return true;
-    }
-    if !matches!(
-        response["status"].as_str(),
-        Some("recorded" | "already_recorded" | "superseded")
-    ) || !matches!(
-        response["stage_outcome"].as_str(),
-        Some("handed" | "not_handed")
-    ) {
-        return false;
-    }
-    match request.path.as_slice() {
-        [_, _, item, _, entry, _] => {
-            response["entry"]["entry_id"] == *entry && response["entry"]["item_id"] == *item
+    };
+    let request_body: Value = serde_json::from_str(&request.body).unwrap_or_default();
+    let item_id = request.path.get(2).map(String::as_str);
+    let valid_message = |message: &Value| {
+        super::reads::valid_sent_message(message, rev)
+            && item_id.is_none_or(|id| message["item_id"] == id)
+    };
+    let entry = &response["entry"];
+    let valid_entry = || {
+        item_id.is_some_and(|item| entry["item_id"] == item)
+            && entry["entry_id"].as_str().is_some_and(|id| !id.is_empty())
+            && entry["rev"]
+                .as_u64()
+                .is_some_and(|entry_rev| (1..=rev).contains(&entry_rev))
+            && entry["position"]
+                .as_u64()
+                .is_some_and(|position| position > 0)
+            && entry["request_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > 0)
+            && entry["kind"].as_str().is_some_and(|kind| !kind.is_empty())
+            && matches!(
+                entry["author"].as_str(),
+                Some("person" | "origin" | "server")
+            )
+    };
+    let message = &response["message"];
+    match kind {
+        "send" => {
+            valid_message(message)
+                && message["sender"] == request_body["sender"]
+                && message["session"] == request_body["session"]
+                && message["message"]["title"] == request_body["message"]["title"]
+                && message["message"]["body"] == request_body["message"]["body"]
         }
-        [_, _, item, _] => response["message"]["item_id"] == *item,
-        _ => false,
+        "revise" | "progress" | "retract" | "lifecycle" => {
+            valid_message(message)
+                && request_body["in_reply_to"]
+                    .as_str()
+                    .is_none_or(|id| valid_entry() && entry["entry_id"] == id)
+        }
+        "reply" => valid_entry() && entry["kind"] == "reply",
+        "result" => valid_message(message) && valid_entry(),
+        "receipt" => {
+            if !matches!(
+                response["status"].as_str(),
+                Some("recorded" | "already_recorded" | "superseded")
+            ) || !matches!(
+                response["stage_outcome"].as_str(),
+                Some("handed" | "not_handed")
+            ) {
+                return false;
+            }
+            match request.path.as_slice() {
+                [_, _, _, _, id, _] => valid_entry() && entry["entry_id"] == *id,
+                [_, _, _, _] => valid_message(message),
+                _ => false,
+            }
+        }
+        _ => true,
     }
+}
+
+fn correlated_unknown(
+    operation: &OperationRecord,
+    detail: &str,
+    request_id: Option<&str>,
+) -> WriteFailure {
+    let mut failure = unknown(operation, detail, None);
+    if let (Some(id), Some(output)) = (request_id, failure.output.as_mut()) {
+        output["request_id"] = id.into();
+    }
+    failure
 }
 
 pub(super) fn record_failure(
@@ -786,7 +814,10 @@ mod tests {
     #[test]
     fn correlated_retract_posts_the_entry_id() {
         let mut journal = TestJournal::new();
-        let server = SlowServer::answer_after(Duration::ZERO, r#"{"rev":2}"#);
+        let server = SlowServer::answer_after(
+            Duration::ZERO,
+            r#"{"rev":2,"message":{"item_id":"item/a","rev":2,"sender":"app:fixture","revision":1,"message":{},"files":[],"seen":false},"entry":{"item_id":"item/a","entry_id":"entry/one","rev":2,"position":1,"request_revision":1,"author":"person","kind":"reply"}}"#,
+        );
         let key = Uuid::new_v4();
         let output = control(
             &client_for(&server),
@@ -915,8 +946,8 @@ mod tests {
             ),
         ] {
             let projection = entry_id.map_or_else(
-                || json!({"message":{"item_id":"item"}}),
-                |id| json!({"entry":{"item_id":"item","entry_id":id}}),
+                || json!({"message":{"item_id":"item","rev":3,"sender":"app:fixture","revision":1,"message":{},"files":[],"seen":false}}),
+                |id| json!({"entry":{"item_id":"item","entry_id":id,"rev":3,"position":1,"request_revision":1,"author":"person","kind":"reply"}}),
             );
             let mut body = json!({"rev":3,"status":"recorded","stage_outcome":"handed"});
             body.as_object_mut()
@@ -1058,7 +1089,10 @@ mod tests {
     fn simultaneous_same_key_writes_share_a_single_http_request() {
         use std::sync::{Arc, Barrier};
         let mut journal = TestJournal::new();
-        let server = SlowServer::answer_after(Duration::from_millis(120), r#"{"rev":3}"#);
+        let server = SlowServer::answer_after(
+            Duration::from_millis(120),
+            r#"{"rev":3,"message":{"item_id":"item","sender":"app:fixture","rev":3,"revision":1,"message":{},"files":[],"seen":false}}"#,
+        );
         let client = client_for(&server);
         let second_client = client.clone();
         let op_id = Uuid::new_v4();

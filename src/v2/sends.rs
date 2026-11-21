@@ -340,9 +340,20 @@ mod tests {
                 body: r#"{"rev":1,"message":"#.into(),
                 truncate: true,
             },
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[("Request-Id", "wrong-content")],
+                body: json!({"rev":1,"message":{
+                    "item_id":"opaque/id","sender":"app:sample","session":session,
+                    "revision":1,"rev":1,"message":{"title":"Different title","body":"Body"},
+                    "seen":false,"files":[],
+                }})
+                .to_string(),
+                truncate: false,
+            },
             FixtureResponse::json(json!({"rev":1,"message":{
                 "item_id":"opaque/id","sender":"app:sample","session":session,
-                "revision":1,"rev":1,"message":{},"seen":false,"files":[],
+                "revision":1,"rev":1,"message":{"title":"Update","body":"Body"},"seen":false,"files":[],
             }})),
         ]);
         let client = client_for(&server);
@@ -360,6 +371,9 @@ mod tests {
         assert_eq!(outcome.exit_code, 7);
         let revived_client = client_for(&server);
         let mut reopened = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
+        let malformed = writes::retry(&revived_client, &mut reopened, key, None).unwrap_err();
+        assert_eq!(malformed.exit_code, 7);
+        assert_eq!(malformed.output.unwrap()["request_id"], "wrong-content");
         let committed = writes::retry(&revived_client, &mut reopened, key, None).unwrap();
         assert_eq!(committed["item_id"], "opaque/id");
         assert_eq!(committed["prepared"], prepared["prepared"]);
@@ -376,6 +390,7 @@ mod tests {
         );
         let mut requests = server.requests().into_iter();
         let first = requests.next().unwrap();
+        let wrong_content = requests.next().unwrap();
         let second = requests.next().unwrap();
         assert_eq!(first.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
         let body: Value = serde_json::from_slice(&first.body).unwrap();
@@ -383,7 +398,8 @@ mod tests {
         assert_eq!(body["message"], prepared["prepared"]["message"]);
         assert!(body["message"].get("message_id").is_none());
         assert_eq!(first.body, second.body);
-        for attempt in [first, second] {
+        assert_eq!(first.body, wrong_content.body);
+        for attempt in [first, wrong_content, second] {
             assert!(
                 attempt
                     .headers

@@ -285,6 +285,7 @@ pub fn progress(
     {
         item_id = remote.to_owned();
     }
+    let explicit_legacy = legacy_sender.is_some();
     let legacy_sender = match legacy_sender {
         Some(sender) => Some(sender.to_owned()),
         None if item_id == request => journal.legacy_sender(session, request)?,
@@ -311,6 +312,10 @@ pub fn progress(
             }
             journal.remember_v2_item(&sender, request, &item_id)?;
             found
+        } else if explicit_legacy {
+            return Err(WriteFailure::from_saved_refusal(json!({
+                "kind":"refused","operation":"progress","status":404,"error":"not_found",
+            })));
         } else {
             client
                 .message(&item_id)
@@ -572,7 +577,7 @@ mod tests {
     fn reply_preserves_the_correlation_and_uses_opaque_file_ids() {
         let mut journal = TestJournal::new();
         let server = SlowServer::sequence(vec![FixtureResponse::json(
-            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item"}}),
+            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item","rev":9,"position":1,"request_revision":1,"author":"origin","kind":"reply"}}),
         )]);
         let output = reply(
             &client(&server),
