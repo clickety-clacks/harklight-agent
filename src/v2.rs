@@ -39,7 +39,7 @@ impl AgentClient {
     }
 
     /// The caller provides the journaled bytes and key for both first
-    /// delivery and retries. Only POST and PUT have JSON request bodies.
+    /// delivery and retries. This method expects a JSON response.
     pub fn write(
         &self,
         method: Method,
@@ -60,6 +60,20 @@ impl AgentClient {
                 .body(write.body.to_vec());
         }
         self.read_json(request)
+    }
+
+    pub fn delete(&self, path: &[&str], key: Uuid) -> Result<(), V2Error> {
+        let response = self.send_checked(
+            self.client
+                .delete(self.url(path)?)
+                .header("Idempotency-Key", key.to_string()),
+        )?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        Err(V2Error::InvalidResponse {
+            request_id: header(&response, "Request-Id").map(str::to_owned),
+        })
     }
 
     fn url(&self, path: &[&str]) -> Result<Url, V2Error> {
@@ -84,26 +98,45 @@ impl AgentClient {
             .map_err(|source| self.transport_error(source))
     }
 
-    fn read_json(&self, request: RequestBuilder) -> Result<Value, V2Error> {
+    fn send_checked(&self, request: RequestBuilder) -> Result<Response, V2Error> {
         let response = self.send(request)?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
         let status = response.status().as_u16();
         let request_id = header(&response, "Request-Id").map(str::to_owned);
         let retry_after = header(&response, "Retry-After").and_then(|seconds| seconds.parse().ok());
-        let bytes = response
+        let body = response
             .bytes()
-            .map_err(|source| self.transport_error(source))?;
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok());
+        let request_id =
+            request_id.or_else(|| body.as_ref().and_then(|body| body.request_id.clone()));
+        let (token, field) = body
+            .and_then(|body| {
+                body.error
+                    .filter(|token| known_error(token))
+                    .map(|token| (token, body.field))
+            })
+            .map_or((None, None), |(token, field)| (Some(token), field));
+        Err(V2Error::Http {
+            status,
+            request_id,
+            token,
+            field,
+            retry_after,
+        })
+    }
 
-        if !(200..300).contains(&status) {
-            let body = serde_json::from_slice::<ErrorBody>(&bytes).ok();
-            return Err(V2Error::Http {
-                status,
-                request_id: request_id
-                    .or_else(|| body.as_ref().map(|body| body.request_id.clone())),
-                token: body.map(|body| body.error),
-                retry_after,
-            });
-        }
-
+    fn read_json(&self, request: RequestBuilder) -> Result<Value, V2Error> {
+        let response = self.send_checked(request)?;
+        let status = response.status().as_u16();
+        let request_id = header(&response, "Request-Id").map(str::to_owned);
+        let bytes = response.bytes().map_err(|source| V2Error::ResponseRead {
+            status,
+            request_id: request_id.clone(),
+            source,
+        })?;
         serde_json::from_slice::<Value>(&bytes)
             .ok()
             .filter(Value::is_object)
@@ -130,8 +163,32 @@ pub struct JsonWrite<'a> {
 
 #[derive(Deserialize)]
 struct ErrorBody {
-    error: String,
-    request_id: String,
+    error: Option<String>,
+    request_id: Option<String>,
+    field: Option<String>,
+}
+
+fn known_error(token: &str) -> bool {
+    matches!(
+        token,
+        "not_found"
+            | "invalid_field"
+            | "stale_request"
+            | "already_answered"
+            | "already_closed"
+            | "already_retracted"
+            | "not_answered"
+            | "idempotency_conflict"
+            | "precondition_failed"
+            | "cursor_expired"
+            | "unauthorized"
+            | "forbidden"
+            | "retry_later"
+            | "storage_unavailable"
+            | "payload_too_large"
+            | "unsupported"
+            | "account_paused"
+    )
 }
 
 #[derive(Debug, Error)]
@@ -144,12 +201,20 @@ pub enum V2Error {
     },
     #[error("invalid server request path")]
     InvalidPath,
-    #[error("server response was not a JSON object (request ID {request_id:?})")]
+    #[error("server sent an unexpected response (request ID {request_id:?})")]
     InvalidResponse { request_id: Option<String> },
+    #[error("could not read HTTP {status} response (request ID {request_id:?}): {source}")]
+    ResponseRead {
+        status: u16,
+        request_id: Option<String>,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("server returned HTTP {status}: {token:?} (request ID {request_id:?})")]
     Http {
         status: u16,
         token: Option<String>,
+        field: Option<String>,
         request_id: Option<String>,
         retry_after: Option<u64>,
     },
@@ -158,7 +223,9 @@ pub enum V2Error {
 impl V2Error {
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            Self::Transport { .. } | Self::InvalidResponse { .. } => true,
+            Self::Transport { .. } | Self::InvalidResponse { .. } | Self::ResponseRead { .. } => {
+                true
+            }
             Self::Http { status, .. } => *status >= 500,
             Self::InvalidPath => false,
         }
@@ -255,10 +322,100 @@ mod tests {
         assert!(error.outcome_unknown());
         assert!(matches!(
             error,
-            V2Error::Http { status: 503, token: Some(token), request_id: Some(id), retry_after: Some(2) }
+            V2Error::Http { status: 503, token: Some(token), request_id: Some(id), retry_after: Some(2), .. }
                 if token == "storage_unavailable" && id == "req-1"
         ));
         assert_eq!(server.request_line().trim_end(), "GET /v2/me HTTP/1.1");
+    }
+
+    #[test]
+    fn genuine_device_mutual_tls_requires_the_enrolled_certificate() {
+        let (server, test_identity) = SlowServer::mutual_tls(r#"{"rev":0,"messages":[]}"#);
+        let identity = EnrolledIdentity::for_test(
+            "127.0.0.1",
+            TLS_NAME,
+            server.port,
+            server.ca_pem.as_bytes(),
+        )
+        .with_test_identity(test_identity);
+        let response = AgentClient::new(identity)
+            .unwrap()
+            .messages(None, None)
+            .unwrap();
+        assert_eq!(response["messages"], json!([]));
+        assert_eq!(
+            server.request_line().trim_end(),
+            "GET /v2/agent/messages HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn truncated_503_keeps_status_and_response_headers() {
+        let server = SlowServer::truncated(
+            "503 Service Unavailable",
+            &[("Request-Id", "header-id"), ("Retry-After", "9")],
+            r#"{"error":"storage_unavailable""#,
+        );
+        let error = client_for(&server).read(&["me"], &[]).unwrap_err();
+        assert!(error.outcome_unknown());
+        assert!(matches!(
+            error,
+            V2Error::Http {
+                status: 503, token: None, request_id: Some(id), retry_after: Some(9), ..
+            } if id == "header-id"
+        ));
+        server.request();
+    }
+
+    #[test]
+    fn closed_error_tokens_and_request_id_precedence() {
+        let bad_token = SlowServer::respond(
+            Duration::ZERO,
+            "409 Conflict",
+            &[("Request-Id", "header-id")],
+            r#"{"error":"unexpected_detail","request_id":"body-id"}"#,
+        );
+        let error = client_for(&bad_token).read(&["me"], &[]).unwrap_err();
+        assert!(!error.to_string().contains("unexpected_detail"));
+        assert!(matches!(
+            error,
+            V2Error::Http { status: 409, token: None, request_id: Some(id), .. } if id == "header-id"
+        ));
+        bad_token.request();
+
+        let no_body_id = SlowServer::respond(
+            Duration::ZERO,
+            "400 Bad Request",
+            &[("Request-Id", "request-id")],
+            r#"{"error":"invalid_field","field":"sender"}"#,
+        );
+        let error = client_for(&no_body_id).read(&["me"], &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            V2Error::Http { status: 400, token: Some(token), field: Some(field), request_id: Some(id), .. }
+                if token == "invalid_field" && field == "sender" && id == "request-id"
+        ));
+        no_body_id.request();
+    }
+
+    #[test]
+    fn deleting_an_upload_accepts_bodyless_success() {
+        let server = SlowServer::respond(Duration::ZERO, "204 No Content", &[], "");
+        let key = Uuid::new_v4();
+        client_for(&server)
+            .delete(&["files", "file/id"], key)
+            .unwrap();
+        let request = server.request();
+        assert_eq!(
+            request.line.trim_end(),
+            "DELETE /v2/files/file%2Fid HTTP/1.1"
+        );
+        assert!(request.body.is_empty());
+        assert!(
+            request
+                .headers
+                .contains(&("idempotency-key".into(), key.to_string()))
+        );
     }
 
     fn client_for(server: &SlowServer) -> AgentClient {

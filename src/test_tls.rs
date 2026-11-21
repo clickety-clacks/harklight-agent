@@ -9,10 +9,13 @@ use std::{
     time::Duration,
 };
 
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+};
 use rustls::{
-    ServerConfig, ServerConnection, StreamOwned,
+    RootCertStore, ServerConfig, ServerConnection, StreamOwned,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::WebPkiClientVerifier,
 };
 
 pub const TLS_NAME: &str = "harklight.test";
@@ -21,6 +24,11 @@ pub struct SlowServer {
     pub port: u16,
     pub ca_pem: String,
     handle: JoinHandle<RecordedRequest>,
+}
+
+pub struct TestIdentity {
+    pub certificate: Vec<u8>,
+    pub key: Vec<u8>,
 }
 
 pub struct RecordedRequest {
@@ -41,6 +49,39 @@ impl SlowServer {
         response_headers: &'static [(&'static str, &'static str)],
         body: &'static str,
     ) -> Self {
+        Self::serve(delay, status, response_headers, body, body.len(), false).0
+    }
+
+    /// Announce a longer body than the one sent, then close the connection.
+    pub fn truncated(
+        status: &'static str,
+        headers: &'static [(&'static str, &'static str)],
+        body: &'static str,
+    ) -> Self {
+        Self::serve(
+            Duration::ZERO,
+            status,
+            headers,
+            body,
+            body.len() + 10,
+            false,
+        )
+        .0
+    }
+
+    pub fn mutual_tls(body: &'static str) -> (Self, TestIdentity) {
+        let (server, identity) = Self::serve(Duration::ZERO, "200 OK", &[], body, body.len(), true);
+        (server, identity.unwrap())
+    }
+
+    fn serve(
+        delay: Duration,
+        status: &'static str,
+        response_headers: &'static [(&'static str, &'static str)],
+        body: &'static str,
+        content_length: usize,
+        require_identity: bool,
+    ) -> (Self, Option<TestIdentity>) {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -53,10 +94,32 @@ impl SlowServer {
             .unwrap();
 
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = ServerConfig::builder_with_provider(provider)
+        let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
+            .unwrap();
+        let (builder, client_identity) = if require_identity {
+            let mut roots = RootCertStore::empty();
+            roots.add(ca.der().clone()).unwrap();
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .unwrap();
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(vec!["client".into()]).unwrap();
+            params
+                .extended_key_usages
+                .push(ExtendedKeyUsagePurpose::ClientAuth);
+            let cert = params.signed_by(&key, &ca).unwrap();
+            (
+                builder.with_client_cert_verifier(verifier),
+                Some(TestIdentity {
+                    certificate: cert.pem().into_bytes(),
+                    key: key.serialize_pem().into_bytes(),
+                }),
+            )
+        } else {
+            (builder.with_no_client_auth(), None)
+        };
+        let config = builder
             .with_single_cert(
                 vec![CertificateDer::from(server_cert.der().to_vec())],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
@@ -72,7 +135,7 @@ impl SlowServer {
             let mut reader = BufReader::new(StreamOwned::new(connection, tcp));
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
-            let mut content_length = 0usize;
+            let mut request_content_length = 0usize;
             let mut headers = Vec::new();
             loop {
                 let mut header = String::new();
@@ -84,11 +147,11 @@ impl SlowServer {
                 let (name, value) = header.split_once(':').unwrap();
                 let value = value.trim();
                 if name.eq_ignore_ascii_case("content-length") {
-                    content_length = value.parse().unwrap();
+                    request_content_length = value.parse().unwrap();
                 }
                 headers.push((name.to_ascii_lowercase(), value.to_owned()));
             }
-            let mut request_body = vec![0; content_length];
+            let mut request_body = vec![0; request_content_length];
             reader.read_exact(&mut request_body).unwrap();
 
             thread::sleep(delay);
@@ -97,7 +160,7 @@ impl SlowServer {
             write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                body.len()
+                content_length
             )
             .unwrap();
             for (name, value) in response_headers {
@@ -114,11 +177,14 @@ impl SlowServer {
             }
         });
 
-        Self {
-            port,
-            ca_pem: ca.as_ref().pem(),
-            handle,
-        }
+        (
+            Self {
+                port,
+                ca_pem: ca.as_ref().pem(),
+                handle,
+            },
+            client_identity,
+        )
     }
 
     /// The request line the server received.
