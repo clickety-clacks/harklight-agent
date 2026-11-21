@@ -22,8 +22,8 @@ pub struct AgentClient {
 
 impl AgentClient {
     pub fn new(identity: EnrolledIdentity) -> Result<Self, ConfigError> {
-        let client = identity.client_for_port(identity.port)?;
-        let base = identity.origin_url(identity.port, "/v2/")?;
+        let client = identity.device_client()?;
+        let base = identity.device_url("/v2/")?;
         Ok(Self {
             client,
             base,
@@ -270,13 +270,12 @@ mod tests {
     #[test]
     fn reads_on_the_enrolled_device_port_with_encoded_ids_and_queries() {
         let server = SlowServer::answer_after(Duration::ZERO, r#"{"rev":1,"entries":[]}"#);
-        let mut identity = EnrolledIdentity::for_test(
+        let identity = EnrolledIdentity::for_test(
             "127.0.0.1",
             TLS_NAME,
             server.port,
             server.ca_pem.as_bytes(),
         );
-        identity.origin_port = Some(1);
         let client = AgentClient::new(identity).unwrap();
         let response = client
             .read(

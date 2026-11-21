@@ -1,9 +1,11 @@
+#[cfg(test)]
+use std::process;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
     path::{Path, PathBuf},
-    process, thread,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -65,10 +67,6 @@ pub enum JournalError {
     MissingOperation(Uuid),
     #[error("operation {op_id} is {state}; only an unresolved operation can be abandoned")]
     NotUnresolved { op_id: Uuid, state: &'static str },
-    #[error("listener already active (pid {0})")]
-    ListenerActive(u32),
-    #[error("listener lock is held but its process id is not available")]
-    ListenerActiveUnknown,
     #[error("journal has no entry for event {0}")]
     MissingEvent(String),
 }
@@ -358,8 +356,6 @@ thread_local! {
 pub struct JournalStore {
     journal_path: PathBuf,
     journal_lock_path: PathBuf,
-    listener_lock_path: PathBuf,
-    listener_lock: Option<File>,
 }
 
 impl JournalStore {
@@ -374,8 +370,6 @@ impl JournalStore {
         let store = Self {
             journal_path: directory.join("origin-feed.sqlite3"),
             journal_lock_path: directory.join("origin-feed.lock"),
-            listener_lock_path: directory.join(format!("{session_handle}.listener.lock")),
-            listener_lock: None,
         };
         store.initialize()?;
         store.maintain_progress_material(session_handle)?;
@@ -966,28 +960,6 @@ impl JournalStore {
             .join("upload-staging")
             .join(session_handle.to_string())
             .join(op_id.to_string())
-    }
-
-    pub fn acquire_listener(&mut self) -> Result<(), JournalError> {
-        if self.listener_lock.is_some() {
-            return Ok(());
-        }
-        let lock_file = open_lock_file(&self.listener_lock_path)?;
-        if let Err(error) = lock_file.try_lock_exclusive() {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Err(match read_lock_pid(&self.listener_lock_path) {
-                    Some(pid) => JournalError::ListenerActive(pid),
-                    None => JournalError::ListenerActiveUnknown,
-                });
-            }
-            return Err(error.into());
-        }
-        let mut lock_file = lock_file;
-        lock_file.set_len(0)?;
-        writeln!(&mut lock_file, "{}", process::id())?;
-        lock_file.sync_all()?;
-        self.listener_lock = Some(lock_file);
-        Ok(())
     }
 
     pub fn record_entry(&mut self, entry: JournalEntry) -> Result<bool, JournalError> {
@@ -1619,14 +1591,6 @@ impl JournalStore {
             {
                 let _ = self.prune_progress_request(op.session_handle, id);
             }
-        }
-    }
-}
-
-impl Drop for JournalStore {
-    fn drop(&mut self) {
-        if let Some(lock_file) = self.listener_lock.as_ref() {
-            let _ = lock_file.unlock();
         }
     }
 }
@@ -2373,25 +2337,6 @@ fn open_lock_file(path: &Path) -> Result<File, std::io::Error> {
     let file = options.open(path)?;
     set_private_file(&file)?;
     Ok(file)
-}
-
-fn read_lock_pid(path: &Path) -> Option<u32> {
-    // A second listener can arrive in the short interval after the lock is
-    // acquired and before the owner publishes its PID. Only local lock metadata
-    // is retried here; this does not drive server requests or feed polling.
-    for _ in 0..32 {
-        let mut content = String::new();
-        if File::open(path)
-            .and_then(|mut file| file.read_to_string(&mut content))
-            .is_ok()
-        {
-            if let Ok(pid) = content.trim().parse() {
-                return Some(pid);
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    None
 }
 
 #[cfg(unix)]
@@ -3322,34 +3267,6 @@ mod tests {
     }
 
     #[test]
-    fn listener_lease_blocks_only_another_listener() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut listener = open(&root, session);
-        listener.acquire_listener().unwrap();
-
-        let mut command = open(&root, session);
-        assert!(matches!(
-            command.acquire_listener(),
-            Err(JournalError::ListenerActive(pid)) if pid == process::id()
-        ));
-        command.record_entry(entry(session, 1, "hello")).unwrap();
-        command.mark_delivered("1").unwrap();
-        assert!(
-            command
-                .snapshot()
-                .unwrap()
-                .entry_by_event("1")
-                .unwrap()
-                .delivered_at_ms
-                .is_some()
-        );
-
-        drop(listener);
-        command.acquire_listener().unwrap();
-    }
-
-    #[test]
     fn operation_commit_and_acted_fact_share_one_snapshot() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
@@ -3373,14 +3290,12 @@ mod tests {
     }
 
     #[test]
-    fn feed_cursor_is_origin_wide_while_pending_and_listener_leases_are_per_session() {
+    fn legacy_feed_cursor_spans_sessions() {
         let root = Scratch::new();
         let first_session = Uuid::new_v4();
         let second_session = Uuid::new_v4();
         let mut first = open(&root, first_session);
         let mut second = open(&root, second_session);
-        first.acquire_listener().unwrap();
-        second.acquire_listener().unwrap();
 
         first
             .record_entry(entry(second_session, 1, "for second"))

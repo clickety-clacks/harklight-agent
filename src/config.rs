@@ -47,7 +47,6 @@ struct ServerFile {
     name: String,
     port: u16,
     device_port: Option<u16>,
-    origin_port: Option<u16>,
     ca_sha256: String,
 }
 
@@ -65,7 +64,6 @@ pub struct EnrolledIdentity {
     pub address: String,
     pub name: String,
     pub port: u16,
-    pub origin_port: Option<u16>,
     pub person_id: Option<String>,
     pub device_id: String,
     pub ca_file: PathBuf,
@@ -117,7 +115,6 @@ impl EnrolledIdentity {
             address: server.address,
             name: server.name,
             port: server.device_port.unwrap_or(server.port),
-            origin_port: server.origin_port,
             person_id: enrollment.person_id,
             device_id: enrollment.device_id,
             ca_file: ca_file.to_path_buf(),
@@ -140,7 +137,6 @@ impl EnrolledIdentity {
             address: address.into(),
             name: name.into(),
             port,
-            origin_port: Some(port),
             person_id: None,
             device_id: "device".into(),
             ca_file: PathBuf::new(),
@@ -170,23 +166,8 @@ impl EnrolledIdentity {
         hex::encode(Sha256::digest(bytes))
     }
 
-    pub fn resolve_origin_port(&self, override_port: Option<u16>) -> Result<u16, ConfigError> {
-        let port = override_port.or(self.origin_port).ok_or_else(|| {
-            ConfigError::Invalid(
-                "origin HTTPS port is not configured; provide --origin-port from the server endpoint configuration".into(),
-            )
-        })?;
-        if port == 0 {
-            return Err(ConfigError::Invalid(
-                "origin HTTPS port must be nonzero".into(),
-            ));
-        }
-        Ok(port)
-    }
-
     /// Build a client that uses only the enrolled CA and device certificate.
-    /// The endpoint route and port are supplied by the confirmed server wire.
-    pub fn client_for_port(&self, _port: u16) -> Result<Client, ConfigError> {
+    pub fn device_client(&self) -> Result<Client, ConfigError> {
         let mut identity_pem = self.certificate_pem.clone();
         if !identity_pem.ends_with(b"\n") {
             identity_pem.push(b'\n');
@@ -214,13 +195,14 @@ impl EnrolledIdentity {
     }
 
     /// Create a URL using the enrolled certificate name while resolving it to
-    /// the enrolled address. A server-provided port is explicit because the
-    /// origin listener may differ from the relay listener in server.json.
-    pub fn origin_url(&self, port: u16, path: &str) -> Result<Url, ConfigError> {
+    /// the enrolled address.
+    pub fn device_url(&self, path: &str) -> Result<Url, ConfigError> {
         if !path.starts_with('/') || path.starts_with("//") {
-            return Err(ConfigError::Invalid("origin path must be absolute".into()));
+            return Err(ConfigError::Invalid(
+                "device API path must be absolute".into(),
+            ));
         }
-        let mut url = Url::parse(&format!("https://{}:{port}{path}", self.name))
+        let mut url = Url::parse(&format!("https://{}:{}{path}", self.name, self.port))
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         url.set_fragment(None);
         Ok(url)
@@ -302,7 +284,7 @@ mod tests {
         fs::write(
             identity.join("server.json"),
             format!(
-                r#"{{"address":"127.0.0.1","name":"example.test","port":18444,"origin_port":null,"ca_sha256":"{ca_hash}"}}"#
+                r#"{{"address":"127.0.0.1","name":"example.test","port":18444,"ca_sha256":"{ca_hash}"}}"#
             ),
         )
         .unwrap();
