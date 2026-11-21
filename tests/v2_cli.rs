@@ -164,3 +164,24 @@ fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
     assert!(body.get("file_ids").is_none());
     assert_eq!(body["message"]["progress"]["percent"], 20);
 }
+
+#[test]
+fn binary_device_port_overrides_an_existing_enrollment_port() {
+    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":0,"messages":[]}"#);
+    let fixture = CliFixture::new(&server, identity);
+    let path = fixture.0.join("identity/server.json");
+    let mut server_config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    server_config.as_object_mut().unwrap().remove("device_port");
+    fs::write(path, server_config.to_string()).unwrap();
+
+    let output = fixture.run(&["--device-port", &server.port.to_string(), "messages"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        server.request_line().trim_end(),
+        "GET /v2/agent/messages HTTP/1.1"
+    );
+}

@@ -589,7 +589,12 @@ fn device_identity(cli: &Cli) -> EnrolledIdentity {
         .ca_file
         .as_deref()
         .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
-    EnrolledIdentity::load(identity_dir, ca_file).unwrap_or_else(|error| fail(error.to_string(), 1))
+    let mut identity = EnrolledIdentity::load(identity_dir, ca_file)
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    if let Some(device_port) = cli.device_port {
+        identity.port = device_port;
+    }
+    identity
 }
 
 fn run_device_read(cli: &Cli) {
