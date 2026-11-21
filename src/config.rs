@@ -149,6 +149,13 @@ impl EnrolledIdentity {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_identity(mut self, identity: crate::test_tls::TestIdentity) -> Self {
+        self.certificate_pem = identity.certificate;
+        self.key_pem = identity.key;
+        self
+    }
+
     pub fn resolve_origin_port(&self, override_port: Option<u16>) -> Result<u16, ConfigError> {
         let port = override_port.or(self.origin_port).ok_or_else(|| {
             ConfigError::Invalid(

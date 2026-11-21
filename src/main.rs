@@ -965,6 +965,7 @@ fn run_device_read(cli: &Cli) {
                 message.ok_or_else(|| V2Error::Http {
                     status: 404,
                     token: Some("not_found".into()),
+                    field: None,
                     request_id: None,
                     retry_after: None,
                 })
@@ -988,6 +989,7 @@ fn run_device_read(cli: &Cli) {
         Err(error @ V2Error::Http { status, .. }) if (400..500).contains(&status) => {
             if let V2Error::Http {
                 ref token,
+                ref field,
                 ref request_id,
                 ..
             } = error
@@ -995,6 +997,9 @@ fn run_device_read(cli: &Cli) {
                 let mut output = serde_json::json!({
                     "kind":"refused", "operation":operation, "status":status, "error":token,
                 });
+                if let Some(field) = field {
+                    output["field"] = field.as_str().into();
+                }
                 if let Some(request_id) = request_id {
                     output["request_id"] = request_id.as_str().into();
                 }
