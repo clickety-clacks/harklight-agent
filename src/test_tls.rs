@@ -207,11 +207,15 @@ impl SlowServer {
                 } = response;
                 let content_length = body.len() + if truncate { 10 } else { 0 };
                 write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                content_length
-            )
-            .unwrap();
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nConnection: close\r\n",
+                ).unwrap();
+                if !response_headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                {
+                    write!(stream, "Content-Type: application/json\r\n").unwrap();
+                }
                 for (name, value) in response_headers {
                     write!(stream, "{name}: {value}\r\n").unwrap();
                 }

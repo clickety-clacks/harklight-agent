@@ -4,11 +4,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use harklight_agent::{
-    commands::{self, CommandContext, MessageFieldOptions, ProgressReport},
+    commands::{self, MessageFieldOptions, ProgressReport},
     config::{EnrolledIdentity, default_state_root},
     enrollment,
     journal::JournalStore,
-    v2::{AgentClient, V2Error, mutations, sends, writes},
+    v2::{AgentClient, V2Error, feed, mutations, sends, writes},
 };
 
 #[derive(Debug, Parser)]
@@ -22,8 +22,6 @@ struct Cli {
     identity_dir: Option<PathBuf>,
     #[arg(long, global = true, env = "HARKLIGHT_CA_FILE")]
     ca_file: Option<PathBuf>,
-    #[arg(long, global = true, env = "HARKLIGHT_ORIGIN_PORT")]
-    origin_port: Option<u16>,
     #[arg(long, global = true, env = "HARKLIGHT_AGENT_STATE_DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -156,44 +154,8 @@ enum Command {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Attach {
-        #[arg(long)]
-        session: Uuid,
-        #[arg(long, value_name = "ID|none")]
-        vendor_session_id: String,
-        #[arg(long, value_enum)]
-        route: Route,
-        #[arg(long)]
-        controller: bool,
-        #[arg(long)]
-        origin_listener: bool,
-        #[arg(
-            long,
-            help = "Declare that this controller sends system ACK2 for this handle"
-        )]
-        ack2: bool,
-    },
-    /// Replace this existing origin handle's transport and resume its saved feed.
-    Reconnect {
-        #[arg(long)]
-        session: Uuid,
-        #[arg(long, value_name = "ID|none", requires = "route")]
-        vendor_session_id: Option<String>,
-        #[arg(long, value_enum, requires = "vendor_session_id")]
-        route: Option<Route>,
-        #[arg(long, requires = "route")]
-        controller: bool,
-    },
     Listen(ListenArgs),
-    /// Move an existing supported route-other handle under the origin listener.
-    Cover {
-        #[arg(long)]
-        session: Uuid,
-    },
-    Read {
-        #[arg(long)]
-        session: Uuid,
-    },
+    Read(FeedArgs),
     /// Read an authoritative sent message and its file references.
     #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "sender_id"])))]
     MessageGet {
@@ -238,17 +200,14 @@ enum Command {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Ack {
+    /// Acknowledge an advisory delivered on the change feed.
+    AdvisoryAck {
         #[arg(long)]
-        session: Uuid,
-        #[arg(
-            long,
-            required_unless_present = "advisory",
-            conflicts_with = "advisory"
-        )]
-        event: Option<String>,
-        #[arg(long, required_unless_present = "event", conflicts_with = "event")]
-        advisory: Option<Uuid>,
+        item_id: String,
+        #[arg(long)]
+        advisory_id: String,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
     /// Report handoff of an answer or a person chat entry.
     Receipt {
@@ -339,16 +298,6 @@ enum Command {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Withdraw {
-        #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
-        #[arg(long)]
-        in_reply_to: Option<String>,
-        #[arg(long)]
-        op_id: Option<Uuid>,
-    },
     Retract {
         #[arg(long)]
         item_id: String,
@@ -372,10 +321,6 @@ enum Command {
         status: ResultStatus,
         #[arg(long)]
         op_id: Option<Uuid>,
-    },
-    Status {
-        #[arg(long)]
-        session: Uuid,
     },
     /// Upload a file for use in a message or reply.
     FileUpload {
@@ -473,29 +418,24 @@ struct EnrollStatusArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("mode").required(true).multiple(false).args(["follow", "next"]))) ]
-struct ListenArgs {
-    #[arg(long, required_unless_present = "origin", conflicts_with = "origin")]
+struct FeedArgs {
+    #[arg(long)]
     session: Option<Uuid>,
-    #[arg(long, requires = "follow", conflicts_with_all = ["next", "controller", "ack2", "session"])]
-    origin: bool,
-    #[arg(long, value_enum)]
-    session_context: Option<SessionContext>,
+    #[arg(long, conflicts_with = "snapshot")]
+    after: Option<u64>,
     #[arg(long)]
-    claude_code_version: Option<String>,
+    snapshot: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("mode").required(true).args(["follow","next"])))]
+struct ListenArgs {
+    #[command(flatten)]
+    feed: FeedArgs,
     #[arg(long)]
-    background_tasks_enabled: bool,
-    #[arg(long, group = "mode")]
     follow: bool,
-    #[arg(long, group = "mode")]
-    next: bool,
     #[arg(long)]
-    controller: bool,
-    #[arg(
-        long,
-        help = "Declare that this controller sends system ACK2 for this handle"
-    )]
-    ack2: bool,
+    next: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -506,21 +446,6 @@ enum SessionCommand {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum Route {
-    ClaudeCode,
-    Codex,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SessionContext {
-    Interactive,
-    Bare,
-    Print,
-    Sdk,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -570,7 +495,7 @@ fn main() {
                 args.endpoint.name.as_deref(),
                 args.endpoint.port.as_deref(),
                 args.label.as_deref(),
-                cli.origin_port,
+                None,
             ),
             EnrollCommand::Retry(args) => enrollment::retry(
                 cli.identity_dir.as_deref(),
@@ -594,174 +519,48 @@ fn main() {
         return;
     }
 
-    if matches!(
-        cli.command,
-        Command::MessageGet { .. }
-            | Command::Messages { .. }
-            | Command::MessageEntries { .. }
-            | Command::FileGet { .. }
-    ) {
-        run_device_read(&cli);
-        return;
-    }
-
-    if matches!(
-        cli.command,
-        Command::Send { .. }
-            | Command::Reply { .. }
-            | Command::Revise { .. }
-            | Command::Progress { .. }
-            | Command::Retract { .. }
-            | Command::Lifecycle { .. }
-            | Command::Result { .. }
-            | Command::Receipt { .. }
-            | Command::FileUse { .. }
-            | Command::FileUpload { .. }
-            | Command::DiscardUploads { .. }
-            | Command::Show { .. }
-            | Command::JournalId
-            | Command::Session { .. }
-            | Command::Retry { .. }
-            | Command::Abandon { .. }
-    ) {
-        run_device_write(&cli);
-        return;
-    }
-
-    let context = match CommandContext::load(
-        cli.identity_dir.as_deref(),
-        cli.ca_file.as_deref(),
-        cli.origin_port,
-        cli.state_dir.as_deref(),
-    ) {
-        Ok(context) => context,
-        Err(error) => {
-            if let Command::Reconnect { session, .. } = &cli.command {
-                let safe = commands::reconnect_configuration_error(*session, "reconnect");
-                fail(safe.message, safe.exit_code);
-            }
-            if let Command::Attach {
-                session,
-                controller: true,
-                ..
-            } = &cli.command
-            {
-                let safe = commands::reconnect_configuration_error(*session, "attach");
-                fail(safe.message, safe.exit_code);
-            }
-            fail(error.to_string(), 1)
-        }
-    };
-
-    let result = match cli.command {
-        Command::Enroll { .. } => unreachable!("enroll was dispatched before loading an identity"),
-        Command::Attach {
-            session,
-            vendor_session_id,
-            route,
-            controller,
-            origin_listener,
-            ack2,
-        } => commands::attach_with_origin(
-            &context,
-            session,
-            &vendor_session_id,
-            route.into(),
-            controller,
-            ack2,
-            origin_listener,
+    match &cli.command {
+        Command::Read(args) => run_device_feed(&cli, Some(args), feed::Mode::Read),
+        Command::Listen(args) => run_device_feed(
+            &cli,
+            Some(&args.feed),
+            if args.next {
+                feed::Mode::Next
+            } else {
+                feed::Mode::Follow
+            },
         ),
-        Command::Reconnect {
-            session,
-            vendor_session_id,
-            route,
-            controller,
-        } => commands::reconnect(
-            &context,
-            session,
-            vendor_session_id.as_deref(),
-            route.map(Into::into),
-            controller,
-        ),
-        Command::Cover { session } => commands::cover(&context, session),
-        Command::Listen(args) if args.origin => commands::listen_origin(&context),
-        Command::Listen(args) => commands::listen(
-            &context,
-            args.session.expect("session required without --origin"),
-            args.session_context.map(Into::into),
-            args.claude_code_version.as_deref(),
-            args.background_tasks_enabled,
-            args.follow,
-            args.controller,
-            args.ack2,
-        ),
-        Command::Read { session } => commands::read(&context, session),
+        Command::Focus { follow: true } => run_device_feed(&cli, None, feed::Mode::Focus),
         Command::MessageGet { .. }
         | Command::Messages { .. }
         | Command::MessageEntries { .. }
-        | Command::FileGet { .. } => {
-            unreachable!("device reads were dispatched before loading the origin context")
-        }
-        Command::Focus { follow } => commands::focus(&context, follow),
-        Command::Ack {
-            session,
-            event,
-            advisory,
-        } => match (event, advisory) {
-            (Some(event), None) => commands::ack(&context, session, &event),
-            (None, Some(advisory)) => commands::ack_advisory(&context, session, advisory),
-            _ => unreachable!("clap requires exactly one acknowledgment target"),
-        },
-        Command::Withdraw {
-            session,
-            request,
-            in_reply_to,
-            op_id,
-        } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
-        Command::Status { session } => commands::status(&context, session),
-        Command::Send { .. }
-        | Command::Reply { .. }
-        | Command::Revise { .. }
-        | Command::Progress { .. }
-        | Command::Retract { .. }
-        | Command::Lifecycle { .. }
-        | Command::Result { .. }
-        | Command::Receipt { .. }
-        | Command::FileUse { .. }
-        | Command::FileUpload { .. }
-        | Command::DiscardUploads { .. }
-        | Command::Show { .. }
-        | Command::JournalId
-        | Command::Session { .. }
-        | Command::Retry { .. }
-        | Command::Abandon { .. } => {
-            unreachable!("device writes were dispatched before loading the origin context")
-        }
+        | Command::FileGet { .. }
+        | Command::Focus { follow: false } => run_device_read(&cli),
+        _ => run_device_write(&cli),
+    }
+}
+
+fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
+    use std::io::{self, Write};
+
+    let identity = device_identity(cli);
+    let journal = device_journal(cli, &identity.device_id);
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let session = args.and_then(|args| args.session);
+    let start = match args {
+        Some(FeedArgs {
+            after: Some(rev), ..
+        }) => feed::Start::After(*rev),
+        Some(FeedArgs { snapshot: true, .. }) => feed::Start::Snapshot,
+        _ => feed::Start::Journal,
     };
-
+    let mut stdout = io::stdout().lock();
+    let result = feed::run(&client, &journal, session, start, mode, |value| {
+        writeln!(stdout, "{value}")?;
+        stdout.flush()
+    });
     if let Err(error) = result {
-        fail(error.message, error.exit_code);
-    }
-}
-
-impl From<Route> for commands::OriginHarness {
-    fn from(value: Route) -> Self {
-        match value {
-            Route::ClaudeCode => Self::ClaudeCode,
-            Route::Codex => Self::Codex,
-            Route::Other => Self::Other,
-        }
-    }
-}
-
-impl From<SessionContext> for commands::SessionContext {
-    fn from(value: SessionContext) -> Self {
-        match value {
-            SessionContext::Interactive => Self::Interactive,
-            SessionContext::Bare => Self::Bare,
-            SessionContext::Print => Self::Print,
-            SessionContext::Sdk => Self::Sdk,
-        }
+        fail(error.to_string(), error.exit_code());
     }
 }
 
@@ -842,6 +641,7 @@ fn run_device_read(cli: &Cli) {
                 })
             }),
         ),
+        Command::Focus { follow: false } => ("focus", client.read(&["agent", "focus"], &[])),
         _ => unreachable!("clap requires a complete message selector"),
     };
     match result {
@@ -1127,6 +927,19 @@ fn run_device_write(cli: &Cli) {
             *op_id,
             ControlWrite::EndSession(*session),
         ),
+        Command::AdvisoryAck {
+            item_id,
+            advisory_id,
+            op_id,
+        } => writes::post(
+            &client,
+            &mut journal,
+            "advisory-ack",
+            None,
+            *op_id,
+            &["agent", "messages", item_id, "advisories", "ack"],
+            serde_json::json!({"advisory_id":advisory_id}),
+        ),
         Command::Result {
             item_id,
             status,
@@ -1235,121 +1048,35 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn ack_accepts_exactly_one_ordinary_event_or_advisory_id() {
+    fn listen_uses_an_explicit_caller_cursor_or_snapshot() {
         let session = "123e4567-e89b-42d3-a456-426614174000";
-        let advisory = "123e4567-e89b-42d3-a456-426614174001";
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "ack",
-                "--session",
-                session,
-                "--event",
-                "17"
-            ])
-            .is_ok()
-        );
         let cli = Cli::try_parse_from([
-            "harklight-agent",
-            "ack",
+            "agent",
+            "listen",
             "--session",
             session,
-            "--advisory",
-            advisory,
+            "--after",
+            "42",
+            "--follow",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Ack {
-                event: None,
-                advisory: Some(_),
+            Command::Listen(ListenArgs {
+                feed: FeedArgs {
+                    after: Some(42),
+                    ..
+                },
+                follow: true,
                 ..
-            }
-        ));
-        assert!(Cli::try_parse_from(["harklight-agent", "ack", "--session", session]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "ack",
-                "--session",
-                session,
-                "--event",
-                "17",
-                "--advisory",
-                advisory,
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn origin_listener_options_are_exclusive_before_configuration_or_network() {
-        assert!(Cli::try_parse_from(["agent", "listen", "--origin", "--follow"]).is_ok());
-        for extra in ["--controller", "--ack2", "--next"] {
-            assert!(
-                Cli::try_parse_from(["agent", "listen", "--origin", "--follow", extra]).is_err()
-            );
-        }
-        assert!(Cli::try_parse_from(["agent", "listen", "--origin"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "agent",
-                "listen",
-                "--origin",
-                "--follow",
-                "--session",
-                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn reconnect_accepts_saved_or_complete_attachment_inputs() {
-        let handle = "123e4567-e89b-42d3-a456-426614174000";
-        let cli =
-            Cli::try_parse_from(["harklight-agent", "reconnect", "--session", handle]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Reconnect {
-                vendor_session_id: None,
-                route: None,
-                controller: false,
-                ..
-            }
-        ));
-        let cli = Cli::try_parse_from([
-            "harklight-agent",
-            "reconnect",
-            "--session",
-            handle,
-            "--vendor-session-id",
-            "none",
-            "--route",
-            "other",
-            "--controller",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Reconnect {
-                vendor_session_id: Some(_),
-                route: Some(Route::Other),
-                controller: true,
-                ..
-            }
+            })
         ));
         assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "reconnect",
-                "--session",
-                handle,
-                "--vendor-session-id",
-                "none"
-            ])
-            .is_err()
+            Cli::try_parse_from(["agent", "listen", "--next", "--snapshot", "--after", "42"])
+                .is_err()
         );
+        assert!(Cli::try_parse_from(["agent", "listen", "--follow", "--origin"]).is_err());
+        assert!(Cli::try_parse_from(["agent", "listen", "--snapshot", "--next"]).is_ok());
     }
 
     #[test]
@@ -1383,8 +1110,6 @@ mod tests {
                 "harklight.example",
                 "--port",
                 "18444",
-                "--origin-port",
-                "18450",
                 "--label",
                 "Work laptop"
             ])
@@ -1703,7 +1428,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(cli.command, Command::Read { session } if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
+            matches!(cli.command, Command::Read(FeedArgs { session: Some(session), .. }) if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
         );
 
         assert!(

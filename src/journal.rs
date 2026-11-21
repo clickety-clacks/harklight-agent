@@ -17,6 +17,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod progress_files;
+mod v2_feed;
 pub(crate) use progress_files::is_progress;
 
 #[derive(Debug, Error)]
@@ -409,6 +410,13 @@ impl JournalStore {
                 op_id TEXT PRIMARY KEY NOT NULL, session_handle TEXT NOT NULL,
                 kind TEXT NOT NULL, state TEXT NOT NULL, message_id TEXT,
                 request_revision INTEGER, in_reply_to TEXT, payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS v2_feed_cursors (
+                scope TEXT PRIMARY KEY NOT NULL, position TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS v2_feed_resources (
+                scope TEXT NOT NULL, resource TEXT NOT NULL, rev TEXT NOT NULL,
+                payload TEXT NOT NULL, PRIMARY KEY(scope, resource)
              );
              CREATE TABLE IF NOT EXISTS v2_item_ids (
                 sender TEXT NOT NULL, local_id TEXT NOT NULL, item_id TEXT NOT NULL,

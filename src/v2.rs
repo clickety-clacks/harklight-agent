@@ -440,3 +440,5 @@ pub use files::Download;
 pub mod sends;
 
 pub mod mutations;
+
+pub mod feed;
