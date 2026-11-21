@@ -285,42 +285,29 @@ pub fn progress(
     {
         item_id = remote.to_owned();
     }
-    let explicit_legacy = legacy_sender.is_some();
     let legacy_sender = match legacy_sender {
         Some(sender) => Some(sender.to_owned()),
         None if item_id == request => journal.legacy_sender(session, request)?,
         None => None,
     };
     let snapshot = if let Some(sender) = legacy_sender {
-        if let Some(mapped) = journal.v2_item_id(&sender, request)? {
-            item_id = mapped;
-            client
-                .message(&item_id)
-                .map_err(|error| read_failure("progress", error))?
-        } else if let Some(found) = client
-            .legacy_message(&sender, request)
-            .map_err(|error| read_failure("progress", error))?
-        {
-            item_id = found["message"]["item_id"]
-                .as_str()
-                .ok_or_else(|| WriteFailure::local("legacy lookup lacked the item ID"))?
-                .to_owned();
-            if found["message"]["session"] != session.to_string() {
-                return Err(WriteFailure::local_refusal(
-                    "the message is outside this session",
-                ));
-            }
-            journal.remember_v2_item(&sender, request, &item_id)?;
-            found
-        } else if explicit_legacy {
-            return Err(WriteFailure::from_saved_refusal(json!({
-                "kind":"refused","operation":"progress","status":404,"error":"not_found",
-            })));
-        } else {
-            client
-                .message(&item_id)
-                .map_err(|error| read_failure("progress", error))?
+        let cached = journal.v2_item_id(&sender, request)?;
+        let found = client
+            .resolve_legacy_message(&sender, request, cached.as_deref())
+            .map_err(|error| read_failure("progress", error))?;
+        item_id = found["message"]["item_id"]
+            .as_str()
+            .ok_or_else(|| WriteFailure::local("legacy lookup lacked the item ID"))?
+            .to_owned();
+        if found["message"]["session"] != session.to_string() {
+            return Err(WriteFailure::local_refusal(
+                "the message is outside this session",
+            ));
         }
+        if cached.is_none() {
+            journal.remember_v2_item(&sender, request, &item_id)?;
+        }
+        found
     } else {
         client
             .message(&item_id)
@@ -363,10 +350,18 @@ fn read_failure(operation: &str, error: super::V2Error) -> WriteFailure {
             request_id,
             field,
             ..
-        } if (400..500).contains(&status) => WriteFailure::from_saved_refusal(json!({
-            "kind":"refused","operation":operation,"status":status,"error":token,
-            "request_id":request_id,"field":field,
-        })),
+        } if (400..500).contains(&status) => {
+            let mut output = json!({
+                "kind":"refused","operation":operation,"status":status,"error":token,
+            });
+            if let Some(id) = request_id {
+                output["request_id"] = id.into();
+            }
+            if let Some(field) = field {
+                output["field"] = field.into();
+            }
+            WriteFailure::from_saved_refusal(output)
+        }
         _ => WriteFailure::local(error.to_string()),
     }
 }
@@ -577,7 +572,7 @@ mod tests {
     fn reply_preserves_the_correlation_and_uses_opaque_file_ids() {
         let mut journal = TestJournal::new();
         let server = SlowServer::sequence(vec![FixtureResponse::json(
-            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item","rev":9,"position":1,"request_revision":1,"author":"origin","kind":"reply"}}),
+            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item","rev":9,"position":1,"request_revision":1,"author":"origin","kind":"reply","in_reply_to":"entry/1","text":""}}),
         )]);
         let output = reply(
             &client(&server),

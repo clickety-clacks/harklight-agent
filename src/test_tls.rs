@@ -123,9 +123,19 @@ impl SlowServer {
         Self::serve(Duration::ZERO, responses, false).0
     }
 
+    #[allow(dead_code)] // Used by the send test after observing its prepared payload.
+    pub fn sequence_from(responses: std::sync::mpsc::Receiver<Vec<FixtureResponse>>) -> Self {
+        Self::serve(
+            Duration::ZERO,
+            std::iter::once_with(move || responses.recv().unwrap_or_default()).flatten(),
+            false,
+        )
+        .0
+    }
+
     fn serve(
         delay: Duration,
-        responses: Vec<FixtureResponse>,
+        responses: impl IntoIterator<Item = FixtureResponse> + Send + 'static,
         require_identity: bool,
     ) -> (Self, Option<TestIdentity>) {
         let ca_key = KeyPair::generate().unwrap();
@@ -176,7 +186,7 @@ impl SlowServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
-            let mut recorded = Vec::with_capacity(responses.len());
+            let mut recorded = Vec::new();
             for response in responses {
                 let (tcp, _) = listener.accept().unwrap();
                 let connection = ServerConnection::new(Arc::clone(&config)).unwrap();

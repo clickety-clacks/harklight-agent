@@ -61,6 +61,8 @@ pub enum JournalError {
     OperationConflict(Uuid),
     #[error("local message reference already has a different server item ID")]
     ItemBindingConflict,
+    #[error("legacy message reference has multiple senders; specify --sender-id")]
+    AmbiguousLegacySender,
     #[error("a revision is unresolved for this item; retry operation {0}")]
     PendingRevision(Uuid),
     #[error("journal has no operation with key {0}")]
@@ -1258,7 +1260,8 @@ impl JournalStore {
                 .collect::<Result<Vec<_>, _>>()?;
             match senders.as_slice() {
                 [sender] => Ok(Some(sender.clone())),
-                _ => Ok(None),
+                [] => Ok(None),
+                _ => Err(JournalError::AmbiguousLegacySender),
             }
         })
     }
