@@ -5,9 +5,10 @@ use uuid::Uuid;
 
 use harklight_agent::{
     commands::{self, CommandContext, MessageFieldOptions, ProgressReport},
-    config::EnrolledIdentity,
+    config::{EnrolledIdentity, default_state_root},
     enrollment,
-    v2::{AgentClient, V2Error},
+    journal::JournalStore,
+    v2::{AgentClient, V2Error, writes},
 };
 
 #[derive(Debug, Parser)]
@@ -361,9 +362,17 @@ enum Command {
     },
     Retract {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        request: String,
+        in_reply_to: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
+    },
+    Lifecycle {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long, value_enum)]
+        action: LifecycleAction,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -493,8 +502,8 @@ enum SessionCommand {
     End {
         #[arg(long)]
         session: Uuid,
-        #[arg(long, required = true)]
-        gone: bool,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
 }
 
@@ -511,6 +520,25 @@ enum SessionContext {
     Bare,
     Print,
     Sdk,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LifecycleAction {
+    Answered,
+    Cleared,
+    Expired,
+    Superseded,
+}
+
+impl LifecycleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Cleared => "cleared",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -570,6 +598,18 @@ fn main() {
         Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. }
     ) {
         run_device_read(&cli);
+        return;
+    }
+
+    if matches!(
+        cli.command,
+        Command::Retract { .. }
+            | Command::Lifecycle { .. }
+            | Command::Session { .. }
+            | Command::Retry { .. }
+            | Command::Abandon { .. }
+    ) {
+        run_device_write(&cli);
         return;
     }
 
@@ -852,11 +892,6 @@ fn main() {
             in_reply_to,
             op_id,
         } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
-        Command::Retract {
-            session,
-            request,
-            op_id,
-        } => commands::retract(&context, session, &request, op_id),
         Command::Result {
             session,
             request,
@@ -878,11 +913,13 @@ fn main() {
             revision,
             op_id,
         } => commands::discard_uploads(&context, &sender_id, &message_id, revision, op_id),
-        Command::Session { action } => match action {
-            SessionCommand::End { session, gone: _ } => commands::session_end(&context, session),
-        },
-        Command::Retry { op_id } => commands::retry(&context, op_id),
-        Command::Abandon { op_id } => commands::abandon(&context, op_id),
+        Command::Retract { .. }
+        | Command::Lifecycle { .. }
+        | Command::Session { .. }
+        | Command::Retry { .. }
+        | Command::Abandon { .. } => {
+            unreachable!("device writes were dispatched before loading the origin context")
+        }
         Command::FileUse {
             session,
             event,
@@ -930,7 +967,7 @@ impl From<SessionContext> for commands::SessionContext {
     }
 }
 
-fn run_device_read(cli: &Cli) {
+fn device_identity(cli: &Cli) -> EnrolledIdentity {
     let identity_dir = cli
         .identity_dir
         .as_deref()
@@ -939,10 +976,12 @@ fn run_device_read(cli: &Cli) {
         .ca_file
         .as_deref()
         .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
-    let client = EnrolledIdentity::load(identity_dir, ca_file)
-        .and_then(AgentClient::new)
-        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    EnrolledIdentity::load(identity_dir, ca_file).unwrap_or_else(|error| fail(error.to_string(), 1))
+}
 
+fn run_device_read(cli: &Cli) {
+    let client =
+        AgentClient::new(device_identity(cli)).unwrap_or_else(|error| fail(error.to_string(), 1));
     let (operation, result) = match &cli.command {
         Command::MessageGet {
             item_id: Some(id),
@@ -1018,6 +1057,69 @@ fn run_device_read(cli: &Cli) {
             fail(error.to_string(), commands::EXIT_REFUSED)
         }
         Err(error) => fail(error.to_string(), 1),
+    }
+}
+
+fn run_device_write(cli: &Cli) {
+    use writes::ControlWrite;
+
+    let identity = device_identity(cli);
+    let state_root = cli
+        .state_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_state_root)
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    let mut journal = JournalStore::open(&state_root, &identity.device_id, Uuid::nil())
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let result = match &cli.command {
+        Command::Retract {
+            item_id,
+            in_reply_to,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Retract {
+                item_id,
+                in_reply_to: in_reply_to.as_deref(),
+            },
+        ),
+        Command::Lifecycle {
+            item_id,
+            action,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Lifecycle {
+                item_id,
+                action: action.as_str(),
+            },
+        ),
+        Command::Session {
+            action: SessionCommand::End { session, op_id },
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::EndSession(*session),
+        ),
+        Command::Retry { op_id } => writes::retry(&client, &mut journal, *op_id),
+        Command::Abandon { op_id } => writes::abandon(&mut journal, *op_id),
+        _ => unreachable!("device write dispatch requires a write command"),
+    };
+    match result {
+        Ok(output) => println!("{output}"),
+        Err(error) => {
+            if let Some(output) = &error.output {
+                println!("{output}");
+            }
+            fail(error.to_string(), error.exit_code)
+        }
     }
 }
 
