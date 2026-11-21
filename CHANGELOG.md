@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.2.0
+
+- Move enrolled Agent operations to the `/v2/agent` API over mutual TLS. Enrollment keeps its own endpoint. Use `--device-port` or `HARKLIGHT_DEVICE_PORT` to select the device API port, including for existing identities.
+- Use `read` for a single catch-up and `listen` to follow the change feed. Both support saved checkpoints, explicit cursors, and snapshots. Several processes can follow the same scope. The old listener lease, exit 6, `attach`, and `reconnect` commands are removed. The feed resumes automatically after transient connection failures.
+- Use Server item IDs for messages, conditional revisions, and correlated replies. List messages and entries, read retained revisions, and record answer or chat handoff with `receipt`. Progress updates keep existing attachments unless the file list is explicitly replaced.
+- Writes save the exact request and its operation key before delivery. `retry` reuses the saved bytes, key, and revision precondition. Prepared sends stage attachments locally, and `abandon` releases the local operation without undoing anything the Server already committed.
+- Exit 0 means success, 1 a local or read failure, 2 a definite refusal, 5 an unsupported operation, and 7 an unknown write outcome or retryable write.
+- A Server `500 internal_error` stops the feed at the last completed position and reports the Request-Id. A write with this error remains unresolved under its original key and reports `retryable: false`. Any replay is explicit and uses the saved request.
+
+Compatibility: protocol 0.2 (new, supersedes 0.1). Requires a Server that serves the v2 Agent API.
+
 ## 0.1.16
 
 - Make existing identity directories and key files private automatically when permissions are too broad. Report an error if the permissions cannot be changed.
