@@ -114,10 +114,9 @@ once to write `enrollment.json`. Enrollment does not grant a sender ID. Use the
 existing `send` command for the first relay/origin proof.
 
 If a reply to `start` is lost, keep the same directory and run `enroll retry`
-with its original inputs. The Server may report `key_pending` until the request's
-24-hour lifetime expires; wait up to 24 hours for that expiry, then retry with
-the same private key. Starting in a new directory is also available when the
-earlier request's code cannot be recovered.
+with its original inputs. A waiting request does not expire: submitting the same
+key again returns the same request and approval code with a new status secret,
+which `retry` saves in `pending.json` (the previous secret stops working).
 
 Suggested locations (the CA file is beside, not inside, the identity directory):
 
@@ -134,7 +133,7 @@ Enrollment failures use these exit codes:
 
 | Server answer or failure | Exit | What to do |
 | --- | ---: | --- |
-| `409 key_pending` | 2 | Keep this directory and retry after the earlier request expires (its pending lifetime is 24 hours), or start in a new directory. The earlier approval code cannot be recovered. |
+| `409 key_pending` | 2 | The Server already holds an invitation-based request for this key. Continue with that invitation flow, or start in a new directory. |
 | `409 key_in_use` | 2 | Check `enroll status`, or start in a new directory. |
 | `400 invalid_request` | 2 | Check the label and certificate inputs. |
 | `404 not_found` | 2 | Run `enroll retry`; if status readback ended, local approved identity data is reported. |
