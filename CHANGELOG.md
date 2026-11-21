@@ -1,5 +1,13 @@
 # Release notes
 
+## 0.1.16
+
+- Make existing identity directories and key files private automatically when permissions are too broad. Report an error if the permissions cannot be changed.
+- Add `abandon --op-id <KEY>` to unblock a request when an operation’s outcome is unknown. Abandoning stops local retries and does not undo any change already applied by the Server.
+- Confirm existing handles with the Server during attach and reconnect. Rebuild local conversation state from the feed when the journal has no record of the original send. Reconnect with no saved attachment still needs the vendor session ID and route.
+- Support pending enrollments without deadlines. With a Server release containing #171, restarting a waiting plain enrollment for the same key reuses its approval code and saves the new status secret. Older Server deadlines still parse, and pending output omits deadlines the Server did not supply.
+- Fix the file-attachment `send` example to include the required `--type` flag and correct the 0.1.15 release notes.
+
 ## 0.1.15
 
 This release intentionally breaks some command-line behaviour. Callers must update.
