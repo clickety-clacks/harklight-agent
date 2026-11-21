@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use harklight_agent::{
     commands::{self, CommandContext, MessageFieldOptions, ProgressReport},
+    config::EnrolledIdentity,
     enrollment,
+    v2::{AgentClient, V2Error},
 };
 
 #[derive(Debug, Parser)]
@@ -194,14 +196,33 @@ enum Command {
         #[arg(long)]
         session: Uuid,
     },
-    /// Read one of this origin's messages from the authoritative Server state.
+    /// Read an authoritative sent message and its file references.
+    #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "sender_id"])))]
     MessageGet {
         #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        message_id: String,
-        #[arg(long)]
+        item_id: Option<String>,
+        #[arg(long, requires = "message_id")]
+        sender_id: Option<String>,
+        #[arg(long, requires = "sender_id")]
+        message_id: Option<String>,
+        #[arg(long, requires = "sender_id")]
         revision: Option<u64>,
+    },
+    /// List sent messages, newest first.
+    Messages {
+        #[arg(long)]
+        session: Option<Uuid>,
+        #[arg(long)]
+        page: Option<String>,
+    },
+    /// Read a page of entries for a sent message.
+    MessageEntries {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Read the latest reported focus, or follow focus changes.
     Focus {
@@ -544,6 +565,16 @@ fn main() {
         return;
     }
 
+    if matches!(
+        cli.command,
+        Command::MessageGet { revision: None, .. }
+            | Command::Messages { .. }
+            | Command::MessageEntries { .. }
+    ) {
+        run_device_read(&cli);
+        return;
+    }
+
     let context = match CommandContext::load(
         cli.identity_dir.as_deref(),
         cli.ca_file.as_deref(),
@@ -692,10 +723,14 @@ fn main() {
         ),
         Command::Read { session } => commands::read(&context, session),
         Command::MessageGet {
-            sender_id,
-            message_id,
-            revision,
-        } => commands::message_get(&context, &sender_id, &message_id, revision),
+            sender_id: Some(sender_id),
+            message_id: Some(message_id),
+            revision: Some(revision),
+            ..
+        } => commands::message_get(&context, &sender_id, &message_id, Some(revision)),
+        Command::MessageGet { .. } | Command::Messages { .. } | Command::MessageEntries { .. } => {
+            unreachable!("device reads were dispatched before loading the origin context")
+        }
         Command::Focus { follow } => commands::focus(&context, follow),
         Command::Show {
             sender_id,
@@ -900,6 +935,74 @@ impl From<SessionContext> for commands::SessionContext {
             SessionContext::Print => Self::Print,
             SessionContext::Sdk => Self::Sdk,
         }
+    }
+}
+
+fn run_device_read(cli: &Cli) {
+    let identity_dir = cli
+        .identity_dir
+        .as_deref()
+        .unwrap_or_else(|| fail("provide --identity-dir or HARKLIGHT_IDENTITY_DIR".into(), 1));
+    let ca_file = cli
+        .ca_file
+        .as_deref()
+        .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
+    let client = EnrolledIdentity::load(identity_dir, ca_file)
+        .and_then(AgentClient::new)
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+
+    let (operation, result) = match &cli.command {
+        Command::MessageGet {
+            item_id: Some(id), ..
+        } => ("message-get", client.message(id)),
+        Command::MessageGet {
+            sender_id: Some(sender),
+            message_id: Some(id),
+            ..
+        } => (
+            "message-get",
+            client.legacy_message(sender, id).and_then(|message| {
+                message.ok_or_else(|| V2Error::Http {
+                    status: 404,
+                    token: Some("not_found".into()),
+                    request_id: None,
+                    retry_after: None,
+                })
+            }),
+        ),
+        Command::Messages { session, page } => {
+            ("messages", client.messages(*session, page.as_deref()))
+        }
+        Command::MessageEntries {
+            item_id,
+            before,
+            limit,
+        } => (
+            "message-entries",
+            client.message_entries(item_id, before.as_deref(), *limit),
+        ),
+        _ => unreachable!("clap requires a complete message selector"),
+    };
+    match result {
+        Ok(response) => println!("{response}"),
+        Err(error @ V2Error::Http { status, .. }) if (400..500).contains(&status) => {
+            if let V2Error::Http {
+                ref token,
+                ref request_id,
+                ..
+            } = error
+            {
+                let mut output = serde_json::json!({
+                    "kind":"refused", "operation":operation, "status":status, "error":token,
+                });
+                if let Some(request_id) = request_id {
+                    output["request_id"] = request_id.as_str().into();
+                }
+                println!("{output}");
+            }
+            fail(error.to_string(), commands::EXIT_REFUSED)
+        }
+        Err(error) => fail(error.to_string(), 1),
     }
 }
 
@@ -1424,9 +1527,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::MessageGet {
-                sender_id,
-                message_id,
-                revision: Some(3)
+                sender_id: Some(sender_id),
+                message_id: Some(message_id),
+                revision: Some(3),
+                ..
             } if sender_id == "app:example" && message_id == "message-1"
         ));
 
@@ -1438,6 +1542,41 @@ mod tests {
                 "app:example",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn device_message_reads_accept_opaque_ids_and_reject_mixed_selectors() {
+        let cli =
+            Cli::try_parse_from(["agent", "message-get", "--item-id", "opaque/item"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::MessageGet { item_id: Some(id), revision: None, .. } if id == "opaque/item"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "message-get",
+                "--item-id",
+                "opaque/item",
+                "--sender-id",
+                "app:example",
+                "--message-id",
+                "local"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agent", "messages", "--page", "opaque+next"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "message-entries",
+                "--item-id",
+                "opaque/item",
+                "--before",
+                "opaque+entry"
+            ])
+            .is_ok()
         );
     }
 
