@@ -36,8 +36,8 @@ impl CliFixture {
             json!({
                 "address":"127.0.0.1",
                 "name":TLS_NAME,
-                "port":server.port,
-                "origin_port":1,
+                "port":1,
+                "device_port":server.port,
                 "ca_sha256":hex::encode(Sha256::digest(ca)),
             })
             .to_string(),

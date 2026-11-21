@@ -22,6 +22,9 @@ struct Cli {
     identity_dir: Option<PathBuf>,
     #[arg(long, global = true, env = "HARKLIGHT_CA_FILE")]
     ca_file: Option<PathBuf>,
+    /// Device API port, separate from the enrollment endpoint.
+    #[arg(long, global = true, env = "HARKLIGHT_DEVICE_PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    device_port: Option<u16>,
     #[arg(long, global = true, env = "HARKLIGHT_AGENT_STATE_DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -495,7 +498,7 @@ fn main() {
                 args.endpoint.name.as_deref(),
                 args.endpoint.port.as_deref(),
                 args.label.as_deref(),
-                None,
+                cli.device_port,
             ),
             EnrollCommand::Retry(args) => enrollment::retry(
                 cli.identity_dir.as_deref(),
