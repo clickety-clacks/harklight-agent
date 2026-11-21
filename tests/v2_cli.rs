@@ -69,7 +69,7 @@ impl Drop for CliFixture {
 #[test]
 fn binary_uses_the_device_listener_for_the_historical_message_selector() {
     let (server, identity) = SlowServer::mutual_tls(
-        r#"{"rev":12,"message":{"item_id":"opaque/item","rev":7,"sender":"app:fixture","revision":2,"message":{"title":"Old","created_at":10},"files":[],"delivered":true,"seen":false}}"#,
+        r#"{"rev":12,"revision":{"request_revision":2,"message":{"title":"Old","created_at":10},"files":[]}}"#,
     );
     let fixture = CliFixture::new(&server, identity);
     let output = fixture.run(&["message-get", "--item-id", "opaque/item", "--revision", "2"]);
@@ -79,7 +79,7 @@ fn binary_uses_the_device_listener_for_the_historical_message_selector() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["message"]["revision"], 2);
+    assert_eq!(result["revision"]["request_revision"], 2);
     assert_eq!(
         server.request_line().trim_end(),
         "GET /v2/agent/messages/opaque%2Fitem/revisions/2 HTTP/1.1"

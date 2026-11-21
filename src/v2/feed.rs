@@ -85,6 +85,9 @@ pub enum FeedError {
 impl FeedError {
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::Api(V2Error::Http {
+                token: Some(token), ..
+            }) if token == "unsupported" => 5,
             Self::Closed(_)
             | Self::Api(V2Error::Http {
                 status: 400..=499, ..
@@ -620,7 +623,8 @@ mod tests {
         vec![
             expired(),
             FixtureResponse::json(json!({"rev":40,"messages":[{
-                "item_id":"item","session":session,"rev":39,
+                "item_id":"item","session":session,"rev":39,"sender":"app:fixture",
+                "revision":1,"message":{},"seen":false,"files":[],
                 "advisories":[{"advisory_id":"notice","advisory_type":"possible_contradictions"}]
             }], "next_page":"later"})),
             FixtureResponse::json(json!({"rev":41,"entries":[{
@@ -630,7 +634,8 @@ mod tests {
                 "entry_id":"entry-a","item_id":"item","rev":37,"position":1
             }],"older":false})),
             FixtureResponse::json(json!({"rev":47,"messages":[{
-                "item_id":"answered","session":session,"rev":42,"terminal":{
+                "item_id":"answered","session":session,"rev":42,"sender":"app:fixture",
+                "revision":1,"message":{},"seen":false,"files":[],"terminal":{
                     "state":"answered","at_ms":100,"answer":null
                 }
             }]})),

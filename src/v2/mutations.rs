@@ -143,6 +143,7 @@ pub struct Revision<'a> {
     pub files: &'a [PathBuf],
     pub operation: &'a str,
     pub session: Option<Uuid>,
+    pub in_reply_to: Option<&'a str>,
 }
 
 pub fn revise(
@@ -157,7 +158,10 @@ pub fn revise(
         .ok_or_else(|| WriteFailure::local("a revision message must be a JSON object"))?;
     content.remove("sender_id");
     content.remove("message_id");
-    let body = json!({"message":message,"file_ids":revision.file_ids});
+    let mut body = json!({"message":message,"file_ids":revision.file_ids});
+    if let Some(entry) = revision.in_reply_to {
+        body["in_reply_to"] = entry.into();
+    }
     submit(
         client,
         journal,
@@ -187,6 +191,7 @@ pub struct InteractiveRevision<'a> {
     pub fields: &'a MessageFieldOptions,
     pub file_ids: &'a [String],
     pub files: &'a [PathBuf],
+    pub in_reply_to: Option<&'a str>,
 }
 
 pub fn revise_interactive(
@@ -227,6 +232,7 @@ pub fn revise_interactive(
             files: revision.files,
             operation: "revise",
             session: None,
+            in_reply_to: revision.in_reply_to,
         },
         op_id,
     )
@@ -305,6 +311,7 @@ pub fn progress(
             files: &[],
             operation: "progress",
             session: Some(session),
+            in_reply_to: None,
         },
         op_id,
     )
@@ -387,6 +394,7 @@ mod tests {
     fn snapshot(session: Uuid, file_manifest: Value) -> Value {
         json!({"rev":8,"message":{
             "item_id":"opaque/item","session":session,"revision":3,"files":file_manifest,
+            "rev":7,"sender":"app:fixture","seen":false,
             "message":{
                 "title":"Building", "body":"Keep this body", "created_at":100,
                 "message_type":"fyi",
@@ -409,7 +417,10 @@ mod tests {
         let server = SlowServer::sequence(vec![
             FixtureResponse::json(snapshot(
                 session,
-                json!([{"file_id":"retained-a"},{"file_id":"retained-b"}]),
+                json!([
+                    {"file_id":"retained-a","name":"a","size":1,"sha256":"a".repeat(64)},
+                    {"file_id":"retained-b","name":"b","size":1,"sha256":"b".repeat(64)},
+                ]),
             )),
             FixtureResponse {
                 status: "200 OK",
@@ -486,7 +497,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(failure.exit_code, 2);
+        assert_eq!(failure.exit_code, 1);
         assert_eq!(server.requests().len(), 1);
     }
 
@@ -509,6 +520,7 @@ mod tests {
             files: &[],
             operation: "revise",
             session: None,
+            in_reply_to: None,
         };
         assert_eq!(
             revise(&client, &mut journal.store, make(), Some(key))

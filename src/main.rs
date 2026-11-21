@@ -198,8 +198,10 @@ enum Command {
         item_id: String,
         #[arg(long)]
         chat: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "device_id")]
         device: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -294,6 +296,8 @@ enum Command {
         clear_default: bool,
         #[arg(long = "choice-style", action = clap::ArgAction::Append)]
         choice_styles: Vec<String>,
+        #[arg(long)]
+        in_reply_to: Option<String>,
         #[arg(long = "file-id")]
         file_ids: Vec<String>,
         #[arg(long = "file", action = clap::ArgAction::Append)]
@@ -365,12 +369,9 @@ enum Command {
         #[arg(long)]
         op_id: Uuid,
     },
-    #[command(group(
-        ArgGroup::new("file-use-result")
-            .required(true)
-            .multiple(false)
-            .args(["used", "unusable"])
-    ))]
+    /// Report an attachment transfer, use, or both.
+    #[command(group(ArgGroup::new("file-outcome").required(true).multiple(true)
+        .args(["used","unusable","transferred","not_transferred"])))]
     FileUse {
         #[arg(long)]
         item_id: String,
@@ -378,11 +379,15 @@ enum Command {
         entry_id: String,
         #[arg(long)]
         file_id: String,
-        #[arg(long, group = "file-use-result")]
+        #[arg(long, conflicts_with = "unusable")]
         used: bool,
-        #[arg(long, group = "file-use-result", requires = "reason")]
+        #[arg(long, requires = "reason")]
         unusable: bool,
-        #[arg(long, requires = "unusable")]
+        #[arg(long, conflicts_with = "not_transferred")]
+        transferred: bool,
+        #[arg(long, requires = "reason")]
+        not_transferred: bool,
+        #[arg(long)]
         reason: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
@@ -668,7 +673,13 @@ fn run_device_read(cli: &Cli) {
                 }
                 println!("{output}");
             }
-            fail(error.to_string(), commands::EXIT_REFUSED)
+            let exit = match &error {
+                V2Error::Http {
+                    token: Some(token), ..
+                } if token == "unsupported" => 5,
+                _ => commands::EXIT_REFUSED,
+            };
+            fail(error.to_string(), exit)
         }
         Err(error) => fail(error.to_string(), 1),
     }
@@ -686,21 +697,37 @@ fn read_message_revision(
 }
 
 fn device_journal(cli: &Cli, device_id: &str) -> JournalStore {
+    try_device_journal(cli, device_id).unwrap_or_else(|error| fail(error, 1))
+}
+
+fn try_device_journal(cli: &Cli, device_id: &str) -> Result<JournalStore, String> {
     let state_root = cli
         .state_dir
         .clone()
         .map(Ok)
         .unwrap_or_else(default_state_root)
-        .unwrap_or_else(|error| fail(error.to_string(), 1));
-    JournalStore::open(&state_root, device_id, Uuid::nil())
-        .unwrap_or_else(|error| fail(error.to_string(), 1))
+        .map_err(|error| error.to_string())?;
+    JournalStore::open(&state_root, device_id, Uuid::nil()).map_err(|error| error.to_string())
 }
 
 fn run_device_write(cli: &Cli) {
     use writes::ControlWrite;
 
     let identity = device_identity(cli);
-    let mut journal = device_journal(cli, &identity.device_id);
+    let mut journal = match try_device_journal(cli, &identity.device_id) {
+        Ok(journal) => journal,
+        Err(detail) => match &cli.command {
+            Command::Retry { op_id, journal_id } => {
+                let expected = journal_id.map(|id| id.to_string());
+                write_failure(writes::unavailable_retry(
+                    *op_id,
+                    expected.as_deref(),
+                    &detail,
+                ))
+            }
+            _ => fail(detail, 1),
+        },
+    };
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
     let result = match &cli.command {
         Command::Send {
@@ -800,6 +827,7 @@ fn run_device_write(cli: &Cli) {
             message_json: Some(path),
             file_ids,
             files,
+            in_reply_to,
             op_id,
             ..
         } => {
@@ -819,6 +847,7 @@ fn run_device_write(cli: &Cli) {
                     message,
                     file_ids,
                     files,
+                    in_reply_to: in_reply_to.as_deref(),
                     operation: "revise",
                     session: None,
                 },
@@ -844,6 +873,7 @@ fn run_device_write(cli: &Cli) {
             choice_styles,
             file_ids,
             files,
+            in_reply_to,
             op_id,
             ..
         } => {
@@ -873,6 +903,7 @@ fn run_device_write(cli: &Cli) {
                     fields: &fields,
                     file_ids,
                     files,
+                    in_reply_to: in_reply_to.as_deref(),
                 },
                 *op_id,
             )
@@ -981,7 +1012,10 @@ fn run_device_write(cli: &Cli) {
             file_id,
             reason,
             op_id,
-            ..
+            used,
+            unusable,
+            transferred,
+            not_transferred,
         } => writes::control(
             &client,
             &mut journal,
@@ -990,6 +1024,12 @@ fn run_device_write(cli: &Cli) {
                 item_id,
                 entry_id,
                 file_id,
+                transfer: transferred
+                    .then_some("transferred")
+                    .or_else(|| not_transferred.then_some("not_transferred")),
+                usage: used
+                    .then_some("used")
+                    .or_else(|| unusable.then_some("unusable")),
                 reason: reason.as_deref(),
             },
         ),
@@ -997,6 +1037,7 @@ fn run_device_write(cli: &Cli) {
             item_id,
             chat,
             device,
+            device_id,
             op_id,
         } => writes::control(
             &client,
@@ -1006,6 +1047,7 @@ fn run_device_write(cli: &Cli) {
                 item_id,
                 chat: *chat,
                 device_name: device.as_deref(),
+                device_id: device_id.as_deref(),
             },
         ),
         Command::FileUpload { file, op_id } => {
@@ -1031,13 +1073,15 @@ fn run_device_write(cli: &Cli) {
     };
     match result {
         Ok(output) => println!("{output}"),
-        Err(error) => {
-            if let Some(output) = &error.output {
-                println!("{output}");
-            }
-            fail(error.to_string(), error.exit_code)
-        }
+        Err(error) => write_failure(error),
     }
+}
+
+fn write_failure(error: writes::WriteFailure) -> ! {
+    if let Some(output) = &error.output {
+        println!("{output}");
+    }
+    fail(error.to_string(), error.exit_code)
 }
 
 fn fail(message: String, exit_code: i32) -> ! {
