@@ -133,7 +133,7 @@ Enrollment failures use these exit codes:
 
 | Server answer or failure | Exit | What to do |
 | --- | ---: | --- |
-| `409 key_pending` | 2 | The Server already holds an invitation-based request for this key. Continue with that invitation flow, or start in a new directory. |
+| `409 key_pending` | 2 | The Server already holds a request for this key. Continue its invitation flow if it came from an invitation, or start in a new directory. |
 | `409 key_in_use` | 2 | Check `enroll status`, or start in a new directory. |
 | `400 invalid_request` | 2 | Check the label and certificate inputs. |
 | `404 not_found` | 2 | Run `enroll retry`; if status readback ended, local approved identity data is reported. |

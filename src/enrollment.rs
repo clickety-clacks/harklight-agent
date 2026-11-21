@@ -716,7 +716,7 @@ fn refusal_response(
     let message = match (status, error) {
         (409, "key_pending") => Some((
             EXIT_REFUSED,
-            "The Server already holds an invitation-based request for this key. Continue with the invitation flow that created it, or start over with `enroll start` in a new identity directory.",
+            "The Server already holds a request for this key. Continue its invitation flow if it came from an invitation, or start over with `enroll start` in a new identity directory.",
         )),
         (409, "key_in_use") => Some((
             EXIT_REFUSED,
@@ -1282,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn key_pending_for_an_invitation_request_is_a_refusal() {
+    fn key_pending_is_a_refusal() {
         let directory = TestDirectory::new();
         setup_identity(directory.path());
         let fake = std::cell::RefCell::new(FakeTransport::with([reply(
@@ -1299,7 +1299,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.exit_code, 2);
-        assert!(error.message.contains("invitation"));
+        assert!(
+            error
+                .message
+                .contains("already holds a request for this key")
+        );
         assert!(!directory.path().join("pending.json").exists());
     }
 
