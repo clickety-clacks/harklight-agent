@@ -464,7 +464,15 @@ operation still deduplicates by its key.
 
 A reply, revision, withdrawal or source result acts on the exact
 person turn it names. A final answer does not close through local process exit;
-only a server terminal entry closes the request.
+only a server terminal entry closes the request. The CLI does not refuse a
+reply, revision or withdrawal because the request already has a terminal event,
+and it does not refuse a reply because the person event was already replied to:
+chat stays open after any terminal outcome, an agent may reply more than once to
+the same person event, and the Server marks the event acted-on by the first.
+Chat that arrives after a terminal event still surfaces from `listen`. A
+`result` for an answered event is still refused locally once that event is
+acted on, and the Server refuses a second answer. This relies on a Server that
+has those rules; an older Server still refuses, and the CLI reports its refusal.
 An origin withdrawal is recorded as a `retracted` terminal entry. Retraction
 keeps the request and its history, ends outstanding work, and is not a person
 answer. `retract` uses the sender and message identity already recorded in the

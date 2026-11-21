@@ -26,7 +26,6 @@ use crate::{
 };
 
 pub const EXIT_REFUSED: i32 = 2;
-const CLOSED_REPLY_MESSAGE: &str = "This request's chat is closed. Your message was not sent.";
 pub const EXIT_UNSUPPORTED: i32 = 5;
 pub const EXIT_LISTENER_ACTIVE: i32 = 6;
 pub const EXIT_OUTCOME_UNKNOWN: i32 = 7;
@@ -3144,15 +3143,7 @@ pub fn reply(
         .request_snapshot(session, request_id, Some(in_reply_to))
         .map_err(|error| journal_error(error, 1))?;
     let request = request_context(&snapshot, session, request_id)?;
-    ensure_reply_chat_open(&snapshot, session, &request)?;
-    let event = delivered_event(
-        &snapshot,
-        session,
-        &request,
-        in_reply_to,
-        "discussion",
-        false,
-    )?;
+    let event = delivered_event(&snapshot, session, &request, in_reply_to, "discussion")?;
     ensure_current_revision(request.revision, event.request_revision)?;
     let revision = request.revision;
     let op_id = op_id.unwrap_or_else(Uuid::new_v4);
@@ -3247,7 +3238,6 @@ pub fn revise_with_fields(
         .request_snapshot(session, request_id, in_reply_to)
         .map_err(|error| journal_error(error, 1))?;
     let request = request_context(&snapshot, session, request_id)?;
-    ensure_request_open(&snapshot, session, &request)?;
     if base_revision != request.revision {
         return Err(CommandError::new(
             format!(
@@ -3259,7 +3249,7 @@ pub fn revise_with_fields(
     }
     if let Some(event_id) = in_reply_to {
         validate_event_id(event_id)?;
-        let event = delivered_event(&snapshot, session, &request, event_id, "discussion", false)?;
+        let event = delivered_event(&snapshot, session, &request, event_id, "discussion")?;
         ensure_current_revision(request.revision, event.request_revision)?;
     }
     let (mut message, tool_warnings) = revised_message_with_fields(
@@ -3315,10 +3305,9 @@ pub fn withdraw(
         .request_snapshot(session, request_id, in_reply_to)
         .map_err(|error| journal_error(error, 1))?;
     let request = request_context(&snapshot, session, request_id)?;
-    ensure_request_open(&snapshot, session, &request)?;
     if let Some(event_id) = in_reply_to {
         validate_event_id(event_id)?;
-        let event = delivered_event(&snapshot, session, &request, event_id, "discussion", false)?;
+        let event = delivered_event(&snapshot, session, &request, event_id, "discussion")?;
         ensure_current_revision(request.revision, event.request_revision)?;
     }
     let mut command = json!({
@@ -3442,14 +3431,7 @@ pub fn result(
             && entry.raw["status"] == "received"
     });
     let may_update_received = prior_received && matches!(status, "applied" | "refused");
-    let event = delivered_event(
-        &snapshot,
-        session,
-        &request,
-        in_reply_to,
-        "terminal",
-        may_update_received,
-    )?;
+    let event = delivered_event(&snapshot, session, &request, in_reply_to, "terminal")?;
     if event.raw["terminal_state"] != "answered" {
         return Err(CommandError::new(
             "result is valid only for an answered terminal event",
@@ -5595,48 +5577,6 @@ fn request_context(
     })
 }
 
-fn ensure_request_open(
-    journal: &Journal,
-    session: Uuid,
-    request: &RequestContext,
-) -> Result<(), CommandError> {
-    let closed_by = request_terminal(journal, session, request);
-    if let Some(terminal) = closed_by {
-        return Err(CommandError::new(
-            format!(
-                "request is closed by terminal event {}; no further reply, revision or withdrawal is allowed",
-                terminal.event_id
-            ),
-            EXIT_REFUSED,
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_reply_chat_open(
-    journal: &Journal,
-    session: Uuid,
-    request: &RequestContext,
-) -> Result<(), CommandError> {
-    if request_terminal(journal, session, request).is_some() {
-        return Err(CommandError::new(CLOSED_REPLY_MESSAGE, EXIT_REFUSED));
-    }
-    Ok(())
-}
-
-fn request_terminal<'a>(
-    journal: &'a Journal,
-    session: Uuid,
-    request: &RequestContext,
-) -> Option<&'a JournalEntry> {
-    journal.entries.values().find(|entry| {
-        entry.session_handle == session
-            && entry.kind == "terminal"
-            && entry.sender_id.as_deref() == Some(request.sender_id.as_str())
-            && entry.request_id.as_deref() == Some(request.message_id.as_str())
-    })
-}
-
 fn ensure_current_revision(
     request_revision: u64,
     event_revision: Option<u64>,
@@ -5656,7 +5596,6 @@ fn delivered_event<'a>(
     request: &RequestContext,
     event_id: &str,
     expected_kind: &str,
-    allow_acted: bool,
 ) -> Result<&'a JournalEntry, CommandError> {
     let entry = journal.entry_by_event(event_id).ok_or_else(|| {
         CommandError::new(format!("event {event_id} is not in the durable journal"), 1)
@@ -5676,12 +5615,6 @@ fn delivered_event<'a>(
     if entry.delivered_at_ms.is_none() {
         return Err(CommandError::new(
             "ack this event first; delivery is recorded only after server confirmation",
-            EXIT_REFUSED,
-        ));
-    }
-    if entry.acted_at_ms.is_some() && !allow_acted {
-        return Err(CommandError::new(
-            "event is already acted; do not submit another operation for it",
             EXIT_REFUSED,
         ));
     }
@@ -5770,15 +5703,7 @@ fn refused(operation: &str, op_id: Option<Uuid>, response: Value) -> Result<(), 
 
 fn refusal_message(operation: &str, response: &Value) -> String {
     let reason = response["reason"].as_str().unwrap_or("refused");
-    if operation == "reply"
-        && response["v"] == 1
-        && response["type"] == "error"
-        && reason == "closed"
-    {
-        CLOSED_REPLY_MESSAGE.to_owned()
-    } else {
-        format!("{operation} refused: {reason}")
-    }
+    format!("{operation} refused: {reason}")
 }
 
 fn emit(value: &Value) -> Result<(), CommandError> {
@@ -8522,7 +8447,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_reply_refusal_uses_the_plain_message_and_records_rejection() {
+    fn a_server_closed_refusal_is_reported_and_recorded_as_a_rejection() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
         let op_id = Uuid::new_v4();
@@ -8550,12 +8475,8 @@ mod tests {
         let error = handle_operation_error_response(&mut store, &operation, response.clone(), true)
             .unwrap_err();
 
-        assert_eq!(error.message, CLOSED_REPLY_MESSAGE);
-        assert_eq!(
-            error.message,
-            "This request's chat is closed. Your message was not sent."
-        );
-        assert_eq!(refusal_message("reply", &response), CLOSED_REPLY_MESSAGE);
+        assert_eq!(error.message, "reply refused: closed");
+        assert_eq!(refusal_message("reply", &response), "reply refused: closed");
         assert_eq!(error.exit_code, EXIT_REFUSED);
         let saved = store.operation(op_id).unwrap().unwrap();
         assert_eq!(saved.state, OperationState::Rejected);
@@ -8609,7 +8530,6 @@ mod tests {
         let error =
             submit_operation_inner(&lost_response, &mut store, operation, false).unwrap_err();
         assert_eq!(error.exit_code, EXIT_OUTCOME_UNKNOWN);
-        assert_ne!(error.message, CLOSED_REPLY_MESSAGE);
         let saved = store.operation(op_id).unwrap().unwrap();
         assert_eq!(saved.state, OperationState::Unknown);
         assert_eq!(saved.request, request);
@@ -10025,76 +9945,77 @@ mod tests {
         assert_eq!(request.message["title"], "new");
         assert!(ensure_current_revision(request.revision, Some(1)).is_err());
         assert!(ensure_current_revision(request.revision, Some(2)).is_ok());
-        assert!(ensure_request_open(&snapshot, session, &request).is_err());
     }
 
     #[test]
-    fn answer_and_no_comment_report_the_definite_closed_chat_message() {
-        for terminal_kind in ["answer", "no_comment"] {
-            let scratch = Scratch::new();
-            let session = Uuid::new_v4();
-            let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
-            store
-                .record_entry(JournalEntry::fetched(
-                    1,
-                    "1".into(),
-                    session,
-                    "revision".into(),
-                    "origin".into(),
-                    false,
-                    Some("app:example".into()),
-                    Some("message-1".into()),
-                    Some(1),
-                    json!({
-                        "event_id":"1",
-                        "session_handle":session.to_string(),
-                        "kind":"revision",
-                        "author":"origin",
-                        "sender_id":"app:example",
-                        "message_id":"message-1",
-                        "request_revision":1,
-                        "message":{"sender_id":"app:example","message_id":"message-1","title":"Request"}
-                    }),
-                ))
-                .unwrap();
-
-            let mut terminal = json!({
-                "event_id":"2",
+    fn a_reply_is_allowed_after_a_terminal_event_and_for_an_already_acted_event() {
+        let scratch = Scratch::new();
+        let session = Uuid::new_v4();
+        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let entry = |seq: u64, kind: &str, author: &str, extra: Value| {
+            let mut raw = json!({
+                "event_id":seq.to_string(),
                 "session_handle":session.to_string(),
-                "kind":"terminal",
-                "author":"person",
+                "kind":kind,
+                "author":author,
                 "sender_id":"app:example",
                 "message_id":"message-1",
                 "request_revision":1,
-                "terminal_state":"answered"
+                "message":{"sender_id":"app:example","message_id":"message-1","title":"Request"}
             });
-            if terminal_kind == "no_comment" {
-                terminal["terminal_kind"] = json!("no_comment");
+            for (key, value) in extra.as_object().unwrap() {
+                raw[key] = value.clone();
             }
-            store
-                .record_entry(JournalEntry::fetched(
-                    2,
-                    "2".into(),
-                    session,
-                    "terminal".into(),
-                    "person".into(),
-                    false,
-                    Some("app:example".into()),
-                    Some("message-1".into()),
-                    Some(1),
-                    terminal,
-                ))
-                .unwrap();
-
-            let snapshot = store.snapshot().unwrap();
-            let request = request_context(&snapshot, session, "message-1").unwrap();
-            let error = ensure_reply_chat_open(&snapshot, session, &request).unwrap_err();
-            assert_eq!(
-                error.message,
-                "This request's chat is closed. Your message was not sent."
-            );
-            assert_eq!(error.exit_code, EXIT_REFUSED);
+            JournalEntry::fetched(
+                seq,
+                seq.to_string(),
+                session,
+                kind.into(),
+                author.into(),
+                kind == "discussion",
+                Some("app:example".into()),
+                Some("message-1".into()),
+                Some(1),
+                raw,
+            )
+        };
+        for item in [
+            entry(1, "revision", "origin", json!({})),
+            entry(
+                2,
+                "terminal",
+                "origin",
+                json!({"terminal_state":"retracted"}),
+            ),
+            entry(
+                3,
+                "discussion",
+                "person",
+                json!({"channel":"chat","text":"one more"}),
+            ),
+        ] {
+            store.record_entry(item).unwrap();
         }
+        store.mark_delivered("3").unwrap();
+        store.mark_acted("3").unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let request = request_context(&snapshot, session, "message-1").unwrap();
+        // The request is closed and the person event was already acted on,
+        // yet a further reply to it is not refused locally.
+        let event = delivered_event(&snapshot, session, &request, "3", "discussion").unwrap();
+        assert!(event.acted_at_ms.is_some());
+        // An event that was never acknowledged is still refused.
+        store
+            .record_entry(entry(
+                4,
+                "discussion",
+                "person",
+                json!({"channel":"chat","text":"unacked"}),
+            ))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert!(delivered_event(&snapshot, session, &request, "4", "discussion").is_err());
     }
 
     #[test]
