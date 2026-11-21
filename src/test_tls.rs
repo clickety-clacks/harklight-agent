@@ -23,12 +23,30 @@ pub const TLS_NAME: &str = "harklight.test";
 pub struct SlowServer {
     pub port: u16,
     pub ca_pem: String,
-    handle: JoinHandle<RecordedRequest>,
+    handle: JoinHandle<Vec<RecordedRequest>>,
 }
 
 pub struct TestIdentity {
     pub certificate: Vec<u8>,
     pub key: Vec<u8>,
+}
+
+pub struct FixtureResponse {
+    pub status: &'static str,
+    pub headers: &'static [(&'static str, &'static str)],
+    pub body: String,
+    pub truncate: bool,
+}
+
+impl FixtureResponse {
+    pub fn json(body: serde_json::Value) -> Self {
+        Self {
+            status: "200 OK",
+            headers: &[],
+            body: body.to_string(),
+            truncate: false,
+        }
+    }
 }
 
 pub struct RecordedRequest {
@@ -49,7 +67,17 @@ impl SlowServer {
         response_headers: &'static [(&'static str, &'static str)],
         body: &'static str,
     ) -> Self {
-        Self::serve(delay, status, response_headers, body, body.len(), false).0
+        Self::serve(
+            delay,
+            vec![FixtureResponse {
+                status,
+                headers: response_headers,
+                body: body.to_owned(),
+                truncate: false,
+            }],
+            false,
+        )
+        .0
     }
 
     /// Announce a longer body than the one sent, then close the connection.
@@ -60,26 +88,38 @@ impl SlowServer {
     ) -> Self {
         Self::serve(
             Duration::ZERO,
-            status,
-            headers,
-            body,
-            body.len() + 10,
+            vec![FixtureResponse {
+                status,
+                headers,
+                body: body.to_owned(),
+                truncate: true,
+            }],
             false,
         )
         .0
     }
 
     pub fn mutual_tls(body: &'static str) -> (Self, TestIdentity) {
-        let (server, identity) = Self::serve(Duration::ZERO, "200 OK", &[], body, body.len(), true);
+        let (server, identity) = Self::serve(
+            Duration::ZERO,
+            vec![FixtureResponse {
+                status: "200 OK",
+                headers: &[],
+                body: body.to_owned(),
+                truncate: false,
+            }],
+            true,
+        );
         (server, identity.unwrap())
+    }
+
+    pub fn sequence(responses: Vec<FixtureResponse>) -> Self {
+        Self::serve(Duration::ZERO, responses, false).0
     }
 
     fn serve(
         delay: Duration,
-        status: &'static str,
-        response_headers: &'static [(&'static str, &'static str)],
-        body: &'static str,
-        content_length: usize,
+        responses: Vec<FixtureResponse>,
         require_identity: bool,
     ) -> (Self, Option<TestIdentity>) {
         let ca_key = KeyPair::generate().unwrap();
@@ -130,51 +170,62 @@ impl SlowServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
-            let connection = ServerConnection::new(config).unwrap();
-            let mut reader = BufReader::new(StreamOwned::new(connection, tcp));
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).unwrap();
-            let mut request_content_length = 0usize;
-            let mut headers = Vec::new();
-            loop {
-                let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
-                let header = header.trim_end();
-                if header.is_empty() {
-                    break;
+            let mut recorded = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (tcp, _) = listener.accept().unwrap();
+                let connection = ServerConnection::new(Arc::clone(&config)).unwrap();
+                let mut reader = BufReader::new(StreamOwned::new(connection, tcp));
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut request_content_length = 0usize;
+                let mut headers = Vec::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap();
+                    let value = value.trim();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        request_content_length = value.parse().unwrap();
+                    }
+                    headers.push((name.to_ascii_lowercase(), value.to_owned()));
                 }
-                let (name, value) = header.split_once(':').unwrap();
-                let value = value.trim();
-                if name.eq_ignore_ascii_case("content-length") {
-                    request_content_length = value.parse().unwrap();
-                }
-                headers.push((name.to_ascii_lowercase(), value.to_owned()));
-            }
-            let mut request_body = vec![0; request_content_length];
-            reader.read_exact(&mut request_body).unwrap();
+                let mut request_body = vec![0; request_content_length];
+                reader.read_exact(&mut request_body).unwrap();
 
-            thread::sleep(delay);
+                thread::sleep(delay);
 
-            let mut stream = reader.into_inner();
-            write!(
+                let mut stream = reader.into_inner();
+                let FixtureResponse {
+                    status,
+                    headers: response_headers,
+                    body,
+                    truncate,
+                } = response;
+                let content_length = body.len() + if truncate { 10 } else { 0 };
+                write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
                 content_length
             )
             .unwrap();
-            for (name, value) in response_headers {
-                write!(stream, "{name}: {value}\r\n").unwrap();
+                for (name, value) in response_headers {
+                    write!(stream, "{name}: {value}\r\n").unwrap();
+                }
+                write!(stream, "\r\n{body}").unwrap();
+                stream.flush().unwrap();
+                stream.conn.send_close_notify();
+                let _ = stream.conn.complete_io(&mut stream.sock);
+                recorded.push(RecordedRequest {
+                    line: request_line,
+                    headers,
+                    body: request_body,
+                });
             }
-            write!(stream, "\r\n{body}").unwrap();
-            stream.flush().unwrap();
-            stream.conn.send_close_notify();
-            let _ = stream.conn.complete_io(&mut stream.sock);
-            RecordedRequest {
-                line: request_line,
-                headers,
-                body: request_body,
-            }
+            recorded
         });
 
         (
@@ -193,6 +244,12 @@ impl SlowServer {
     }
 
     pub fn request(self) -> RecordedRequest {
+        let mut requests = self.requests();
+        assert_eq!(requests.len(), 1);
+        requests.pop().unwrap()
+    }
+
+    pub fn requests(self) -> Vec<RecordedRequest> {
         self.handle.join().unwrap()
     }
 }

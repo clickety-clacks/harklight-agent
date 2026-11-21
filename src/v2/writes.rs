@@ -30,7 +30,15 @@ impl WriteFailure {
         }
     }
 
-    fn from_saved_refusal(output: Value) -> Self {
+    pub(super) fn local_refusal(detail: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            output: None,
+            detail: detail.into(),
+        }
+    }
+
+    pub(super) fn from_saved_refusal(output: Value) -> Self {
         Self {
             exit_code: 2,
             output: Some(output),
@@ -472,6 +480,9 @@ pub(super) fn deliver(
         operation = super::sends::freeze_send(client, journal, lock, operation)?;
     }
 
+    if operation.prepared_request.is_none() && operation.request.get("wire").is_some() {
+        operation = super::mutations::freeze(client, journal, lock, operation)?;
+    }
     let request = operation
         .prepared_request
         .as_ref()

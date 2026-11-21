@@ -8,7 +8,7 @@ use harklight_agent::{
     config::{EnrolledIdentity, default_state_root},
     enrollment,
     journal::JournalStore,
-    v2::{AgentClient, V2Error, sends, writes},
+    v2::{AgentClient, V2Error, mutations, sends, writes},
 };
 
 #[derive(Debug, Parser)]
@@ -267,14 +267,14 @@ enum Command {
     },
     Reply {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        request: String,
+        in_reply_to: Option<String>,
         #[arg(long)]
-        in_reply_to: String,
-        #[arg(long)]
-        body: String,
-        #[arg(long = "file", action = clap::ArgAction::Append)]
+        body: Option<String>,
+        #[arg(long = "file-id")]
+        file_ids: Vec<String>,
+        #[arg(long = "file")]
         files: Vec<PathBuf>,
         #[arg(long)]
         op_id: Option<Uuid>,
@@ -284,13 +284,17 @@ enum Command {
     )]
     Revise {
         #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
-        #[arg(long)]
+        item_id: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         base_revision: u64,
-        #[arg(long)]
-        title: String,
+        #[arg(long, required_unless_present = "message_json")]
+        title: Option<String>,
+        #[arg(long, conflicts_with_all = [
+            "title", "body", "choices", "clear_choices", "message_type", "message_kind",
+            "reply", "importance", "by_when", "stake", "default_choice", "default_at",
+            "clear_default", "choice_styles"
+        ])]
+        message_json: Option<PathBuf>,
         #[arg(long)]
         body: Option<String>,
         #[arg(long = "choice", action = clap::ArgAction::Append)]
@@ -328,8 +332,8 @@ enum Command {
         clear_default: bool,
         #[arg(long = "choice-style", action = clap::ArgAction::Append)]
         choice_styles: Vec<String>,
-        #[arg(long)]
-        in_reply_to: Option<String>,
+        #[arg(long = "file-id")]
+        file_ids: Vec<String>,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
         #[arg(long)]
@@ -604,6 +608,9 @@ fn main() {
     if matches!(
         cli.command,
         Command::Send { .. }
+            | Command::Reply { .. }
+            | Command::Revise { .. }
+            | Command::Progress { .. }
             | Command::Retract { .. }
             | Command::Lifecycle { .. }
             | Command::Result { .. }
@@ -705,91 +712,6 @@ fn main() {
             (None, Some(advisory)) => commands::ack_advisory(&context, session, advisory),
             _ => unreachable!("clap requires exactly one acknowledgment target"),
         },
-        Command::Reply {
-            session,
-            request,
-            in_reply_to,
-            body,
-            files,
-            op_id,
-        } => commands::reply(
-            &context,
-            session,
-            &request,
-            &in_reply_to,
-            &body,
-            &files,
-            op_id,
-        ),
-        Command::Revise {
-            session,
-            request,
-            base_revision,
-            title,
-            body,
-            choices,
-            clear_choices,
-            message_type,
-            message_kind,
-            reply,
-            importance,
-            by_when,
-            stake,
-            default_choice,
-            default_at,
-            clear_default,
-            choice_styles,
-            in_reply_to,
-            files,
-            op_id,
-        } => commands::revise_with_fields(
-            &context,
-            session,
-            &request,
-            base_revision,
-            &title,
-            body.as_deref(),
-            &choices,
-            clear_choices,
-            in_reply_to.as_deref(),
-            &files,
-            op_id,
-            &MessageFieldOptions {
-                origin_listener: false,
-                message_type,
-                message_kind,
-                reply,
-                importance,
-                by_when,
-                stake,
-                thread: None,
-                display_name: None,
-                default_choice,
-                default_at,
-                choice_styles,
-                clear_default,
-                answer_ui: None,
-                progress: None,
-            },
-        ),
-        Command::Progress {
-            session,
-            request,
-            percent,
-            stage,
-            note,
-            op_id,
-        } => commands::progress_update(
-            &context,
-            session,
-            &request,
-            &ProgressReport {
-                percent,
-                stage,
-                note,
-            },
-            op_id,
-        ),
         Command::Withdraw {
             session,
             request,
@@ -798,6 +720,9 @@ fn main() {
         } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
         Command::Status { session } => commands::status(&context, session),
         Command::Send { .. }
+        | Command::Reply { .. }
+        | Command::Revise { .. }
+        | Command::Progress { .. }
         | Command::Retract { .. }
         | Command::Lifecycle { .. }
         | Command::Result { .. }
@@ -1049,6 +974,125 @@ fn run_device_write(cli: &Cli) {
                 *prepare,
             )
         }
+        Command::Reply {
+            item_id,
+            in_reply_to,
+            body,
+            file_ids,
+            files,
+            op_id,
+        } => mutations::reply(
+            &client,
+            &mut journal,
+            item_id,
+            body.as_deref(),
+            in_reply_to.as_deref(),
+            file_ids,
+            files,
+            *op_id,
+        ),
+        Command::Revise {
+            item_id,
+            base_revision,
+            message_json: Some(path),
+            file_ids,
+            files,
+            op_id,
+            ..
+        } => {
+            let message = std::fs::read(path)
+                .map_err(|error| format!("could not read revision JSON: {error}"))
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("invalid revision JSON: {error}"))
+                })
+                .unwrap_or_else(|error| fail(error, 1));
+            mutations::revise(
+                &client,
+                &mut journal,
+                mutations::Revision {
+                    item_id,
+                    revision: *base_revision,
+                    message,
+                    file_ids,
+                    files,
+                    operation: "revise",
+                    session: None,
+                },
+                *op_id,
+            )
+        }
+        Command::Revise {
+            item_id,
+            base_revision,
+            title: Some(title),
+            body,
+            choices,
+            clear_choices,
+            message_type,
+            message_kind,
+            reply,
+            importance,
+            by_when,
+            stake,
+            default_choice,
+            default_at,
+            clear_default,
+            choice_styles,
+            file_ids,
+            files,
+            op_id,
+            ..
+        } => {
+            let fields = MessageFieldOptions {
+                message_type: message_type.clone(),
+                message_kind: message_kind.clone(),
+                reply: *reply,
+                importance: importance.clone(),
+                by_when: by_when.clone(),
+                stake: stake.clone(),
+                default_choice: default_choice.clone(),
+                default_at: default_at.clone(),
+                clear_default: *clear_default,
+                choice_styles: choice_styles.clone(),
+                ..MessageFieldOptions::default()
+            };
+            mutations::revise_interactive(
+                &client,
+                &mut journal,
+                mutations::InteractiveRevision {
+                    item_id,
+                    revision: *base_revision,
+                    title,
+                    body: body.as_deref(),
+                    choices,
+                    clear_choices: *clear_choices,
+                    fields: &fields,
+                    file_ids,
+                    files,
+                },
+                *op_id,
+            )
+        }
+        Command::Progress {
+            session,
+            request,
+            percent,
+            stage,
+            note,
+            op_id,
+        } => mutations::progress(
+            &client,
+            &mut journal,
+            *session,
+            request,
+            &ProgressReport {
+                percent: *percent,
+                stage: stage.clone(),
+                note: note.clone(),
+            },
+            *op_id,
+        ),
         Command::Retract {
             item_id,
             in_reply_to,
@@ -1832,9 +1876,7 @@ mod tests {
         let revise = Cli::try_parse_from([
             "harklight-agent",
             "revise",
-            "--session",
-            "123e4567-e89b-42d3-a456-426614174000",
-            "--request",
+            "--item-id",
             "message-1",
             "--base-revision",
             "1",
@@ -1872,9 +1914,7 @@ mod tests {
             Cli::try_parse_from([
                 "harklight-agent",
                 "revise",
-                "--session",
-                "123e4567-e89b-42d3-a456-426614174000",
-                "--request",
+                "--item-id",
                 "message-1",
                 "--base-revision",
                 "1",
