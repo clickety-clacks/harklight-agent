@@ -154,6 +154,9 @@ enum Command {
         stage: String,
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
+        /// Resolve the request as a pre-cut-over message belonging to this sender.
+        #[arg(long)]
+        sender_id: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -300,6 +303,8 @@ enum Command {
         in_reply_to: Option<String>,
         #[arg(long = "file-id")]
         file_ids: Vec<String>,
+        #[arg(long, conflicts_with_all = ["file_ids","files"])]
+        clear_files: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
         #[arg(long)]
@@ -826,6 +831,7 @@ fn run_device_write(cli: &Cli) {
             base_revision,
             message_json: Some(path),
             file_ids,
+            clear_files,
             files,
             in_reply_to,
             op_id,
@@ -845,7 +851,7 @@ fn run_device_write(cli: &Cli) {
                     item_id,
                     revision: *base_revision,
                     message,
-                    file_ids,
+                    file_ids: (*clear_files || !file_ids.is_empty()).then_some(file_ids.as_slice()),
                     files,
                     in_reply_to: in_reply_to.as_deref(),
                     operation: "revise",
@@ -872,6 +878,7 @@ fn run_device_write(cli: &Cli) {
             clear_default,
             choice_styles,
             file_ids,
+            clear_files,
             files,
             in_reply_to,
             op_id,
@@ -901,7 +908,7 @@ fn run_device_write(cli: &Cli) {
                     choices,
                     clear_choices: *clear_choices,
                     fields: &fields,
-                    file_ids,
+                    file_ids: (*clear_files || !file_ids.is_empty()).then_some(file_ids.as_slice()),
                     files,
                     in_reply_to: in_reply_to.as_deref(),
                 },
@@ -914,6 +921,7 @@ fn run_device_write(cli: &Cli) {
             percent,
             stage,
             note,
+            sender_id,
             op_id,
         } => mutations::progress(
             &client,
@@ -925,6 +933,7 @@ fn run_device_write(cli: &Cli) {
                 stage: stage.clone(),
                 note: note.clone(),
             },
+            sender_id.as_deref(),
             *op_id,
         ),
         Command::Retract {

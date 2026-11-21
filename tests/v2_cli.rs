@@ -104,3 +104,61 @@ fn binary_session_read_emits_an_empty_caught_up_boundary_from_caller_cursor() {
         format!("GET /v2/agent/changes?after=5&session={session} HTTP/1.1")
     );
 }
+
+#[test]
+fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
+    use test_tls::FixtureResponse;
+
+    let session = Uuid::new_v4().to_string();
+    let operation = Uuid::new_v4().to_string();
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"rev":8,"message":{
+            "item_id":"item/opaque","revision":3,"rev":7,"session":session,"sender":"app:fixture",
+            "seen":false,"files":[{"file_id":"read-only-id","name":"a","size":1,"sha256":"a".repeat(64)}],
+            "message":{"title":"Progress","created_at":10,"message_type":"fyi",
+                "progress":{"percent":10,"segments":[{"stage":"Build","width":10}]}}
+        }})),
+        FixtureResponse::json(json!({"rev":9,"message":{"item_id":"item/opaque","revision":4}})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&[
+        "progress",
+        "--session",
+        &session,
+        "--request",
+        "item/opaque",
+        "--percent",
+        "20",
+        "--stage",
+        "Verify",
+        "--op-id",
+        &operation,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests[0].line.trim_end(),
+        "GET /v2/agent/messages/item%2Fopaque HTTP/1.1"
+    );
+    assert_eq!(
+        requests[1].line.trim_end(),
+        "PUT /v2/agent/messages/item%2Fopaque HTTP/1.1"
+    );
+    assert!(
+        requests[1]
+            .headers
+            .contains(&("if-match".into(), "3".into()))
+    );
+    assert!(
+        requests[1]
+            .headers
+            .contains(&("idempotency-key".into(), operation))
+    );
+    let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(body.get("file_ids").is_none());
+    assert_eq!(body["message"]["progress"]["percent"], 20);
+}

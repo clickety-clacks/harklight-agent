@@ -113,6 +113,11 @@ impl SlowServer {
         (server, identity.unwrap())
     }
 
+    pub fn mutual_tls_sequence(responses: Vec<FixtureResponse>) -> (Self, TestIdentity) {
+        let (server, identity) = Self::serve(Duration::ZERO, responses, true);
+        (server, identity.unwrap())
+    }
+
     pub fn sequence(responses: Vec<FixtureResponse>) -> Self {
         Self::serve(Duration::ZERO, responses, false).0
     }
