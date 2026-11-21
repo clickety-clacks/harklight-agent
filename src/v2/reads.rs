@@ -96,6 +96,33 @@ impl AgentClient {
         Ok(response)
     }
 
+    /// The journal also stores modern operation aliases, so a cached item
+    /// can satisfy a legacy selector only if the Server confirms both fields.
+    pub fn resolve_legacy_message(
+        &self,
+        sender: &str,
+        legacy_message_id: &str,
+        cached_item_id: Option<&str>,
+    ) -> Result<Value, V2Error> {
+        if let Some(item_id) = cached_item_id {
+            match self.message(item_id) {
+                Ok(response) if matches_legacy(&response["message"], sender, legacy_message_id) => {
+                    return Ok(response);
+                }
+                Ok(_) | Err(V2Error::Http { status: 404, .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.legacy_message(sender, legacy_message_id)?
+            .ok_or_else(|| V2Error::Http {
+                status: 404,
+                token: Some("not_found".into()),
+                field: None,
+                request_id: None,
+                retry_after: None,
+            })
+    }
+
     pub fn legacy_message(
         &self,
         sender: &str,
@@ -112,8 +139,7 @@ impl AgentClient {
             let (response, request_id) = self.read_correlated(&["agent", "messages"], &query)?;
             let (position, messages) = message_page(&response, token.as_deref(), &request_id)?;
             for message in messages {
-                if message["sender"] != sender || message["legacy_message_id"] != legacy_message_id
-                {
+                if !matches_legacy(message, sender, legacy_message_id) {
                     return Err(invalid_response(&request_id));
                 }
                 if let Some(prior) = &matched {
@@ -133,6 +159,10 @@ impl AgentClient {
             }
         }
     }
+}
+
+fn matches_legacy(message: &Value, sender: &str, legacy_message_id: &str) -> bool {
+    message["sender"] == sender && message["legacy_message_id"] == legacy_message_id
 }
 
 fn invalid_response(request_id: &Option<String>) -> V2Error {
@@ -244,6 +274,34 @@ mod tests {
         let result = client_for(&server).legacy_message("app:build", "old");
         assert!(matches!(result, Err(V2Error::InvalidResponse { .. })));
         server.request();
+    }
+
+    #[test]
+    fn legacy_resolution_checks_a_cached_alias_against_the_server() {
+        use crate::test_tls::FixtureResponse;
+
+        let mut message = json!({"item_id":"cached","sender":"app:test",
+            "rev":4,"revision":1,"message":{},"seen":false,"files":[]});
+        let modern = FixtureResponse::json(json!({"rev":4,"message":message}));
+        message["item_id"] = "retained".into();
+        message["legacy_message_id"] = "local".into();
+        let server = SlowServer::sequence(vec![
+            modern,
+            FixtureResponse::json(json!({"rev":4,"messages":[message]})),
+        ]);
+        let result = client_for(&server)
+            .resolve_legacy_message("app:test", "local", Some("cached"))
+            .unwrap();
+        assert_eq!(result["message"]["item_id"], "retained");
+        let requests = server.requests();
+        assert_eq!(
+            requests[0].line.trim_end(),
+            "GET /v2/agent/messages/cached HTTP/1.1"
+        );
+        assert_eq!(
+            requests[1].line.trim_end(),
+            "GET /v2/agent/messages?sender=app%3Atest&legacy_message_id=local HTTP/1.1",
+        );
     }
 
     #[test]

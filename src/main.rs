@@ -614,31 +614,25 @@ fn run_device_read(cli: &Cli) {
             ..
         } => {
             let journal = device_journal(cli, &device_id);
-            let saved = journal
+            let cached = journal
                 .v2_item_id(sender, id)
                 .unwrap_or_else(|error| fail(error.to_string(), 1));
-            let result = match saved {
-                Some(item_id) => read_message_revision(&client, &item_id, *revision),
-                None => client.legacy_message(sender, id).and_then(|message| {
-                    let message = message.ok_or_else(|| V2Error::Http {
-                        status: 404,
-                        token: Some("not_found".into()),
-                        field: None,
-                        request_id: None,
-                        retry_after: None,
-                    })?;
+            let result = client
+                .resolve_legacy_message(sender, id, cached.as_deref())
+                .and_then(|message| {
                     let item_id = message["message"]["item_id"]
                         .as_str()
                         .ok_or(V2Error::InvalidResponse { request_id: None })?;
-                    journal
-                        .remember_v2_item(sender, id, item_id)
-                        .unwrap_or_else(|error| fail(error.to_string(), 1));
+                    if cached.is_none() {
+                        journal
+                            .remember_v2_item(sender, id, item_id)
+                            .unwrap_or_else(|error| fail(error.to_string(), 1));
+                    }
                     match revision {
                         Some(revision) => client.message_revision(item_id, *revision),
                         None => Ok(message),
                     }
-                }),
-            };
+                });
             ("message-get", result)
         }
         Command::Messages { session, page } => {
