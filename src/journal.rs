@@ -1355,6 +1355,20 @@ impl JournalStore {
         })
     }
 
+    pub(crate) fn record_v2_supersedes(
+        &self,
+        op_id: Uuid,
+        resolved: Value,
+    ) -> Result<(), JournalError> {
+        self.update_operation(op_id, |operation| {
+            if operation.prepared_request.is_some() {
+                return Err(JournalError::OperationConflict(op_id));
+            }
+            operation.request["_resolved_supersedes"] = resolved;
+            Ok(true)
+        })
+    }
+
     pub(crate) fn record_v2_upload(
         &self,
         op_id: Uuid,

@@ -452,6 +452,16 @@ pub(super) fn deliver(
             "operation belongs to the earlier protocol",
         ));
     }
+    if operation.kind == "send"
+        && operation
+            .prepared_send
+            .as_ref()
+            .is_none_or(|prepared| prepared.inputs["server_binding"] != client.server_binding())
+    {
+        return Err(WriteFailure::local(
+            "prepared send belongs to a different enrolled Server",
+        ));
+    }
     match operation.state {
         OperationState::Committed => {
             let response = operation
@@ -550,9 +560,9 @@ pub(super) fn deliver(
         RequestMethod::Delete => Method::DELETE,
     };
     let response = if method == Method::DELETE {
-        client.delete(&path, key).map(|()| json!({}))
+        client.delete(&path, key).map(|()| (json!({}), None))
     } else {
-        client.write(
+        client.write_correlated(
             method.clone(),
             &path,
             JsonWrite {
@@ -563,7 +573,7 @@ pub(super) fn deliver(
         )
     };
     match response {
-        Ok(response) if valid_write_response(&operation.kind, request, &response) => {
+        Ok((response, _)) if valid_write_response(&operation.kind, request, &response) => {
             journal
                 .settle_operation(key, response.clone(), None)
                 .map_err(|error| unknown(&operation, &error.to_string(), None))?;
@@ -572,11 +582,19 @@ pub(super) fn deliver(
             }
             Ok(committed(&operation, response))
         }
-        Ok(_) => Err(unknown(
-            &operation,
-            "server response lacked a position",
-            None,
-        )),
+        Ok((_, request_id)) => {
+            let mut failure = unknown(
+                &operation,
+                "server response did not match the operation",
+                None,
+            );
+            if let Some(id) = request_id
+                && let Some(output) = failure.output.as_mut()
+            {
+                output["request_id"] = id.into();
+            }
+            Err(failure)
+        }
         Err(error) => Err(record_failure(journal, &operation, error)?),
     }
 }
@@ -593,6 +611,25 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
     }
     if !response["rev"].is_u64() {
         return false;
+    }
+    if matches!(kind, "send" | "revise" | "progress") {
+        return (kind == "send"
+            || request
+                .path
+                .get(2)
+                .is_some_and(|item| response["message"]["item_id"] == *item))
+            && super::reads::valid_sent_message(
+                &response["message"],
+                response["rev"].as_u64().unwrap(),
+            );
+    }
+    if kind == "reply" {
+        let entry = &response["entry"];
+        return request
+            .path
+            .get(2)
+            .is_some_and(|item| entry["item_id"] == *item)
+            && entry["entry_id"].as_str().is_some_and(|id| !id.is_empty());
     }
     if kind != "receipt" {
         return true;

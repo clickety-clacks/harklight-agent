@@ -118,7 +118,9 @@ fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
             "message":{"title":"Progress","created_at":10,"message_type":"fyi",
                 "progress":{"percent":10,"segments":[{"stage":"Build","width":10}]}}
         }})),
-        FixtureResponse::json(json!({"rev":9,"message":{"item_id":"item/opaque","revision":4}})),
+        FixtureResponse::json(
+            json!({"rev":9,"message":{"item_id":"item/opaque","revision":4,"sender":"app:fixture","rev":9,"message":{},"seen":false,"files":[]}}),
+        ),
     ]);
     let fixture = CliFixture::new(&server, identity);
     let output = fixture.run(&[

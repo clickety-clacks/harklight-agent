@@ -481,7 +481,7 @@ mod tests {
         let replay = SlowServer::sequence(vec![FixtureResponse {
             status: "200 OK",
             headers: &[("Idempotent-Replayed", "true")],
-            body: r#"{"rev":9,"message":{"item_id":"opaque/item","revision":4}}"#.into(),
+            body: r#"{"rev":9,"message":{"item_id":"opaque/item","revision":4,"sender":"app:fixture","rev":9,"message":{},"seen":false,"files":[]}}"#.into(),
             truncate: false,
         }]);
         let output = writes::retry(&client(&replay), &mut journal.store, key, None).unwrap();
@@ -561,7 +561,7 @@ mod tests {
     fn reply_preserves_the_correlation_and_uses_opaque_file_ids() {
         let mut journal = TestJournal::new();
         let server = SlowServer::sequence(vec![FixtureResponse::json(
-            json!({"rev":9,"entry":{"entry_id":"new"}}),
+            json!({"rev":9,"entry":{"entry_id":"new","item_id":"item"}}),
         )]);
         let output = reply(
             &client(&server),

@@ -113,6 +113,7 @@ impl SlowServer {
         (server, identity.unwrap())
     }
 
+    #[allow(dead_code)] // Used by the executable-level fixture crate.
     pub fn mutual_tls_sequence(responses: Vec<FixtureResponse>) -> (Self, TestIdentity) {
         let (server, identity) = Self::serve(Duration::ZERO, responses, true);
         (server, identity.unwrap())

@@ -17,6 +17,7 @@ pub struct AgentClient {
     client: Client,
     base: Url,
     address: String,
+    server_binding: String,
 }
 
 impl AgentClient {
@@ -26,8 +27,13 @@ impl AgentClient {
         Ok(Self {
             client,
             base,
+            server_binding: identity.server_binding(),
             address: identity.address,
         })
+    }
+
+    pub(crate) fn server_binding(&self) -> &str {
+        &self.server_binding
     }
 
     pub fn read(&self, path: &[&str], query: &[(&str, &str)]) -> Result<Value, V2Error> {
@@ -46,6 +52,16 @@ impl AgentClient {
         path: &[&str],
         write: JsonWrite<'_>,
     ) -> Result<Value, V2Error> {
+        self.write_correlated(method, path, write)
+            .map(|(value, _)| value)
+    }
+
+    pub(crate) fn write_correlated(
+        &self,
+        method: Method,
+        path: &[&str],
+        write: JsonWrite<'_>,
+    ) -> Result<(Value, Option<String>), V2Error> {
         let mut request = self
             .client
             .request(method, self.url(path)?)
@@ -59,7 +75,7 @@ impl AgentClient {
                 .header(CONTENT_TYPE, "application/json")
                 .body(write.body.to_vec());
         }
-        self.read_json(request)
+        self.read_json_correlated(request)
     }
 
     pub fn delete(&self, path: &[&str], key: Uuid) -> Result<(), V2Error> {
@@ -129,6 +145,13 @@ impl AgentClient {
     }
 
     fn read_json(&self, request: RequestBuilder) -> Result<Value, V2Error> {
+        self.read_json_correlated(request).map(|(value, _)| value)
+    }
+
+    fn read_json_correlated(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<(Value, Option<String>), V2Error> {
         let response = self.send_checked(request)?;
         let status = response.status().as_u16();
         let request_id = header(&response, "Request-Id").map(str::to_owned);
@@ -140,6 +163,7 @@ impl AgentClient {
         serde_json::from_slice::<Value>(&bytes)
             .ok()
             .filter(Value::is_object)
+            .map(|value| (value, request_id.clone()))
             .ok_or(V2Error::InvalidResponse { request_id })
     }
 

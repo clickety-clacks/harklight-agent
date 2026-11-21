@@ -158,7 +158,7 @@ fn valid_files(files: &Value) -> bool {
     })
 }
 
-fn valid_sent_message(message: &Value, position: u64) -> bool {
+pub(super) fn valid_sent_message(message: &Value, position: u64) -> bool {
     nonempty_string(&message["item_id"])
         && nonempty_string(&message["sender"])
         && positive_at_most(&message["rev"], position)

@@ -157,6 +157,19 @@ impl EnrolledIdentity {
         self
     }
 
+    pub(crate) fn server_binding(&self) -> String {
+        let ca = hex::encode(Sha256::digest(&self.ca_pem));
+        let identity = (
+            self.name.as_str(),
+            self.port,
+            ca,
+            self.device_id.as_str(),
+            self.person_id.as_deref(),
+        );
+        let bytes = serde_json::to_vec(&identity).expect("server identity serializes");
+        hex::encode(Sha256::digest(bytes))
+    }
+
     pub fn resolve_origin_port(&self, override_port: Option<u16>) -> Result<u16, ConfigError> {
         let port = override_port.or(self.origin_port).ok_or_else(|| {
             ConfigError::Invalid(

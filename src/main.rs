@@ -82,6 +82,9 @@ enum Command {
         reply: bool,
         #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
         supersedes: Vec<String>,
+        /// Resolve a same-sender local reference before sending.
+        #[arg(long = "supersedes-local")]
+        supersedes_local: Vec<String>,
         #[arg(long, help = "RFC 3339 time by which this matters")]
         by_when: Option<String>,
         #[arg(long)]
@@ -128,7 +131,7 @@ enum Command {
         prepare: bool,
         #[arg(long, requires = "op_id", conflicts_with_all = [
             "prepare", "session", "sender_id", "display_name", "title", "body", "choices",
-            "message_type", "message_kind", "importance", "reply", "supersedes", "by_when",
+            "message_type", "message_kind", "importance", "reply", "supersedes", "supersedes_local", "by_when",
             "stake", "thread", "default_choice", "default_at", "choice_styles", "files",
             "answer_ui_file", "progress", "progress_stage", "progress_note"
         ])]
@@ -752,6 +755,7 @@ fn run_device_write(cli: &Cli) {
             importance,
             reply,
             supersedes,
+            supersedes_local,
             by_when,
             stake,
             thread,
@@ -801,6 +805,7 @@ fn run_device_write(cli: &Cli) {
                     body: body.as_deref(),
                     choices,
                     supersedes,
+                    supersedes_local,
                     files,
                     fields: &fields,
                     answer_ui: answer_ui_file.as_deref(),

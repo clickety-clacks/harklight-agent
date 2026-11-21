@@ -13,6 +13,7 @@ pub struct Download {
     pub response: Response,
     pub sha256: String,
     pub size: u64,
+    pub request_id: Option<String>,
 }
 
 impl AgentClient {
@@ -57,6 +58,7 @@ impl AgentClient {
             .to_owned();
         let size = response.content_length().ok_or_else(invalid)?;
         Ok(Download {
+            request_id: header(&response, "Request-Id").map(str::to_owned),
             response,
             sha256,
             size,
@@ -67,6 +69,10 @@ impl AgentClient {
 impl Download {
     pub fn save(&mut self, destination: &Path) -> Result<(), String> {
         crate::files::persist_download(destination, &mut self.response, self.size, &self.sha256)
+            .map_err(|error| match &self.request_id {
+                Some(id) => format!("{error} (request ID {id})"),
+                None => error,
+            })
     }
 }
 
