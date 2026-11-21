@@ -80,11 +80,21 @@ pub enum FeedError {
     InvalidSnapshot,
     #[error("agent feed closed: {0}")]
     Closed(String),
+    #[error("internal_error (Request-Id {request_id:?})")]
+    InternalClosing { request_id: Option<String> },
     #[error("could not emit agent feed output: {0}")]
     Output(io::Error),
 }
 
 impl FeedError {
+    pub fn is_internal_error(&self) -> bool {
+        match self {
+            Self::InternalClosing { .. } => true,
+            Self::Api(error) => error.is_internal_error(),
+            _ => false,
+        }
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Api(V2Error::Http {
@@ -139,11 +149,17 @@ impl AgentClient {
             }
             .into());
         }
-        Ok(EventStream(BufReader::new(response)))
+        Ok(EventStream {
+            request_id: header(&response, "Request-Id").map(str::to_owned),
+            reader: BufReader::new(response),
+        })
     }
 }
 
-struct EventStream(BufReader<Response>);
+struct EventStream {
+    reader: BufReader<Response>,
+    request_id: Option<String>,
+}
 
 enum Event {
     Change(Change),
@@ -160,7 +176,7 @@ impl EventStream {
         let mut line = String::new();
         loop {
             line.clear();
-            match self.0.read_line(&mut line) {
+            match self.reader.read_line(&mut line) {
                 Ok(0) | Err(_) => return Ok(None),
                 Ok(_) => {}
             }
@@ -388,6 +404,11 @@ pub fn run(
                         continue 'resume;
                     }
                     "storage_unavailable" | "server_shutdown" => break,
+                    "internal_error" => {
+                        return Err(FeedError::InternalClosing {
+                            request_id: stream.request_id,
+                        });
+                    }
                     _ => return Err(FeedError::Closed(reason)),
                 },
             }

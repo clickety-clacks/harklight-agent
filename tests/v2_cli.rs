@@ -379,3 +379,121 @@ fn malformed_or_mismatched_write_responses_keep_the_saved_operation() {
         assert_eq!(server.requests().len(), 1);
     }
 }
+
+#[test]
+fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"rev":10,"messages":[]})),
+        FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
+        internal_error_response(),
+        FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
+        FixtureResponse {
+            status: "200 OK",
+            headers: &[("Content-Type", "text/event-stream"), ("Request-Id", "stream-fault")],
+            body: concat!(
+                "id: 12\nevent: entry\ndata: {\"entry_id\":\"one\",\"item_id\":\"item\",\"rev\":12}\n\n",
+                "event: closing\ndata: {\"reason\":\"internal_error\"}\n\n"
+            ).into(),
+            truncate: false,
+        },
+        FixtureResponse::json(json!({"rev":13,"changes":[],"more":false})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    assert!(fixture.run(&["read"]).status.success());
+    let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(10));
+
+    let batch = fixture.run(&["listen", "--follow"]);
+    assert_eq!(batch.status.code(), Some(1), "{batch:?}");
+    assert!(batch.stdout.is_empty());
+    let diagnostic = String::from_utf8(batch.stderr).unwrap();
+    for detail in [
+        "listen",
+        "live updates paused",
+        "internal_error",
+        "boundary-fault",
+    ] {
+        assert!(diagnostic.contains(detail), "{diagnostic}");
+    }
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(10));
+
+    let stream = fixture.run(&["listen", "--follow"]);
+    assert_eq!(stream.status.code(), Some(1), "{stream:?}");
+    let diagnostic = String::from_utf8(stream.stderr).unwrap();
+    for detail in [
+        "listen",
+        "live updates paused",
+        "internal_error",
+        "stream-fault",
+    ] {
+        assert!(diagnostic.contains(detail), "{diagnostic}");
+    }
+    let output = String::from_utf8(stream.stdout).unwrap();
+    let rows: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["rev"], 12);
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(12));
+    assert!(fixture.run(&["read"]).status.success());
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
+
+    let requests = server.requests();
+    assert!(requests[2].line.contains("after=10"));
+    assert!(requests[3].line.contains("after=10"));
+    assert!(
+        requests[4]
+            .headers
+            .contains(&("last-event-id".into(), "10".into()))
+    );
+    assert!(requests[5].line.contains("after=12"));
+}
+
+#[test]
+fn internal_write_error_preserves_operation_for_explicit_retry() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        internal_error_response(),
+        FixtureResponse::json(json!({"rev":14})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let key = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let failed = fixture.run(&["session", "end", "--session", &session, "--op-id", &key]);
+    assert_eq!(failed.status.code(), Some(7), "{failed:?}");
+    let retry = fixture.run(&["retry", "--op-id", &key]);
+    assert!(retry.status.success(), "{retry:?}");
+    let output: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(
+        output,
+        json!({
+            "kind":"outcome_unknown","operation":"session-end","op_id":key,
+            "status":500,"error":"internal_error","retryable":false,"request_id":"boundary-fault",
+        })
+    );
+    let requests = server.requests();
+    assert_eq!(requests[0].line, requests[1].line);
+    assert_eq!(requests[0].body, requests[1].body);
+    for request in requests {
+        assert!(
+            request
+                .headers
+                .contains(&("idempotency-key".into(), key.clone()))
+        );
+    }
+}
+
+fn internal_error_response() -> test_tls::FixtureResponse {
+    test_tls::FixtureResponse {
+        status: "500 Internal Server Error",
+        headers: &[("Request-Id", "boundary-fault")],
+        body: r#"{"error":"internal_error","retryable":false,"request_id":"boundary-fault"}"#
+            .into(),
+        truncate: false,
+    }
+}

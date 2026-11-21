@@ -56,7 +56,7 @@ pub fn submit(
     let uploads = if mutation.files.is_empty() {
         Vec::new()
     } else {
-        let cap = writes::upload_cap(client)?;
+        let cap = writes::upload_cap(client, mutation.operation)?;
         files::stage_v2_uploads(
             mutation.files,
             &journal.upload_staging_directory(session, op_id),
@@ -343,6 +343,9 @@ pub fn progress(
 }
 
 fn read_failure(operation: &str, error: super::V2Error) -> WriteFailure {
+    if error.is_internal_error() {
+        return WriteFailure::local(format!("{operation}: {error}"));
+    }
     match error {
         super::V2Error::Http {
             status,

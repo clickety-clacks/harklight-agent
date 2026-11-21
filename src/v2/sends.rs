@@ -200,9 +200,15 @@ pub(super) fn freeze_send(
                 if let Some(id) = journal.v2_item_id(sender, local)? {
                     targets.push(id.into());
                 } else {
-                    let matched = client
-                        .legacy_message(sender, local)
-                        .map_err(|error| writes::unknown(&operation, &error.to_string(), None))?;
+                    let matched = match client.legacy_message(sender, local) {
+                        Ok(matched) => matched,
+                        Err(error) if error.is_internal_error() => {
+                            return Err(writes::record_failure(journal, &operation, error)?);
+                        }
+                        Err(error) => {
+                            return Err(writes::unknown(&operation, &error.to_string(), None));
+                        }
+                    };
                     let found = matched
                         .as_ref()
                         .and_then(|found| found["message"]["item_id"].as_str())
