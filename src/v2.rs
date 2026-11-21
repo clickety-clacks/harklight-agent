@@ -219,6 +219,7 @@ fn known_error(token: &str) -> bool {
             | "forbidden"
             | "retry_later"
             | "storage_unavailable"
+            | "internal_error"
             | "payload_too_large"
             | "unsupported"
             | "account_paused"
@@ -257,6 +258,10 @@ pub enum V2Error {
 }
 
 impl V2Error {
+    pub fn is_internal_error(&self) -> bool {
+        matches!(self, Self::Http { status: 500, token: Some(token), .. } if token == "internal_error")
+    }
+
     pub fn outcome_unknown(&self) -> bool {
         match self {
             Self::Transport { .. } | Self::InvalidResponse { .. } | Self::ResponseRead { .. } => {

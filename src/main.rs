@@ -570,12 +570,20 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
         Some(FeedArgs { snapshot: true, .. }) => feed::Start::Snapshot,
         _ => feed::Start::Journal,
     };
+    let failure_context = match mode {
+        feed::Mode::Read => "read",
+        feed::Mode::Focus => "focus: live updates paused",
+        feed::Mode::Follow | feed::Mode::Next => "listen: live updates paused",
+    };
     let mut stdout = io::stdout().lock();
     let result = feed::run(&client, &journal, session, start, mode, |value| {
         writeln!(stdout, "{value}")?;
         stdout.flush()
     });
     if let Err(error) = result {
+        if error.is_internal_error() {
+            fail(format!("{failure_context}: {error}"), error.exit_code());
+        }
         fail(error.to_string(), error.exit_code());
     }
 }
@@ -688,6 +696,7 @@ fn run_device_read(cli: &Cli) {
             };
             fail(error.to_string(), exit)
         }
+        Err(error) if error.is_internal_error() => fail(format!("{operation}: {error}"), 1),
         Err(error) => fail(error.to_string(), 1),
     }
 }

@@ -329,10 +329,17 @@ pub(super) fn operation_key(op_id: Option<Uuid>) -> Result<Uuid, WriteFailure> {
     Ok(key)
 }
 
-pub(super) fn upload_cap(client: &AgentClient) -> Result<Option<u64>, WriteFailure> {
-    let me = client
-        .read(&["me"], &[])
-        .map_err(|error| WriteFailure::local(error.to_string()))?;
+pub(super) fn upload_cap(
+    client: &AgentClient,
+    operation: &str,
+) -> Result<Option<u64>, WriteFailure> {
+    let me = client.read(&["me"], &[]).map_err(|error| {
+        if error.is_internal_error() {
+            WriteFailure::local(format!("{operation}: {error}"))
+        } else {
+            WriteFailure::local(error.to_string())
+        }
+    })?;
     match &me["limits"]["upload_cap_bytes_per_file"] {
         Value::String(value) if value == "none" => Ok(None),
         value => value
@@ -361,7 +368,7 @@ pub fn upload_file(
         return Err(JournalError::OperationConflict(op_id).into());
     }
 
-    let cap = upload_cap(client)?;
+    let cap = upload_cap(client, "file-upload")?;
     let staging = journal.upload_staging_directory(Uuid::nil(), op_id);
     let uploads = files::stage_v2_uploads(&paths, &staging, cap).map_err(WriteFailure::local)?;
     let upload = &uploads[0];
@@ -747,6 +754,7 @@ pub(super) fn record_failure(
     operation: &OperationRecord,
     error: V2Error,
 ) -> Result<WriteFailure, WriteFailure> {
+    let internal_error = error.is_internal_error();
     if let V2Error::Http {
         status,
         ref token,
@@ -770,9 +778,18 @@ pub(super) fn record_failure(
             files::cleanup_staged_uploads(&operation.uploads);
             return Ok(WriteFailure::from_saved_refusal(output));
         }
-        let mut failure = unknown(operation, &error.to_string(), retry_after);
+        let detail = if internal_error {
+            format!("{}: {error}", operation.kind)
+        } else {
+            error.to_string()
+        };
+        let mut failure = unknown(operation, &detail, retry_after.filter(|_| !internal_error));
         if let Some(output) = failure.output.as_mut() {
             output["status"] = status.into();
+            if internal_error {
+                output["error"] = "internal_error".into();
+                output["retryable"] = false.into();
+            }
             if let Some(id) = request_id {
                 output["request_id"] = id.as_str().into();
             }
