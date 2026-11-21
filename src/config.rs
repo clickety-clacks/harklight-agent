@@ -46,6 +46,7 @@ struct ServerFile {
     address: String,
     name: String,
     port: u16,
+    device_port: Option<u16>,
     origin_port: Option<u16>,
     ca_sha256: String,
 }
@@ -115,7 +116,7 @@ impl EnrolledIdentity {
             directory: directory.to_path_buf(),
             address: server.address,
             name: server.name,
-            port: server.port,
+            port: server.device_port.unwrap_or(server.port),
             origin_port: server.origin_port,
             person_id: enrollment.person_id,
             device_id: enrollment.device_id,

@@ -95,14 +95,13 @@ struct EnrollmentContext {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ServerFile {
     address: String,
     name: String,
     port: u16,
     ca_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    origin_port: Option<u16>,
+    device_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,13 +213,13 @@ pub fn start(
     tls_name: Option<&str>,
     port: Option<&str>,
     label: Option<&str>,
-    origin_port: Option<u16>,
+    device_port: Option<u16>,
 ) -> Result<(), EnrollmentError> {
     let label = required(label, "--label")?;
-    if origin_port == Some(0) {
-        return Err(EnrollmentError::local("--origin-port must be nonzero"));
-    }
     let context = make_context(identity_dir, ca_file, connect, tls_name, port)?;
+    let device_port = device_port
+        .filter(|port| *port != 0)
+        .ok_or_else(|| EnrollmentError::local("provide --device-port for the enrolled API"))?;
 
     resolve_before_mutation(&context.endpoint)?;
     let transport = HttpsTransport::new(context.endpoint.clone(), &context.ca_pem)?;
@@ -230,7 +229,7 @@ pub fn start(
         name: context.endpoint.tls_name.clone(),
         port: context.endpoint.port,
         ca_sha256: context.ca_sha256.clone(),
-        origin_port,
+        device_port: Some(device_port),
     };
     write_json_private(&context.identity_dir, "server.json", &server)?;
 
