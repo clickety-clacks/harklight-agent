@@ -80,6 +80,17 @@ pub fn submit(
         uploads.clone(),
     ) {
         Ok(saved) => saved,
+        Err(JournalError::PendingRevision(key)) => {
+            files::cleanup_staged_uploads(&uploads);
+            let pending = journal
+                .operation(key)?
+                .ok_or(JournalError::MissingOperation(key))?;
+            return Err(writes::unknown(
+                &pending,
+                &format!("revision unresolved; retry operation {key}"),
+                None,
+            ));
+        }
         Err(error) => {
             files::cleanup_staged_uploads(&uploads);
             return Err(error.into());

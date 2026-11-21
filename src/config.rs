@@ -168,6 +168,13 @@ impl EnrolledIdentity {
 
     /// Build a client that uses only the enrolled CA and device certificate.
     pub fn device_client(&self) -> Result<Client, ConfigError> {
+        self.device_client_with_timeout(None)
+    }
+
+    pub(crate) fn device_client_with_timeout(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Client, ConfigError> {
         let mut identity_pem = self.certificate_pem.clone();
         if !identity_pem.ends_with(b"\n") {
             identity_pem.push(b'\n');
@@ -190,7 +197,7 @@ impl EnrolledIdentity {
             // Wait for the Server's answer or a real connection failure. The
             // blocking client otherwise abandons a working request after its
             // built-in default deadline.
-            .timeout(None)
+            .timeout(timeout)
             .build()?)
     }
 
