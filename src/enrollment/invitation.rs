@@ -298,6 +298,11 @@ impl SavedInvitation {
         let response = transport
             .post("/enroll", &payload)
             .map_err(|error| request_error(error, endpoint))?;
+        if response.status == 503 {
+            return Err(EnrollmentError::unknown(
+                "the Server cannot accept enrollment right now; keep this identity directory and run `harklight-agent enroll retry` later",
+            ));
+        }
         let response = parse_response(response, endpoint)?;
         match (
             response["status"].as_u64(),
@@ -311,11 +316,6 @@ impl SavedInvitation {
             (Some(404), Some("refused")) | (Some(410), Some("expired")) => {
                 return Err(EnrollmentError::refused(
                     "the Server refused this invitation; ask for a new one",
-                ));
-            }
-            (Some(503), Some("capacity" | "unavailable")) => {
-                return Err(EnrollmentError::refused(
-                    "the Server cannot accept enrollment right now; try the invitation again later",
                 ));
             }
             _ => {}

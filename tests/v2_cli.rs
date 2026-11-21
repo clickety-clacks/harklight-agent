@@ -509,6 +509,12 @@ fn enroll_accepts_v2_invitation_and_saves_its_device_endpoint() {
             body: String::new(),
             truncate: true,
         },
+        FixtureResponse {
+            status: "503 Service Unavailable",
+            headers: &[],
+            body: r#"{"error":"capacity"}"#.into(),
+            truncate: false,
+        },
         FixtureResponse::json(json!({"state":"pending","approval_code":"ABCDEFG234"})),
         FixtureResponse::json(
             json!({"state":"approved","person_id":"person","device_id":"device"}),
@@ -537,6 +543,13 @@ fn enroll_accepts_v2_invitation_and_saves_its_device_endpoint() {
         &["start", "--invitation", path.to_str().unwrap()],
     );
     assert_eq!(start.status.code(), Some(7), "{start:?}");
+    fs::remove_file(&path).unwrap();
+    let unavailable = enroll_invitation_cli(&identity, &["retry"]);
+    assert!(
+        identity.join("invitation-enrollment.json").is_file(),
+        "{unavailable:?}"
+    );
+    assert_eq!(unavailable.status.code(), Some(7), "{unavailable:?}");
     let retry = enroll_invitation_cli(&identity, &["retry"]);
     assert!(retry.status.success(), "{retry:?}");
     let saved: Value =
@@ -572,9 +585,11 @@ fn enroll_accepts_v2_invitation_and_saves_its_device_endpoint() {
     assert_eq!(first["status_secret"].as_str().unwrap().len(), 64);
     assert_eq!(requests[0].line, requests[1].line);
     assert_eq!(requests[0].body, requests[1].body);
-    assert_eq!(requests[2].line.trim_end(), "POST /enroll/status HTTP/1.1");
+    assert_eq!(requests[0].line, requests[2].line);
+    assert_eq!(requests[0].body, requests[2].body);
+    assert_eq!(requests[3].line.trim_end(), "POST /enroll/status HTTP/1.1");
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[2].body).unwrap(),
+        serde_json::from_slice::<Value>(&requests[3].body).unwrap(),
         json!({"status_secret":first["status_secret"]})
     );
 }
