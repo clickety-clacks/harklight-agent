@@ -72,6 +72,8 @@ pub enum FeedError {
     Api(#[from] V2Error),
     #[error(transparent)]
     Journal(#[from] JournalError),
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
     #[error("invalid agent change or cursor")]
     InvalidChange,
     #[error("invalid agent snapshot")]
@@ -109,14 +111,19 @@ impl AgentClient {
         serde_json::from_value(value).map_err(|_| FeedError::InvalidChange)
     }
 
-    fn open_changes(&self, session: Option<Uuid>, after: u64) -> Result<EventStream, FeedError> {
+    fn open_changes(
+        &self,
+        stream_client: &reqwest::blocking::Client,
+        session: Option<Uuid>,
+        after: u64,
+    ) -> Result<EventStream, FeedError> {
         let mut url = self.url(&["agent", "changes"])?;
         if let Some(session) = session {
             url.query_pairs_mut()
                 .append_pair("session", &session.to_string());
         }
         let response = self.send_checked(
-            self.client
+            stream_client
                 .get(url)
                 .header(ACCEPT, "text/event-stream")
                 .header("Last-Event-ID", after.to_string()),
@@ -210,6 +217,17 @@ pub fn run(
     mode: Mode,
     mut output: impl FnMut(&Value) -> io::Result<()>,
 ) -> Result<(), FeedError> {
+    // The blocking transport applies this timeout to each response read.
+    // Healthy feeds carry a heartbeat well within it.
+    let stream_client = if matches!(mode, Mode::Read) {
+        None
+    } else {
+        Some(
+            client
+                .identity
+                .device_client_with_timeout(Some(Duration::from_secs(60)))?,
+        )
+    };
     let scope = session.map(|id| id.to_string()).unwrap_or_default();
     let uses_journal = matches!(start, Start::Journal) && !matches!(mode, Mode::Focus);
     let saved = if uses_journal {
@@ -236,10 +254,6 @@ pub fn run(
             Some(rev) => rev,
             None => match baseline(client, session) {
                 Ok((rev, records)) => {
-                    if uses_journal {
-                        journal.record_v2_feed(&scope, checkpoint, rev, &records, true)?;
-                        checkpoint = Some(rev);
-                    }
                     emit_value(
                         &mut output,
                         json!({"kind":"baseline","rev":rev,"reason":baseline_reason}),
@@ -248,6 +262,10 @@ pub fn run(
                         emit_change(&mut output, change)?;
                     }
                     emit_value(&mut output, json!({"kind":"baseline_complete","rev":rev}))?;
+                    if uses_journal {
+                        journal.record_v2_feed(&scope, checkpoint, rev, &records, true)?;
+                        checkpoint = Some(rev);
+                    }
                     rev
                 }
                 Err(error) if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) => {
@@ -288,14 +306,14 @@ pub fn run(
             if batch.rev < start_position || (batch.more && batch.rev == start_position) {
                 return Err(FeedError::InvalidChange);
             }
-            if uses_journal {
-                journal.record_v2_feed(&scope, checkpoint, batch.rev, &batch.changes, false)?;
-                checkpoint = Some(batch.rev);
-            }
             if !focus_only {
                 for change in &batch.changes {
                     emit_change(&mut output, change)?;
                 }
+            }
+            if uses_journal {
+                journal.record_v2_feed(&scope, checkpoint, batch.rev, &batch.changes, false)?;
+                checkpoint = Some(batch.rev);
             }
             output_changes |= !batch.changes.is_empty();
             start_position = batch.rev;
@@ -312,7 +330,10 @@ pub fn run(
         if matches!(mode, Mode::Read) || (matches!(mode, Mode::Next) && output_changes) {
             return Ok(());
         }
-        let mut stream = match client.open_changes(session, start_position) {
+        let Some(stream_client) = &stream_client else {
+            return Ok(());
+        };
+        let mut stream = match client.open_changes(stream_client, session, start_position) {
             Ok(stream) => stream,
             Err(error) if cursor_expired(&error) => {
                 cursor = if focus_only {
@@ -336,6 +357,9 @@ pub fn run(
                     if change.rev <= start_position {
                         continue;
                     }
+                    if !focus_only {
+                        emit_change(&mut output, &change)?;
+                    }
                     if uses_journal {
                         journal.record_v2_feed(
                             &scope,
@@ -345,9 +369,6 @@ pub fn run(
                             false,
                         )?;
                         checkpoint = Some(change.rev);
-                    }
-                    if !focus_only {
-                        emit_change(&mut output, &change)?;
                     }
                     start_position = change.rev;
                     if matches!(mode, Mode::Next) {
@@ -758,5 +779,64 @@ mod tests {
         assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
         assert_eq!(output.last(), Some(&json!({"kind":"caught_up","rev":7})));
         assert!(server.requests()[1].line.contains("after=2"));
+    }
+    #[test]
+    fn default_checkpoint_does_not_advance_when_output_is_interrupted() {
+        let (_root, journal) = open();
+        let baseline =
+            SlowServer::sequence(vec![FixtureResponse::json(json!({"rev":40,"messages":[]}))]);
+        let error = run(
+            &client(&baseline),
+            &journal,
+            None,
+            Start::Journal,
+            Mode::Read,
+            |record| {
+                assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
+                if record["kind"] == "baseline_complete" {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, FeedError::Output(_)));
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
+        baseline.requests();
+
+        journal.record_v2_feed("", None, 40, &[], false).unwrap();
+        let live = SlowServer::sequence(vec![
+            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[("Content-Type", "text/event-stream")],
+                body: concat!(
+                    "id: 41\n",
+                    "event: entry\n",
+                    r#"data: {"entry_id":"entry","item_id":"item","rev":41}"#,
+                    "\n\n"
+                )
+                .into(),
+                truncate: false,
+            },
+        ]);
+        let error = run(
+            &client(&live),
+            &journal,
+            None,
+            Start::Journal,
+            Mode::Next,
+            |record| {
+                if record["kind"] == "entry" {
+                    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(40));
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, FeedError::Output(_)));
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(40));
+        live.requests();
     }
 }

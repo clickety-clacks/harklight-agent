@@ -18,6 +18,7 @@ pub struct AgentClient {
     base: Url,
     address: String,
     server_binding: String,
+    identity: EnrolledIdentity,
 }
 
 impl AgentClient {
@@ -28,7 +29,8 @@ impl AgentClient {
             client,
             base,
             server_binding: identity.server_binding(),
-            address: identity.address,
+            address: identity.address.clone(),
+            identity,
         })
     }
 
