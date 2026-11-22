@@ -517,6 +517,7 @@ dependencies = [
  "base64",
  "clap",
  "fs2",
+ "getrandom 0.4.3",
  "hex",
  "rcgen",
  "reqwest",

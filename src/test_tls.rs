@@ -144,7 +144,7 @@ impl SlowServer {
         let ca = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
         let server_key = KeyPair::generate().unwrap();
-        let server_cert = CertificateParams::new(vec![TLS_NAME.to_string()])
+        let server_cert = CertificateParams::new(vec![TLS_NAME.to_string(), "localhost".into()])
             .unwrap()
             .signed_by(&server_key, &ca)
             .unwrap();
