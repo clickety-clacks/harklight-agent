@@ -1,5 +1,20 @@
 # Release notes
 
+## 0.2.0
+
+- Move enrolled Agent operations to the v2 API over mutual TLS. Agent requests and feeds use `/v2/agent`. Shared file operations use `/v2/files`. Use `--device-port` or `HARKLIGHT_DEVICE_PORT` to select the device API port for an existing identity.
+- Use `read` for a single catch-up, `listen --follow` for continuous updates, or `listen --next` to wait for durable changes. The old listener lease and exit 6 are removed, along with `attach`, `reconnect`, `cover`, standalone `status`, `ack`, and `ack2`.
+- Use Server item IDs for messages and conditional revisions, and entry IDs to correlate replies. Migrated messages can still be resolved by sender and legacy message ID.
+- `progress` preserves existing attachments. `revise` keeps them when the file list is omitted and can explicitly replace or clear them.
+- `file-upload` returns an upload handle for writes and discard. `file-get` uses the download ID from a message or entry.
+- Prepared sends stage files and save an immutable intent locally. `retry` reuses the saved request bytes, operation key, and revision precondition. `abandon` releases an unresolved local operation. The Server may already have applied it.
+- Exit 0 means success, 1 a local input, configuration, journal, or read failure, 2 a definite refusal, 5 an unsupported operation, and 7 an unknown write outcome or retryable write.
+- A batch `500 internal_error` or an SSE close with reason `internal_error` pauses the feed at its last completed position and reports the Request-Id. Resume with a new invocation. A journaled write that receives this error remains unresolved under its original operation key and reports `retryable: false`. Replay requires an explicit retry.
+
+**Upgrading from 0.1.** Finish unresolved 0.1 sends with the 0.1 CLI before switching, or use Agent 0.1.16 to abandon them with `abandon --op-id KEY`. Abandon only changes local state and cannot undo an applied send. Agent 0.2 retains prepared and unknown 0.1 journal rows without migrating or sending them, and `retry --op-id` on those rows exits 1 before any HTTP request with “operation belongs to the earlier protocol.” If the Server still retains a manual pending enrollment, its `pending.json` remains readable, including numeric deadlines, so use `enroll status` or `enroll retry` with the same directory, CA, and original enrollment endpoint, also supplying the original label for retry, then configure the device port separately. Reissue unused v1 invitations and start the feed with a fresh baseline, because Agent 0.2 ignores old feed cursors and you should never pass a 0.1 cursor to `--after`.
+
+Compatibility: protocol 0.2 (new, supersedes 0.1). Requires a Server that serves the v2 Agent API.
+
 ## 0.1.16
 
 - Make existing identity directories and key files private automatically when permissions are too broad. Report an error if the permissions cannot be changed.

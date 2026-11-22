@@ -167,13 +167,13 @@ mod tests {
             .build()
             .unwrap();
         let source = client
-            .post("http://harklight.example/origin/v1")
+            .post("http://harklight.example/v2/me")
             .body("request")
             .send()
             .unwrap_err();
         assert!(source.is_connect());
 
-        let error = crate::api::ApiError::TransportAddress {
+        let error = crate::v2::V2Error::Transport {
             address: "no-such-name.invalid".into(),
             source,
         };
