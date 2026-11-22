@@ -46,7 +46,8 @@ struct ServerFile {
     address: String,
     name: String,
     port: u16,
-    origin_port: Option<u16>,
+    device_port: Option<u16>,
+    device_url: Option<String>,
     ca_sha256: String,
 }
 
@@ -64,7 +65,6 @@ pub struct EnrolledIdentity {
     pub address: String,
     pub name: String,
     pub port: u16,
-    pub origin_port: Option<u16>,
     pub person_id: Option<String>,
     pub device_id: String,
     pub ca_file: PathBuf,
@@ -111,12 +111,23 @@ impl EnrolledIdentity {
             return Err(ConfigError::CaMismatch);
         }
 
+        let (address, name) = match server.device_url {
+            Some(device_url) => {
+                let url = Url::parse(&device_url)
+                    .map_err(|_| ConfigError::Invalid("invalid saved device_url".into()))?;
+                let host = url
+                    .host_str()
+                    .ok_or_else(|| ConfigError::Invalid("invalid saved device_url".into()))?
+                    .to_owned();
+                (host.clone(), host)
+            }
+            None => (server.address, server.name),
+        };
         Ok(Self {
             directory: directory.to_path_buf(),
-            address: server.address,
-            name: server.name,
-            port: server.port,
-            origin_port: server.origin_port,
+            address,
+            name,
+            port: server.device_port.unwrap_or(server.port),
             person_id: enrollment.person_id,
             device_id: enrollment.device_id,
             ca_file: ca_file.to_path_buf(),
@@ -139,7 +150,6 @@ impl EnrolledIdentity {
             address: address.into(),
             name: name.into(),
             port,
-            origin_port: Some(port),
             person_id: None,
             device_id: "device".into(),
             ca_file: PathBuf::new(),
@@ -149,23 +159,35 @@ impl EnrolledIdentity {
         }
     }
 
-    pub fn resolve_origin_port(&self, override_port: Option<u16>) -> Result<u16, ConfigError> {
-        let port = override_port.or(self.origin_port).ok_or_else(|| {
-            ConfigError::Invalid(
-                "origin HTTPS port is not configured; provide --origin-port from the server endpoint configuration".into(),
-            )
-        })?;
-        if port == 0 {
-            return Err(ConfigError::Invalid(
-                "origin HTTPS port must be nonzero".into(),
-            ));
-        }
-        Ok(port)
+    #[cfg(test)]
+    pub(crate) fn with_test_identity(mut self, identity: crate::test_tls::TestIdentity) -> Self {
+        self.certificate_pem = identity.certificate;
+        self.key_pem = identity.key;
+        self
+    }
+
+    pub(crate) fn server_binding(&self) -> String {
+        let ca = hex::encode(Sha256::digest(&self.ca_pem));
+        let identity = (
+            self.name.as_str(),
+            self.port,
+            ca,
+            self.device_id.as_str(),
+            self.person_id.as_deref(),
+        );
+        let bytes = serde_json::to_vec(&identity).expect("server identity serializes");
+        hex::encode(Sha256::digest(bytes))
     }
 
     /// Build a client that uses only the enrolled CA and device certificate.
-    /// The endpoint route and port are supplied by the confirmed server wire.
-    pub fn client_for_port(&self, _port: u16) -> Result<Client, ConfigError> {
+    pub fn device_client(&self) -> Result<Client, ConfigError> {
+        self.device_client_with_timeout(None)
+    }
+
+    pub(crate) fn device_client_with_timeout(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Client, ConfigError> {
         let mut identity_pem = self.certificate_pem.clone();
         if !identity_pem.ends_with(b"\n") {
             identity_pem.push(b'\n');
@@ -185,21 +207,23 @@ impl EnrolledIdentity {
             .tls_version_min(reqwest::tls::Version::TLS_1_3)
             .tls_version_max(reqwest::tls::Version::TLS_1_3)
             .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
             // Wait for the Server's answer or a real connection failure. The
             // blocking client otherwise abandons a working request after its
             // built-in default deadline.
-            .timeout(None)
+            .timeout(timeout)
             .build()?)
     }
 
     /// Create a URL using the enrolled certificate name while resolving it to
-    /// the enrolled address. A server-provided port is explicit because the
-    /// origin listener may differ from the relay listener in server.json.
-    pub fn origin_url(&self, port: u16, path: &str) -> Result<Url, ConfigError> {
+    /// the enrolled address.
+    pub fn device_url(&self, path: &str) -> Result<Url, ConfigError> {
         if !path.starts_with('/') || path.starts_with("//") {
-            return Err(ConfigError::Invalid("origin path must be absolute".into()));
+            return Err(ConfigError::Invalid(
+                "device API path must be absolute".into(),
+            ));
         }
-        let mut url = Url::parse(&format!("https://{}:{port}{path}", self.name))
+        let mut url = Url::parse(&format!("https://{}:{}{path}", self.name, self.port))
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         url.set_fragment(None);
         Ok(url)
@@ -281,7 +305,7 @@ mod tests {
         fs::write(
             identity.join("server.json"),
             format!(
-                r#"{{"address":"127.0.0.1","name":"example.test","port":18444,"origin_port":null,"ca_sha256":"{ca_hash}"}}"#
+                r#"{{"address":"127.0.0.1","name":"example.test","port":18444,"ca_sha256":"{ca_hash}"}}"#
             ),
         )
         .unwrap();

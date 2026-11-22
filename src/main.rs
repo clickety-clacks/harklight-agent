@@ -4,8 +4,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use harklight_agent::{
-    commands::{self, CommandContext, MessageFieldOptions, ProgressReport},
+    commands::{self, MessageFieldOptions, ProgressReport},
+    config::{EnrolledIdentity, default_state_root},
     enrollment,
+    journal::JournalStore,
+    v2::{AgentClient, V2Error, feed, mutations, sends, writes},
 };
 
 #[derive(Debug, Parser)]
@@ -19,8 +22,9 @@ struct Cli {
     identity_dir: Option<PathBuf>,
     #[arg(long, global = true, env = "HARKLIGHT_CA_FILE")]
     ca_file: Option<PathBuf>,
-    #[arg(long, global = true, env = "HARKLIGHT_ORIGIN_PORT")]
-    origin_port: Option<u16>,
+    /// Device API port, separate from the enrollment endpoint.
+    #[arg(long, global = true, env = "HARKLIGHT_DEVICE_PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    device_port: Option<u16>,
     #[arg(long, global = true, env = "HARKLIGHT_AGENT_STATE_DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -34,10 +38,10 @@ enum Command {
         action: EnrollCommand,
     },
     #[command(
-        after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --route claude-code --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
+        after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
     )]
     Send {
-        #[arg(long, value_name = "UUID|new", required_unless_present = "execute")]
+        #[arg(long, value_name = "UUID|new")]
         session: Option<String>,
         #[arg(long, required_unless_present = "execute")]
         sender_id: Option<String>,
@@ -78,6 +82,9 @@ enum Command {
         reply: bool,
         #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
         supersedes: Vec<String>,
+        /// Resolve a same-sender local reference before sending.
+        #[arg(long = "supersedes-local")]
+        supersedes_local: Vec<String>,
         #[arg(long, help = "RFC 3339 time by which this matters")]
         by_when: Option<String>,
         #[arg(long)]
@@ -90,14 +97,6 @@ enum Command {
         default_at: Option<String>,
         #[arg(long = "choice-style", action = clap::ArgAction::Append)]
         choice_styles: Vec<String>,
-        #[arg(long)]
-        vendor_session_id: Option<String>,
-        #[arg(long, value_enum)]
-        route: Option<Route>,
-        #[arg(long)]
-        controller: bool,
-        #[arg(long)]
-        origin_listener: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
         #[arg(
@@ -130,7 +129,12 @@ enum Command {
         progress_note: Option<String>,
         #[arg(long, conflicts_with = "execute")]
         prepare: bool,
-        #[arg(long, conflicts_with = "prepare")]
+        #[arg(long, requires = "op_id", conflicts_with_all = [
+            "prepare", "session", "sender_id", "display_name", "title", "body", "choices",
+            "message_type", "message_kind", "importance", "reply", "supersedes", "supersedes_local", "by_when",
+            "stake", "thread", "default_choice", "default_at", "choice_styles", "files",
+            "answer_ui_file", "progress", "progress_stage", "progress_note"
+        ])]
         execute: bool,
         #[arg(long)]
         op_id: Option<Uuid>,
@@ -153,55 +157,41 @@ enum Command {
         stage: String,
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
+        /// Resolve the request as a pre-cut-over message belonging to this sender.
+        #[arg(long)]
+        sender_id: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Attach {
-        #[arg(long)]
-        session: Uuid,
-        #[arg(long, value_name = "ID|none")]
-        vendor_session_id: String,
-        #[arg(long, value_enum)]
-        route: Route,
-        #[arg(long)]
-        controller: bool,
-        #[arg(long)]
-        origin_listener: bool,
-        #[arg(
-            long,
-            help = "Declare that this controller sends system ACK2 for this handle"
-        )]
-        ack2: bool,
-    },
-    /// Replace this existing origin handle's transport and resume its saved feed.
-    Reconnect {
-        #[arg(long)]
-        session: Uuid,
-        #[arg(long, value_name = "ID|none", requires = "route")]
-        vendor_session_id: Option<String>,
-        #[arg(long, value_enum, requires = "vendor_session_id")]
-        route: Option<Route>,
-        #[arg(long, requires = "route")]
-        controller: bool,
-    },
     Listen(ListenArgs),
-    /// Move an existing supported route-other handle under the origin listener.
-    Cover {
-        #[arg(long)]
-        session: Uuid,
-    },
-    Read {
-        #[arg(long)]
-        session: Uuid,
-    },
-    /// Read one of this origin's messages from the authoritative Server state.
+    Read(FeedArgs),
+    /// Read an authoritative sent message and its file references.
+    #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "sender_id"])))]
     MessageGet {
         #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        message_id: String,
-        #[arg(long)]
+        item_id: Option<String>,
+        #[arg(long, requires = "message_id")]
+        sender_id: Option<String>,
+        #[arg(long, requires = "sender_id")]
+        message_id: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         revision: Option<u64>,
+    },
+    /// List sent messages, newest first.
+    Messages {
+        #[arg(long)]
+        session: Option<Uuid>,
+        #[arg(long)]
+        page: Option<String>,
+    },
+    /// Read a page of entries for a sent message.
+    MessageEntries {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
     },
     /// Read the latest reported focus, or follow focus changes.
     Focus {
@@ -211,63 +201,50 @@ enum Command {
     /// Ask a Harklight client to open a message or its chat.
     Show {
         #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        message_id: String,
+        item_id: String,
         #[arg(long)]
         chat: bool,
-        #[arg(long, conflicts_with = "client")]
+        #[arg(long, conflicts_with = "device_id")]
         device: Option<String>,
-        #[arg(long, conflicts_with = "device")]
-        client: Option<String>,
+        #[arg(long)]
+        device_id: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
-    Ack {
+    /// Acknowledge an advisory delivered on the change feed.
+    AdvisoryAck {
         #[arg(long)]
-        session: Uuid,
-        #[arg(
-            long,
-            required_unless_present = "advisory",
-            conflicts_with = "advisory"
-        )]
-        event: Option<String>,
-        #[arg(long, required_unless_present = "event", conflicts_with = "event")]
-        advisory: Option<Uuid>,
+        item_id: String,
+        #[arg(long)]
+        advisory_id: String,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
-    #[command(
-        about = "Record a receiving-system ACK2 outcome for a person entry",
-        after_help = "This system-level processing receipt is separate from the agent Seen command `ack`. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same saved operation key."
-    )]
-    Ack2 {
+    /// Report handoff of an answer or a person chat entry.
+    Receipt {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        event: String,
-        #[arg(
-            long,
-            help = "Human-readable name of the agent that received the entry"
-        )]
+        entry_id: Option<String>,
+        #[arg(long)]
         agent: Option<String>,
         #[arg(long, conflicts_with = "not_handed")]
         rerouted: bool,
-        #[arg(
-            long = "not-handed",
-            value_name = "REASON",
-            num_args = 0..=1,
-            default_missing_value = "",
-            conflicts_with = "rerouted"
-        )]
+        #[arg(long, value_name = "REASON")]
         not_handed: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
     Reply {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        request: String,
+        in_reply_to: Option<String>,
         #[arg(long)]
-        in_reply_to: String,
-        #[arg(long)]
-        body: String,
-        #[arg(long = "file", action = clap::ArgAction::Append)]
+        body: Option<String>,
+        #[arg(long = "file-id")]
+        file_ids: Vec<String>,
+        #[arg(long = "file")]
         files: Vec<PathBuf>,
         #[arg(long)]
         op_id: Option<Uuid>,
@@ -277,13 +254,17 @@ enum Command {
     )]
     Revise {
         #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
-        #[arg(long)]
+        item_id: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         base_revision: u64,
-        #[arg(long)]
-        title: String,
+        #[arg(long, required_unless_present = "message_json")]
+        title: Option<String>,
+        #[arg(long, conflicts_with_all = [
+            "title", "body", "choices", "clear_choices", "message_type", "message_kind",
+            "reply", "importance", "by_when", "stake", "default_choice", "default_at",
+            "clear_default", "choice_styles"
+        ])]
+        message_json: Option<PathBuf>,
         #[arg(long)]
         body: Option<String>,
         #[arg(long = "choice", action = clap::ArgAction::Append)]
@@ -323,52 +304,56 @@ enum Command {
         choice_styles: Vec<String>,
         #[arg(long)]
         in_reply_to: Option<String>,
+        #[arg(long = "file-id")]
+        file_ids: Vec<String>,
+        #[arg(long, conflicts_with_all = ["file_ids","files"])]
+        clear_files: bool,
         #[arg(long = "file", action = clap::ArgAction::Append)]
         files: Vec<PathBuf>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Withdraw {
+    Retract {
         #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
+        item_id: String,
         #[arg(long)]
         in_reply_to: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Retract {
+    Lifecycle {
         #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
+        item_id: String,
+        #[arg(long, value_enum)]
+        action: LifecycleAction,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
     Result {
         #[arg(long)]
-        session: Uuid,
-        #[arg(long)]
-        request: String,
-        #[arg(long)]
-        in_reply_to: String,
+        item_id: String,
         #[arg(long, value_enum)]
         status: ResultStatus,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
-    Status {
+    /// Upload a file for use in a message or reply.
+    FileUpload {
         #[arg(long)]
-        session: Uuid,
+        file: PathBuf,
+        #[arg(long)]
+        op_id: Option<Uuid>,
+    },
+    /// Verify and save a file from a message or chat entry.
+    FileGet {
+        #[arg(long)]
+        file_id: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     DiscardUploads {
         #[arg(long)]
-        sender_id: String,
-        #[arg(long)]
-        message_id: String,
-        #[arg(long)]
-        revision: u64,
+        file_id: String,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -379,7 +364,11 @@ enum Command {
     Retry {
         #[arg(long)]
         op_id: Uuid,
+        #[arg(long)]
+        journal_id: Option<Uuid>,
     },
+    /// Print the persistent ID of this operation journal.
+    JournalId,
     #[command(
         about = "Give up an operation stuck with an unknown outcome",
         after_help = "Marks the unresolved operation abandoned so it stops blocking new operations for its request. The Server may or may not have applied it. An abandoned operation can no longer be retried; a committed or refused operation cannot be abandoned."
@@ -388,31 +377,40 @@ enum Command {
         #[arg(long)]
         op_id: Uuid,
     },
-    #[command(group(
-        ArgGroup::new("file-use-result")
-            .required(true)
-            .multiple(false)
-            .args(["used", "unusable"])
-    ))]
+    /// Report an attachment transfer, use, or both.
+    #[command(group(ArgGroup::new("file-outcome").required(true).multiple(true)
+        .args(["used","unusable","transferred","not_transferred"])))]
     FileUse {
         #[arg(long)]
-        session: Uuid,
+        item_id: String,
         #[arg(long)]
-        event: String,
+        entry_id: String,
         #[arg(long)]
-        file: String,
-        #[arg(long, group = "file-use-result")]
+        file_id: String,
+        #[arg(long, conflicts_with = "unusable")]
         used: bool,
-        #[arg(long, group = "file-use-result")]
+        #[arg(long, requires = "reason")]
         unusable: bool,
+        #[arg(long, conflicts_with = "not_transferred")]
+        transferred: bool,
+        #[arg(long, requires = "reason")]
+        not_transferred: bool,
         #[arg(long)]
         reason: Option<String>,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum EnrollCommand {
-    Start(EnrollStartArgs),
+    Start {
+        #[command(flatten)]
+        manual: EnrollStartArgs,
+        /// Private JSON invitation file or file containing a native join link.
+        #[arg(long, conflicts_with_all = ["connect", "name", "port"])]
+        invitation: Option<PathBuf>,
+    },
     Retry(EnrollStartArgs),
     Status(EnrollStatusArgs),
 }
@@ -442,29 +440,24 @@ struct EnrollStatusArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("mode").required(true).multiple(false).args(["follow", "next"]))) ]
-struct ListenArgs {
-    #[arg(long, required_unless_present = "origin", conflicts_with = "origin")]
+struct FeedArgs {
+    #[arg(long)]
     session: Option<Uuid>,
-    #[arg(long, requires = "follow", conflicts_with_all = ["next", "controller", "ack2", "session"])]
-    origin: bool,
-    #[arg(long, value_enum)]
-    session_context: Option<SessionContext>,
+    #[arg(long, conflicts_with = "snapshot")]
+    after: Option<u64>,
     #[arg(long)]
-    claude_code_version: Option<String>,
+    snapshot: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("mode").required(true).args(["follow","next"])))]
+struct ListenArgs {
+    #[command(flatten)]
+    feed: FeedArgs,
     #[arg(long)]
-    background_tasks_enabled: bool,
-    #[arg(long, group = "mode")]
     follow: bool,
-    #[arg(long, group = "mode")]
-    next: bool,
     #[arg(long)]
-    controller: bool,
-    #[arg(
-        long,
-        help = "Declare that this controller sends system ACK2 for this handle"
-    )]
-    ack2: bool,
+    next: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -472,24 +465,28 @@ enum SessionCommand {
     End {
         #[arg(long)]
         session: Uuid,
-        #[arg(long, required = true)]
-        gone: bool,
+        #[arg(long)]
+        op_id: Option<Uuid>,
     },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum Route {
-    ClaudeCode,
-    Codex,
-    Other,
+enum LifecycleAction {
+    Answered,
+    Cleared,
+    Expired,
+    Superseded,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SessionContext {
-    Interactive,
-    Bare,
-    Print,
-    Sdk,
+impl LifecycleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Cleared => "cleared",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -513,14 +510,25 @@ fn main() {
     let cli = Cli::parse();
     if let Command::Enroll { action } = &cli.command {
         let result = match action {
-            EnrollCommand::Start(args) => enrollment::start(
+            EnrollCommand::Start {
+                manual,
+                invitation: Some(path),
+            } => enrollment::start_invitation(
+                cli.identity_dir.as_deref(),
+                path,
+                manual.label.as_deref(),
+            ),
+            EnrollCommand::Start {
+                manual: args,
+                invitation: None,
+            } => enrollment::start(
                 cli.identity_dir.as_deref(),
                 cli.ca_file.as_deref(),
                 args.endpoint.connect.as_deref(),
                 args.endpoint.name.as_deref(),
                 args.endpoint.port.as_deref(),
                 args.label.as_deref(),
-                cli.origin_port,
+                cli.device_port,
             ),
             EnrollCommand::Retry(args) => enrollment::retry(
                 cli.identity_dir.as_deref(),
@@ -544,38 +552,229 @@ fn main() {
         return;
     }
 
-    let context = match CommandContext::load(
-        cli.identity_dir.as_deref(),
-        cli.ca_file.as_deref(),
-        cli.origin_port,
-        cli.state_dir.as_deref(),
-    ) {
-        Ok(context) => context,
-        Err(error) => {
-            if let Command::Reconnect { session, .. } = &cli.command {
-                let safe = commands::reconnect_configuration_error(*session, "reconnect");
-                fail(safe.message, safe.exit_code);
-            }
-            if let Command::Attach {
-                session,
-                controller: true,
-                ..
-            } = &cli.command
-            {
-                let safe = commands::reconnect_configuration_error(*session, "attach");
-                fail(safe.message, safe.exit_code);
-            }
-            fail(error.to_string(), 1)
-        }
-    };
+    match &cli.command {
+        Command::Read(args) => run_device_feed(&cli, Some(args), feed::Mode::Read),
+        Command::Listen(args) => run_device_feed(
+            &cli,
+            Some(&args.feed),
+            if args.next {
+                feed::Mode::Next
+            } else {
+                feed::Mode::Follow
+            },
+        ),
+        Command::Focus { follow: true } => run_device_feed(&cli, None, feed::Mode::Focus),
+        Command::MessageGet { .. }
+        | Command::Messages { .. }
+        | Command::MessageEntries { .. }
+        | Command::FileGet { .. }
+        | Command::Focus { follow: false } => run_device_read(&cli),
+        _ => run_device_write(&cli),
+    }
+}
 
-    let result = match cli.command {
-        Command::Enroll { .. } => unreachable!("enroll was dispatched before loading an identity"),
+fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
+    use std::io::{self, Write};
+
+    let identity = device_identity(cli);
+    let journal = device_journal(cli, &identity.device_id);
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let session = args.and_then(|args| args.session);
+    let start = match args {
+        Some(FeedArgs {
+            after: Some(rev), ..
+        }) => feed::Start::After(*rev),
+        Some(FeedArgs { snapshot: true, .. }) => feed::Start::Snapshot,
+        _ => feed::Start::Journal,
+    };
+    let failure_context = match mode {
+        feed::Mode::Read => "read",
+        feed::Mode::Focus => "focus: live updates paused",
+        feed::Mode::Follow | feed::Mode::Next => "listen: live updates paused",
+    };
+    let mut stdout = io::stdout().lock();
+    let result = feed::run(&client, &journal, session, start, mode, |value| {
+        writeln!(stdout, "{value}")?;
+        stdout.flush()
+    });
+    if let Err(error) = result {
+        if error.is_internal_error() {
+            fail(format!("{failure_context}: {error}"), error.exit_code());
+        }
+        fail(error.to_string(), error.exit_code());
+    }
+}
+
+fn device_identity(cli: &Cli) -> EnrolledIdentity {
+    let identity_dir = cli
+        .identity_dir
+        .as_deref()
+        .unwrap_or_else(|| fail("provide --identity-dir or HARKLIGHT_IDENTITY_DIR".into(), 1));
+    let invitation_ca = identity_dir.join("invitation-ca.pem");
+    let ca_file = cli
+        .ca_file
+        .as_deref()
+        .or_else(|| invitation_ca.is_file().then_some(invitation_ca.as_path()))
+        .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
+    let mut identity = EnrolledIdentity::load(identity_dir, ca_file)
+        .unwrap_or_else(|error| fail(error.to_string(), 1));
+    if let Some(device_port) = cli.device_port {
+        identity.port = device_port;
+    }
+    identity
+}
+
+fn run_device_read(cli: &Cli) {
+    let identity = device_identity(cli);
+    let device_id = identity.device_id.clone();
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let (operation, result) = match &cli.command {
+        Command::MessageGet {
+            item_id: Some(id),
+            revision,
+            ..
+        } => ("message-get", read_message_revision(&client, id, *revision)),
+        Command::MessageGet {
+            sender_id: Some(sender),
+            message_id: Some(id),
+            revision,
+            ..
+        } => {
+            let journal = device_journal(cli, &device_id);
+            let cached = journal
+                .v2_item_id(sender, id)
+                .unwrap_or_else(|error| fail(error.to_string(), 1));
+            let result = client
+                .resolve_legacy_message(sender, id, cached.as_deref())
+                .and_then(|message| {
+                    let item_id = message["message"]["item_id"]
+                        .as_str()
+                        .ok_or(V2Error::InvalidResponse { request_id: None })?;
+                    if cached.is_none() {
+                        journal
+                            .remember_v2_item(sender, id, item_id)
+                            .unwrap_or_else(|error| fail(error.to_string(), 1));
+                    }
+                    match revision {
+                        Some(revision) => client.message_revision(item_id, *revision),
+                        None => Ok(message),
+                    }
+                });
+            ("message-get", result)
+        }
+        Command::Messages { session, page } => {
+            ("messages", client.messages(*session, page.as_deref()))
+        }
+        Command::MessageEntries {
+            item_id,
+            before,
+            limit,
+        } => (
+            "message-entries",
+            client.message_entries(item_id, before.as_deref(), *limit),
+        ),
+        Command::FileGet { file_id, output } => (
+            "file-get",
+            client.download_file(file_id).map(|mut file| {
+                file.save(output).unwrap_or_else(|error| fail(error, 1));
+                serde_json::json!({
+                    "kind":"file_saved","file_id":file_id,
+                    "size":file.size,"sha256":file.sha256,"path":output,
+                })
+            }),
+        ),
+        Command::Focus { follow: false } => ("focus", client.read(&["agent", "focus"], &[])),
+        _ => unreachable!("clap requires a complete message selector"),
+    };
+    match result {
+        Ok(response) => println!("{response}"),
+        Err(error @ V2Error::Http { status, .. }) if (400..500).contains(&status) => {
+            if let V2Error::Http {
+                ref token,
+                ref field,
+                ref request_id,
+                ..
+            } = error
+            {
+                let mut output = serde_json::json!({
+                    "kind":"refused", "operation":operation, "status":status, "error":token,
+                });
+                if let Some(field) = field {
+                    output["field"] = field.as_str().into();
+                }
+                if let Some(request_id) = request_id {
+                    output["request_id"] = request_id.as_str().into();
+                }
+                println!("{output}");
+            }
+            let exit = match &error {
+                V2Error::Http {
+                    token: Some(token), ..
+                } if token == "unsupported" => 5,
+                _ => commands::EXIT_REFUSED,
+            };
+            fail(error.to_string(), exit)
+        }
+        Err(error) if error.is_internal_error() => fail(format!("{operation}: {error}"), 1),
+        Err(error) => fail(error.to_string(), 1),
+    }
+}
+
+fn read_message_revision(
+    client: &AgentClient,
+    item_id: &str,
+    revision: Option<u64>,
+) -> Result<serde_json::Value, V2Error> {
+    revision.map_or_else(
+        || client.message(item_id),
+        |rev| client.message_revision(item_id, rev),
+    )
+}
+
+fn device_journal(cli: &Cli, device_id: &str) -> JournalStore {
+    try_device_journal(cli, device_id).unwrap_or_else(|error| fail(error, 1))
+}
+
+fn try_device_journal(cli: &Cli, device_id: &str) -> Result<JournalStore, String> {
+    let state_root = cli
+        .state_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_state_root)
+        .map_err(|error| error.to_string())?;
+    JournalStore::open(&state_root, device_id, Uuid::nil()).map_err(|error| error.to_string())
+}
+
+fn run_device_write(cli: &Cli) {
+    use writes::ControlWrite;
+
+    let identity = device_identity(cli);
+    let mut journal = match try_device_journal(cli, &identity.device_id) {
+        Ok(journal) => journal,
+        Err(detail) => match &cli.command {
+            Command::Retry { op_id, journal_id } => {
+                let expected = journal_id.map(|id| id.to_string());
+                write_failure(writes::unavailable_retry(
+                    *op_id,
+                    expected.as_deref(),
+                    &detail,
+                ))
+            }
+            _ => fail(detail, 1),
+        },
+    };
+    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let result = match &cli.command {
+        Command::Send {
+            execute: true,
+            op_id: Some(key),
+            ..
+        } => sends::execute(&client, &mut journal, *key),
         Command::Send {
             session,
-            sender_id,
+            sender_id: Some(sender),
             display_name,
-            title,
+            title: Some(title),
             body,
             choices,
             message_type,
@@ -583,178 +782,120 @@ fn main() {
             importance,
             reply,
             supersedes,
+            supersedes_local,
             by_when,
             stake,
             thread,
             default_choice,
             default_at,
             choice_styles,
-            vendor_session_id,
-            route,
-            controller,
-            origin_listener,
             files,
             answer_ui_file,
             progress,
             progress_stage,
             progress_note,
             prepare,
-            execute,
             op_id,
+            ..
         } => {
-            let progress = match (progress, progress_stage) {
-                (Some(percent), Some(stage)) => Some(ProgressReport {
+            let progress = progress
+                .zip(progress_stage.as_ref())
+                .map(|(percent, stage)| ProgressReport {
                     percent,
-                    stage,
-                    note: progress_note,
-                }),
-                _ => None,
+                    stage: stage.clone(),
+                    note: progress_note.clone(),
+                });
+            let fields = MessageFieldOptions {
+                message_type: message_type
+                    .clone()
+                    .or_else(|| progress.as_ref().map(|_| "fyi".into())),
+                message_kind: message_kind.clone(),
+                reply: *reply,
+                importance: importance.clone(),
+                by_when: by_when.clone(),
+                stake: stake.clone(),
+                thread: thread.clone(),
+                display_name: display_name.clone(),
+                default_choice: default_choice.clone(),
+                default_at: default_at.clone(),
+                choice_styles: choice_styles.clone(),
+                progress,
+                ..MessageFieldOptions::default()
             };
-            let message_type = if progress.is_some() && message_type.is_none() {
-                Some("fyi".to_string())
-            } else {
-                message_type
-            };
-            commands::send_command_with_answer_ui_file(
-                &context,
-                session.as_deref(),
-                sender_id.as_deref(),
-                title.as_deref(),
-                body.as_deref(),
-                &choices,
-                &supersedes,
-                vendor_session_id.as_deref(),
-                route.map(Into::into),
-                controller,
-                &files,
-                prepare,
-                execute,
-                op_id,
-                &MessageFieldOptions {
-                    origin_listener,
-                    message_type,
-                    message_kind,
-                    reply,
-                    importance,
-                    by_when,
-                    stake,
-                    thread,
-                    display_name,
-                    default_choice,
-                    default_at,
-                    choice_styles,
-                    clear_default: false,
-                    answer_ui: None,
-                    progress,
+            sends::send(
+                &client,
+                &mut journal,
+                &sends::SendInput {
+                    session: session.as_deref(),
+                    sender,
+                    title,
+                    body: body.as_deref(),
+                    choices,
+                    supersedes,
+                    supersedes_local,
+                    files,
+                    fields: &fields,
+                    answer_ui: answer_ui_file.as_deref(),
                 },
-                answer_ui_file.as_deref(),
+                *op_id,
+                *prepare,
             )
         }
-        Command::Attach {
-            session,
-            vendor_session_id,
-            route,
-            controller,
-            origin_listener,
-            ack2,
-        } => commands::attach_with_origin(
-            &context,
-            session,
-            &vendor_session_id,
-            route.into(),
-            controller,
-            ack2,
-            origin_listener,
-        ),
-        Command::Reconnect {
-            session,
-            vendor_session_id,
-            route,
-            controller,
-        } => commands::reconnect(
-            &context,
-            session,
-            vendor_session_id.as_deref(),
-            route.map(Into::into),
-            controller,
-        ),
-        Command::Cover { session } => commands::cover(&context, session),
-        Command::Listen(args) if args.origin => commands::listen_origin(&context),
-        Command::Listen(args) => commands::listen(
-            &context,
-            args.session.expect("session required without --origin"),
-            args.session_context.map(Into::into),
-            args.claude_code_version.as_deref(),
-            args.background_tasks_enabled,
-            args.follow,
-            args.controller,
-            args.ack2,
-        ),
-        Command::Read { session } => commands::read(&context, session),
-        Command::MessageGet {
-            sender_id,
-            message_id,
-            revision,
-        } => commands::message_get(&context, &sender_id, &message_id, revision),
-        Command::Focus { follow } => commands::focus(&context, follow),
-        Command::Show {
-            sender_id,
-            message_id,
-            chat,
-            device,
-            client,
-        } => commands::show(
-            &context,
-            &sender_id,
-            &message_id,
-            chat,
-            device.as_deref(),
-            client.as_deref(),
-        ),
-        Command::Ack {
-            session,
-            event,
-            advisory,
-        } => match (event, advisory) {
-            (Some(event), None) => commands::ack(&context, session, &event),
-            (None, Some(advisory)) => commands::ack_advisory(&context, session, advisory),
-            _ => unreachable!("clap requires exactly one acknowledgment target"),
-        },
-        Command::Ack2 {
-            session,
-            event,
-            agent,
-            rerouted,
-            not_handed,
-        } => commands::ack2(
-            &context,
-            session,
-            &event,
-            agent.as_deref(),
-            rerouted,
-            not_handed.as_deref(),
-        ),
         Command::Reply {
-            session,
-            request,
+            item_id,
             in_reply_to,
             body,
+            file_ids,
             files,
             op_id,
-        } => commands::reply(
-            &context,
-            session,
-            &request,
-            &in_reply_to,
-            &body,
-            &files,
-            op_id,
+        } => mutations::reply(
+            &client,
+            &mut journal,
+            item_id,
+            body.as_deref(),
+            in_reply_to.as_deref(),
+            file_ids,
+            files,
+            *op_id,
         ),
         Command::Revise {
-            session,
-            request,
+            item_id,
             base_revision,
-            title,
+            message_json: Some(path),
+            file_ids,
+            clear_files,
+            files,
+            in_reply_to,
+            op_id,
+            ..
+        } => {
+            let message = std::fs::read(path)
+                .map_err(|error| format!("could not read revision JSON: {error}"))
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("invalid revision JSON: {error}"))
+                })
+                .unwrap_or_else(|error| fail(error, 1));
+            mutations::revise(
+                &client,
+                &mut journal,
+                mutations::Revision {
+                    item_id,
+                    revision: *base_revision,
+                    message,
+                    file_ids: (*clear_files || !file_ids.is_empty()).then_some(file_ids.as_slice()),
+                    files,
+                    in_reply_to: in_reply_to.as_deref(),
+                    operation: "revise",
+                    session: None,
+                },
+                *op_id,
+            )
+        }
+        Command::Revise {
+            item_id,
+            base_revision,
+            title: Some(title),
             body,
             choices,
             clear_choices,
@@ -768,139 +909,220 @@ fn main() {
             default_at,
             clear_default,
             choice_styles,
-            in_reply_to,
+            file_ids,
+            clear_files,
             files,
+            in_reply_to,
             op_id,
-        } => commands::revise_with_fields(
-            &context,
-            session,
-            &request,
-            base_revision,
-            &title,
-            body.as_deref(),
-            &choices,
-            clear_choices,
-            in_reply_to.as_deref(),
-            &files,
-            op_id,
-            &MessageFieldOptions {
-                origin_listener: false,
-                message_type,
-                message_kind,
-                reply,
-                importance,
-                by_when,
-                stake,
-                thread: None,
-                display_name: None,
-                default_choice,
-                default_at,
-                choice_styles,
-                clear_default,
-                answer_ui: None,
-                progress: None,
-            },
-        ),
+            ..
+        } => {
+            let fields = MessageFieldOptions {
+                message_type: message_type.clone(),
+                message_kind: message_kind.clone(),
+                reply: *reply,
+                importance: importance.clone(),
+                by_when: by_when.clone(),
+                stake: stake.clone(),
+                default_choice: default_choice.clone(),
+                default_at: default_at.clone(),
+                clear_default: *clear_default,
+                choice_styles: choice_styles.clone(),
+                ..MessageFieldOptions::default()
+            };
+            mutations::revise_interactive(
+                &client,
+                &mut journal,
+                mutations::InteractiveRevision {
+                    item_id,
+                    revision: *base_revision,
+                    title,
+                    body: body.as_deref(),
+                    choices,
+                    clear_choices: *clear_choices,
+                    fields: &fields,
+                    file_ids: (*clear_files || !file_ids.is_empty()).then_some(file_ids.as_slice()),
+                    files,
+                    in_reply_to: in_reply_to.as_deref(),
+                },
+                *op_id,
+            )
+        }
         Command::Progress {
             session,
             request,
             percent,
             stage,
             note,
+            sender_id,
             op_id,
-        } => commands::progress_update(
-            &context,
-            session,
-            &request,
+        } => mutations::progress(
+            &client,
+            &mut journal,
+            *session,
+            request,
             &ProgressReport {
-                percent,
-                stage,
-                note,
+                percent: *percent,
+                stage: stage.clone(),
+                note: note.clone(),
             },
-            op_id,
+            sender_id.as_deref(),
+            *op_id,
         ),
-        Command::Withdraw {
-            session,
-            request,
-            in_reply_to,
-            op_id,
-        } => commands::withdraw(&context, session, &request, in_reply_to.as_deref(), op_id),
         Command::Retract {
-            session,
-            request,
-            op_id,
-        } => commands::retract(&context, session, &request, op_id),
-        Command::Result {
-            session,
-            request,
+            item_id,
             in_reply_to,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Retract {
+                item_id,
+                in_reply_to: in_reply_to.as_deref(),
+            },
+        ),
+        Command::Lifecycle {
+            item_id,
+            action,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Lifecycle {
+                item_id,
+                action: action.as_str(),
+            },
+        ),
+        Command::Session {
+            action: SessionCommand::End { session, op_id },
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::EndSession(*session),
+        ),
+        Command::AdvisoryAck {
+            item_id,
+            advisory_id,
+            op_id,
+        } => writes::post(
+            &client,
+            &mut journal,
+            "advisory-ack",
+            None,
+            *op_id,
+            &["agent", "messages", item_id, "advisories", "ack"],
+            serde_json::json!({"advisory_id":advisory_id}),
+        ),
+        Command::Result {
+            item_id,
             status,
             op_id,
-        } => commands::result(
-            &context,
-            session,
-            &request,
-            &in_reply_to,
-            status.into(),
-            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Result {
+                item_id,
+                status: (*status).into(),
+            },
         ),
-        Command::Status { session } => commands::status(&context, session),
-        Command::DiscardUploads {
-            sender_id,
-            message_id,
-            revision,
+        Command::Receipt {
+            item_id,
+            entry_id,
+            agent,
+            rerouted,
+            not_handed,
             op_id,
-        } => commands::discard_uploads(&context, &sender_id, &message_id, revision, op_id),
-        Command::Session { action } => match action {
-            SessionCommand::End { session, gone: _ } => commands::session_end(&context, session),
-        },
-        Command::Retry { op_id } => commands::retry(&context, op_id),
-        Command::Abandon { op_id } => commands::abandon(&context, op_id),
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Receipt {
+                item_id,
+                entry_id: entry_id.as_deref(),
+                agent: agent.as_deref(),
+                rerouted: *rerouted,
+                not_handed: not_handed.as_deref(),
+            },
+        ),
         Command::FileUse {
-            session,
-            event,
-            file,
+            item_id,
+            entry_id,
+            file_id,
+            reason,
+            op_id,
             used,
             unusable,
-            reason,
-        } => commands::file_use(
-            &context,
-            session,
-            &event,
-            &file,
-            match (used, unusable) {
-                (true, false) => "used",
-                (false, true) => "unusable",
-                _ => unreachable!("clap requires exactly one file-use outcome"),
+            transferred,
+            not_transferred,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::FileUse {
+                item_id,
+                entry_id,
+                file_id,
+                transfer: transferred
+                    .then_some("transferred")
+                    .or_else(|| not_transferred.then_some("not_transferred")),
+                usage: used
+                    .then_some("used")
+                    .or_else(|| unusable.then_some("unusable")),
+                reason: reason.as_deref(),
             },
-            reason.as_deref(),
         ),
+        Command::Show {
+            item_id,
+            chat,
+            device,
+            device_id,
+            op_id,
+        } => writes::control(
+            &client,
+            &mut journal,
+            *op_id,
+            ControlWrite::Show {
+                item_id,
+                chat: *chat,
+                device_name: device.as_deref(),
+                device_id: device_id.as_deref(),
+            },
+        ),
+        Command::FileUpload { file, op_id } => {
+            writes::upload_file(&client, &mut journal, file, *op_id)
+        }
+        Command::DiscardUploads { file_id, op_id } => {
+            writes::discard_upload(&client, &mut journal, file_id, *op_id)
+        }
+        Command::Retry { op_id, journal_id } => {
+            let journal_id = journal_id.map(|id| id.to_string());
+            writes::retry(&client, &mut journal, *op_id, journal_id.as_deref())
+        }
+        Command::JournalId => journal
+            .journal_id()
+            .map(|id| {
+                serde_json::json!({
+                    "kind":"journal","journal_id":id
+                })
+            })
+            .map_err(writes::WriteFailure::from),
+        Command::Abandon { op_id } => writes::abandon(&mut journal, *op_id),
+        _ => unreachable!("device write dispatch requires a write command"),
     };
-
-    if let Err(error) = result {
-        fail(error.message, error.exit_code);
+    match result {
+        Ok(output) => println!("{output}"),
+        Err(error) => write_failure(error),
     }
 }
 
-impl From<Route> for commands::OriginHarness {
-    fn from(value: Route) -> Self {
-        match value {
-            Route::ClaudeCode => Self::ClaudeCode,
-            Route::Codex => Self::Codex,
-            Route::Other => Self::Other,
-        }
+fn write_failure(error: writes::WriteFailure) -> ! {
+    if let Some(output) = &error.output {
+        println!("{output}");
     }
-}
-
-impl From<SessionContext> for commands::SessionContext {
-    fn from(value: SessionContext) -> Self {
-        match value {
-            SessionContext::Interactive => Self::Interactive,
-            SessionContext::Bare => Self::Bare,
-            SessionContext::Print => Self::Print,
-            SessionContext::Sdk => Self::Sdk,
-        }
-    }
+    fail(error.to_string(), error.exit_code)
 }
 
 fn fail(message: String, exit_code: i32) -> ! {
@@ -914,121 +1136,35 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn ack_accepts_exactly_one_ordinary_event_or_advisory_id() {
+    fn listen_uses_an_explicit_caller_cursor_or_snapshot() {
         let session = "123e4567-e89b-42d3-a456-426614174000";
-        let advisory = "123e4567-e89b-42d3-a456-426614174001";
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "ack",
-                "--session",
-                session,
-                "--event",
-                "17"
-            ])
-            .is_ok()
-        );
         let cli = Cli::try_parse_from([
-            "harklight-agent",
-            "ack",
+            "agent",
+            "listen",
             "--session",
             session,
-            "--advisory",
-            advisory,
+            "--after",
+            "42",
+            "--follow",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Ack {
-                event: None,
-                advisory: Some(_),
+            Command::Listen(ListenArgs {
+                feed: FeedArgs {
+                    after: Some(42),
+                    ..
+                },
+                follow: true,
                 ..
-            }
-        ));
-        assert!(Cli::try_parse_from(["harklight-agent", "ack", "--session", session]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "ack",
-                "--session",
-                session,
-                "--event",
-                "17",
-                "--advisory",
-                advisory,
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn origin_listener_options_are_exclusive_before_configuration_or_network() {
-        assert!(Cli::try_parse_from(["agent", "listen", "--origin", "--follow"]).is_ok());
-        for extra in ["--controller", "--ack2", "--next"] {
-            assert!(
-                Cli::try_parse_from(["agent", "listen", "--origin", "--follow", extra]).is_err()
-            );
-        }
-        assert!(Cli::try_parse_from(["agent", "listen", "--origin"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "agent",
-                "listen",
-                "--origin",
-                "--follow",
-                "--session",
-                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn reconnect_accepts_saved_or_complete_attachment_inputs() {
-        let handle = "123e4567-e89b-42d3-a456-426614174000";
-        let cli =
-            Cli::try_parse_from(["harklight-agent", "reconnect", "--session", handle]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Reconnect {
-                vendor_session_id: None,
-                route: None,
-                controller: false,
-                ..
-            }
-        ));
-        let cli = Cli::try_parse_from([
-            "harklight-agent",
-            "reconnect",
-            "--session",
-            handle,
-            "--vendor-session-id",
-            "none",
-            "--route",
-            "other",
-            "--controller",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Reconnect {
-                vendor_session_id: Some(_),
-                route: Some(Route::Other),
-                controller: true,
-                ..
-            }
+            })
         ));
         assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "reconnect",
-                "--session",
-                handle,
-                "--vendor-session-id",
-                "none"
-            ])
-            .is_err()
+            Cli::try_parse_from(["agent", "listen", "--next", "--snapshot", "--after", "42"])
+                .is_err()
         );
+        assert!(Cli::try_parse_from(["agent", "listen", "--follow", "--origin"]).is_err());
+        assert!(Cli::try_parse_from(["agent", "listen", "--snapshot", "--next"]).is_ok());
     }
 
     #[test]
@@ -1062,8 +1198,6 @@ mod tests {
                 "harklight.example",
                 "--port",
                 "18444",
-                "--origin-port",
-                "18450",
                 "--label",
                 "Work laptop"
             ])
@@ -1101,8 +1235,6 @@ mod tests {
             "app:example",
             "--title",
             "A title",
-            "--route",
-            "claude-code",
             "--type",
             "request",
             "--kind",
@@ -1154,8 +1286,6 @@ mod tests {
             "new",
             "--sender-id",
             "app:example",
-            "--route",
-            "claude-code",
             "--title",
             "Ship the release",
             "--progress",
@@ -1258,8 +1388,6 @@ mod tests {
             "app:example",
             "--title",
             "A notice",
-            "--route",
-            "claude-code",
         ];
         assert!(Cli::try_parse_from(base).is_err());
         assert!(Cli::try_parse_from(base.into_iter().chain(["--type", "fyi"])).is_ok());
@@ -1295,8 +1423,6 @@ mod tests {
             "app:example",
             "--title",
             "Updated plan",
-            "--route",
-            "claude-code",
             "--type",
             "fyi",
             "--supersedes",
@@ -1326,8 +1452,6 @@ mod tests {
             display_name,
             "--title",
             "A title",
-            "--route",
-            "claude-code",
             "--type",
             "fyi",
         ])
@@ -1392,7 +1516,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(cli.command, Command::Read { session } if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
+            matches!(cli.command, Command::Read(FeedArgs { session: Some(session), .. }) if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
         );
 
         assert!(
@@ -1424,9 +1548,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::MessageGet {
-                sender_id,
-                message_id,
-                revision: Some(3)
+                sender_id: Some(sender_id),
+                message_id: Some(message_id),
+                revision: Some(3),
+                ..
             } if sender_id == "app:example" && message_id == "message-1"
         ));
 
@@ -1442,50 +1567,59 @@ mod tests {
     }
 
     #[test]
+    fn device_message_reads_accept_opaque_ids_and_reject_mixed_selectors() {
+        let cli =
+            Cli::try_parse_from(["agent", "message-get", "--item-id", "opaque/item"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::MessageGet { item_id: Some(id), revision: None, .. } if id == "opaque/item"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "message-get",
+                "--item-id",
+                "opaque/item",
+                "--sender-id",
+                "app:example",
+                "--message-id",
+                "local"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["agent", "messages", "--page", "opaque+next"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "message-entries",
+                "--item-id",
+                "opaque/item",
+                "--before",
+                "opaque+entry"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn focus_and_show_parse_their_contract_arguments() {
         let focus = Cli::try_parse_from(["harklight-agent", "focus", "--follow"]).unwrap();
         assert!(matches!(focus.command, Command::Focus { follow: true }));
-
         let show = Cli::try_parse_from([
             "harklight-agent",
             "show",
-            "--sender-id",
-            "app:example",
-            "--message-id",
-            "message-1",
+            "--item-id",
+            "item/one",
             "--chat",
             "--device",
-            "Owner's iPhone",
+            "Office",
         ])
         .unwrap();
         assert!(matches!(
             show.command,
-            Command::Show {
-                sender_id,
-                message_id,
-                chat: true,
-                device: Some(device),
-                client: None,
-            } if sender_id == "app:example"
-                && message_id == "message-1"
-                && device == "Owner's iPhone"
+            Command::Show { item_id, chat: true, device: Some(device), .. }
+            if item_id == "item/one" && device == "Office"
         ));
-
-        assert!(
-            Cli::try_parse_from([
-                "harklight-agent",
-                "show",
-                "--sender-id",
-                "app:example",
-                "--message-id",
-                "message-1",
-                "--device",
-                "iPhone",
-                "--client",
-                "a".repeat(64).as_str(),
-            ])
-            .is_err()
-        );
     }
 
     #[test]
@@ -1555,9 +1689,7 @@ mod tests {
         let revise = Cli::try_parse_from([
             "harklight-agent",
             "revise",
-            "--session",
-            "123e4567-e89b-42d3-a456-426614174000",
-            "--request",
+            "--item-id",
             "message-1",
             "--base-revision",
             "1",
@@ -1595,9 +1727,7 @@ mod tests {
             Cli::try_parse_from([
                 "harklight-agent",
                 "revise",
-                "--session",
-                "123e4567-e89b-42d3-a456-426614174000",
-                "--request",
+                "--item-id",
                 "message-1",
                 "--base-revision",
                 "1",
@@ -1657,112 +1787,84 @@ mod tests {
     }
 
     #[test]
-    fn ack2_is_a_separate_receiver_command_and_controller_capability_is_declared_by_flag() {
-        let handle = "123e4567-e89b-42d3-a456-426614174000";
-        let attach = Cli::try_parse_from([
-            "harklight-agent",
-            "attach",
-            "--session",
-            handle,
-            "--vendor-session-id",
-            "none",
-            "--route",
-            "other",
-            "--controller",
-            "--ack2",
-        ])
-        .unwrap();
-        assert!(matches!(
-            attach.command,
-            Command::Attach {
-                controller: true,
-                ack2: true,
-                ..
-            }
-        ));
-
-        let listen = Cli::try_parse_from([
-            "harklight-agent",
-            "listen",
-            "--session",
-            handle,
-            "--follow",
-            "--controller",
-            "--ack2",
-        ])
-        .unwrap();
-        assert!(matches!(
-            listen.command,
-            Command::Listen(ListenArgs {
-                controller: true,
-                ack2: true,
-                ..
-            })
-        ));
-
+    fn receipts_distinguish_answer_and_entry_and_require_a_reason_for_refusal() {
         let handed = Cli::try_parse_from([
-            "harklight-agent",
-            "ack2",
-            "--session",
-            handle,
-            "--event",
-            "812",
+            "agent",
+            "receipt",
+            "--item-id",
+            "item",
             "--agent",
-            "Studio",
+            "Desk",
             "--rerouted",
         ])
         .unwrap();
         assert!(matches!(
             handed.command,
-            Command::Ack2 {
-                agent: Some(agent),
+            Command::Receipt {
+                entry_id: None,
                 rerouted: true,
                 not_handed: None,
                 ..
-            } if agent == "Studio"
+            }
         ));
-        let not_handed = Cli::try_parse_from([
-            "harklight-agent",
-            "ack2",
-            "--session",
-            handle,
-            "--event",
-            "812",
+        let chat = Cli::try_parse_from([
+            "agent",
+            "receipt",
+            "--item-id",
+            "item",
+            "--entry-id",
+            "entry",
             "--not-handed",
-            "The receiver could not hand off this entry.",
+            "failed",
         ])
         .unwrap();
         assert!(matches!(
-            not_handed.command,
-            Command::Ack2 {
-                agent: None,
-                rerouted: false,
-                not_handed: Some(reason),
-                ..
-            } if reason == "The receiver could not hand off this entry."
+            chat.command,
+            Command::Receipt { entry_id: Some(id), not_handed: Some(reason), .. }
+            if id == "entry" && reason == "failed"
         ));
         assert!(
+            Cli::try_parse_from(["agent", "receipt", "--item-id", "item", "--not-handed"]).is_err()
+        );
+        assert!(
             Cli::try_parse_from([
-                "harklight-agent",
-                "ack2",
-                "--session",
-                handle,
-                "--event",
-                "812",
+                "agent",
+                "receipt",
+                "--item-id",
+                "item",
                 "--rerouted",
                 "--not-handed",
-                "not available",
+                "failed"
             ])
             .is_err()
         );
-
-        let mut command = Cli::command();
-        let ack2_help = command
-            .find_subcommand_mut("ack2")
-            .unwrap()
-            .render_long_help()
-            .to_string();
-        assert!(ack2_help.contains("receiving-system ACK2"));
-        assert!(ack2_help.contains("separate from the agent Seen command `ack`"));
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "file-use",
+                "--item-id",
+                "item",
+                "--entry-id",
+                "entry",
+                "--file-id",
+                "a",
+                "--unusable",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent",
+                "file-use",
+                "--item-id",
+                "item",
+                "--entry-id",
+                "entry",
+                "--file-id",
+                "a",
+                "--used",
+            ])
+            .is_ok()
+        );
     }
 }

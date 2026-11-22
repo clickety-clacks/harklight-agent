@@ -1,4 +1,3 @@
-pub mod api;
 pub mod commands;
 pub mod config;
 pub mod connect;
@@ -7,3 +6,4 @@ pub mod files;
 pub mod journal;
 #[cfg(test)]
 mod test_tls;
+pub mod v2;

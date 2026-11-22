@@ -1,9 +1,11 @@
+#[cfg(test)]
+use std::process;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
     path::{Path, PathBuf},
-    process, thread,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,6 +19,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod progress_files;
+mod v2_feed;
 pub(crate) use progress_files::is_progress;
 
 #[derive(Debug, Error)]
@@ -56,14 +59,16 @@ pub enum JournalError {
     InvalidAdvisoryId(String),
     #[error("operation key {0} was already used with different content")]
     OperationConflict(Uuid),
+    #[error("local message reference already has a different server item ID")]
+    ItemBindingConflict,
+    #[error("legacy message reference has multiple senders; specify --sender-id")]
+    AmbiguousLegacySender,
+    #[error("a revision is unresolved for this item; retry operation {0}")]
+    PendingRevision(Uuid),
     #[error("journal has no operation with key {0}")]
     MissingOperation(Uuid),
     #[error("operation {op_id} is {state}; only an unresolved operation can be abandoned")]
     NotUnresolved { op_id: Uuid, state: &'static str },
-    #[error("listener already active (pid {0})")]
-    ListenerActive(u32),
-    #[error("listener lock is held but its process id is not available")]
-    ListenerActiveUnknown,
     #[error("journal has no entry for event {0}")]
     MissingEvent(String),
 }
@@ -281,6 +286,28 @@ pub struct OperationRecord {
     pub uploads: Vec<UploadSource>,
     #[serde(default)]
     pub prepared_send: Option<PreparedSend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_request: Option<PreparedRequest>,
+    #[serde(default)]
+    pub protocol_v2: bool,
+}
+
+/// The finalized v2 HTTP request. The enclosing operation ID is its
+/// idempotency key. Store the JSON text intact so a retry sends the same bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedRequest {
+    pub method: RequestMethod,
+    pub path: Vec<String>,
+    pub if_match: Option<String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestMethod {
+    Post,
+    Put,
+    Delete,
 }
 
 /// The caller-visible immutable portion of a two-phase send. `request` is the
@@ -305,6 +332,8 @@ pub struct UploadSource {
     pub sha256: String,
     pub upload_cap_bytes_per_file: Option<u64>,
     pub upload_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_key: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,11 +345,19 @@ pub enum OperationState {
     Rejected,
 }
 
+pub struct OperationLock {
+    op_id: Uuid,
+    _file: File,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXIT_AFTER_NEXT_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub struct JournalStore {
     journal_path: PathBuf,
     journal_lock_path: PathBuf,
-    listener_lock_path: PathBuf,
-    listener_lock: Option<File>,
 }
 
 impl JournalStore {
@@ -335,8 +372,6 @@ impl JournalStore {
         let store = Self {
             journal_path: directory.join("origin-feed.sqlite3"),
             journal_lock_path: directory.join("origin-feed.lock"),
-            listener_lock_path: directory.join(format!("{session_handle}.listener.lock")),
-            listener_lock: None,
         };
         store.initialize()?;
         store.maintain_progress_material(session_handle)?;
@@ -371,6 +406,17 @@ impl JournalStore {
                 op_id TEXT PRIMARY KEY NOT NULL, session_handle TEXT NOT NULL,
                 kind TEXT NOT NULL, state TEXT NOT NULL, message_id TEXT,
                 request_revision INTEGER, in_reply_to TEXT, payload TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS v2_feed_cursors (
+                scope TEXT PRIMARY KEY NOT NULL, position TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS v2_feed_resources (
+                scope TEXT NOT NULL, resource TEXT NOT NULL, rev TEXT NOT NULL,
+                payload TEXT NOT NULL, PRIMARY KEY(scope, resource)
+             );
+             CREATE TABLE IF NOT EXISTS v2_item_ids (
+                sender TEXT NOT NULL, local_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                PRIMARY KEY(sender, local_id)
              );
              CREATE TABLE IF NOT EXISTS advisory_cursors (
                 session_handle TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL
@@ -482,7 +528,28 @@ impl JournalStore {
         let tx = connection.transaction()?;
         let result = update(&tx)?;
         tx.commit()?;
+        #[cfg(test)]
+        if EXIT_AFTER_NEXT_COMMIT.get() {
+            process::exit(73);
+        }
         Ok(result)
+    }
+
+    /// Identifies this journal instance for callers recovering an intent.
+    pub fn journal_id(&self) -> Result<String, JournalError> {
+        self.with_transaction(|tx| {
+            let current: Option<String> = tx
+                .query_row("SELECT value FROM meta WHERE key='journal_id'", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(current) = current {
+                return Ok(current);
+            }
+            let id = Uuid::new_v4().to_string();
+            tx.execute("INSERT INTO meta(key,value) VALUES('journal_id',?1)", [&id])?;
+            Ok(id)
+        })
     }
 
     pub fn cursor(&self) -> Result<u64, JournalError> {
@@ -897,28 +964,6 @@ impl JournalStore {
             .join(op_id.to_string())
     }
 
-    pub fn acquire_listener(&mut self) -> Result<(), JournalError> {
-        if self.listener_lock.is_some() {
-            return Ok(());
-        }
-        let lock_file = open_lock_file(&self.listener_lock_path)?;
-        if let Err(error) = lock_file.try_lock_exclusive() {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Err(match read_lock_pid(&self.listener_lock_path) {
-                    Some(pid) => JournalError::ListenerActive(pid),
-                    None => JournalError::ListenerActiveUnknown,
-                });
-            }
-            return Err(error.into());
-        }
-        let mut lock_file = lock_file;
-        lock_file.set_len(0)?;
-        writeln!(&mut lock_file, "{}", process::id())?;
-        lock_file.sync_all()?;
-        self.listener_lock = Some(lock_file);
-        Ok(())
-    }
-
     pub fn record_entry(&mut self, entry: JournalEntry) -> Result<bool, JournalError> {
         let session = entry.session_handle;
         let request_id = entry.request_id.clone();
@@ -1081,15 +1126,56 @@ impl JournalStore {
         request: Value,
         uploads: Vec<UploadSource>,
     ) -> Result<OperationRecord, JournalError> {
+        self.prepare_operation_inner(op_id, session_handle, kind, request, uploads, false)
+    }
+
+    pub fn prepare_v2_operation(
+        &mut self,
+        op_id: Uuid,
+        session_handle: Uuid,
+        kind: String,
+        request: Value,
+        uploads: Vec<UploadSource>,
+    ) -> Result<OperationRecord, JournalError> {
+        self.prepare_operation_inner(op_id, session_handle, kind, request, uploads, true)
+    }
+
+    fn prepare_operation_inner(
+        &self,
+        op_id: Uuid,
+        session_handle: Uuid,
+        kind: String,
+        request: Value,
+        uploads: Vec<UploadSource>,
+        protocol_v2: bool,
+    ) -> Result<OperationRecord, JournalError> {
         self.with_transaction(|tx| {
             if let Some(existing) = read_operation(tx, op_id)? {
                 if existing.session_handle != session_handle
                     || existing.kind != kind
+                    || existing.protocol_v2 != protocol_v2
                     || !operation_requests_equivalent(&existing.request, &request)
                 {
                     return Err(JournalError::OperationConflict(op_id));
                 }
                 return Ok(existing);
+            }
+            if protocol_v2 && let Some(item_id) = request["revision_intent"].as_str() {
+                let pending: Option<String> = tx
+                    .query_row(
+                        "SELECT op_id FROM operations
+                     WHERE state IN ('prepared','unknown')
+                       AND json_extract(payload,'$.request.revision_intent')=?1
+                     LIMIT 1",
+                        [item_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(pending) = pending {
+                    let existing_key = Uuid::parse_str(&pending)
+                        .map_err(|_| JournalError::OperationConflict(op_id))?;
+                    return Err(JournalError::PendingRevision(existing_key));
+                }
             }
             let now = now_ms();
             let operation = OperationRecord {
@@ -1103,10 +1189,94 @@ impl JournalStore {
                 response: None,
                 uploads,
                 prepared_send: None,
+                prepared_request: None,
+                protocol_v2,
             };
             write_operation(tx, &operation)?;
             Ok(operation)
         })
+    }
+
+    /// Reserve the session and normalized send inputs under the supplied
+    /// operation key. An identical lookup returns the original prepared send.
+    pub fn prepare_v2_send(
+        &mut self,
+        lock: &OperationLock,
+        session: Uuid,
+        prepared: PreparedSend,
+        uploads: Vec<UploadSource>,
+    ) -> Result<OperationRecord, JournalError> {
+        let op_id = lock.op_id;
+        self.with_transaction(|tx| {
+            if let Some(existing) = read_operation(tx, op_id)? {
+                if existing.protocol_v2
+                    && existing.kind == "send"
+                    && existing
+                        .prepared_send
+                        .as_ref()
+                        .is_some_and(|saved| saved.inputs == prepared.inputs)
+                {
+                    return Ok(existing);
+                }
+                return Err(JournalError::OperationConflict(op_id));
+            }
+            let now = now_ms();
+            let operation = OperationRecord {
+                op_id,
+                session_handle: session,
+                kind: "send".into(),
+                request: prepared.request.clone(),
+                state: OperationState::Prepared,
+                created_at_ms: now,
+                updated_at_ms: now,
+                response: None,
+                uploads,
+                prepared_send: Some(prepared),
+                prepared_request: None,
+                protocol_v2: true,
+            };
+            write_operation(tx, &operation)?;
+            Ok(operation)
+        })
+    }
+
+    /// Recover only the old local sender reference, never a pending write.
+    pub fn legacy_sender(
+        &self,
+        session: Uuid,
+        local_id: &str,
+    ) -> Result<Option<String>, JournalError> {
+        self.with_read(|connection| {
+            let mut query = connection.prepare(
+                "SELECT sender_id FROM entries WHERE session_handle=?1 AND request_id=?2 AND sender_id IS NOT NULL
+                 UNION
+                 SELECT json_extract(payload,'$.request.message.sender_id') FROM operations
+                 WHERE session_handle=?1 AND message_id=?2 AND kind='send' AND state='committed'
+                   AND coalesce(json_extract(payload,'$.protocol_v2'),0)=0
+                   AND json_extract(payload,'$.request.message.sender_id') IS NOT NULL
+                 LIMIT 2",
+            )?;
+            let senders = query.query_map(params![session.to_string(),local_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            match senders.as_slice() {
+                [sender] => Ok(Some(sender.clone())),
+                [] => Ok(None),
+                _ => Err(JournalError::AmbiguousLegacySender),
+            }
+        })
+    }
+
+    pub fn v2_item_id(&self, sender: &str, local_id: &str) -> Result<Option<String>, JournalError> {
+        self.with_read(|connection| read_v2_item_id(connection, sender, local_id))
+    }
+
+    pub fn remember_v2_item(
+        &self,
+        sender: &str,
+        local_id: &str,
+        item_id: &str,
+    ) -> Result<(), JournalError> {
+        self.with_transaction(|tx| write_v2_item_id(tx, sender, local_id, item_id))
     }
 
     pub fn prepare_send_operation(
@@ -1152,9 +1322,49 @@ impl JournalStore {
                 response: None,
                 uploads,
                 prepared_send: Some(prepared_send),
+                prepared_request: None,
+                protocol_v2: false,
             };
             write_operation(tx, &operation)?;
             Ok(operation)
+        })
+    }
+
+    pub(crate) fn record_v2_supersedes(
+        &self,
+        op_id: Uuid,
+        resolved: Value,
+    ) -> Result<(), JournalError> {
+        self.update_operation(op_id, |operation| {
+            if operation.prepared_request.is_some() {
+                return Err(JournalError::OperationConflict(op_id));
+            }
+            operation.request["_resolved_supersedes"] = resolved;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn record_v2_upload(
+        &self,
+        op_id: Uuid,
+        upload_key: Uuid,
+        file_id: String,
+    ) -> Result<(), JournalError> {
+        self.update_operation(op_id, |operation| {
+            let upload = operation
+                .uploads
+                .iter_mut()
+                .find(|upload| upload.upload_key == Some(upload_key))
+                .ok_or(JournalError::OperationConflict(op_id))?;
+            if let Some(previous) = &upload.upload_id {
+                return if previous == &file_id {
+                    Ok(false)
+                } else {
+                    Err(JournalError::OperationConflict(op_id))
+                };
+            }
+            upload.upload_id = Some(file_id);
+            Ok(true)
         })
     }
 
@@ -1219,6 +1429,54 @@ impl JournalStore {
         })
     }
 
+    /// Serialize delivery and settlement for one local operation across
+    /// processes. Other operation keys can advance while this request runs.
+    pub fn lock_operation(&self, op_id: Uuid) -> Result<OperationLock, JournalError> {
+        let path = self
+            .journal_path
+            .with_file_name(format!("operation-{op_id}.lock"));
+        let file = open_lock_file(&path)?;
+        file.lock_exclusive()?;
+        Ok(OperationLock { op_id, _file: file })
+    }
+
+    /// Freeze the request and record that it may be sent in one commit.
+    pub fn begin_v2_write(
+        &mut self,
+        lock: &OperationLock,
+        request: PreparedRequest,
+    ) -> Result<OperationRecord, JournalError> {
+        let op_id = lock.op_id;
+        self.with_transaction(|tx| {
+            let mut operation =
+                read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
+            if !operation.protocol_v2 {
+                return Err(JournalError::OperationConflict(op_id));
+            }
+            if !matches!(
+                operation.state,
+                OperationState::Prepared | OperationState::Unknown
+            ) {
+                return Err(JournalError::NotUnresolved {
+                    op_id,
+                    state: operation_state_name(operation.state),
+                });
+            }
+            if let Some(saved) = &operation.prepared_request {
+                return if saved == &request {
+                    Ok(operation)
+                } else {
+                    Err(JournalError::OperationConflict(op_id))
+                };
+            }
+            operation.prepared_request = Some(request);
+            operation.state = OperationState::Unknown;
+            operation.updated_at_ms = now_ms();
+            write_operation(tx, &operation)?;
+            Ok(operation)
+        })
+    }
+
     pub fn mark_operation_unknown(&mut self, op_id: Uuid) -> Result<(), JournalError> {
         self.update_operation(op_id, |operation| {
             operation.state = OperationState::Unknown;
@@ -1237,6 +1495,22 @@ impl JournalStore {
         let result = self.with_transaction(|tx| {
             let mut operation =
                 read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
+            if operation.protocol_v2 && operation.kind == "send" {
+                let sender = operation.request["sender"]
+                    .as_str()
+                    .ok_or(JournalError::OperationConflict(op_id))?;
+                let item = &response["message"];
+                let item_id = item["item_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or(JournalError::OperationConflict(op_id))?;
+                let session = (!operation.session_handle.is_nil())
+                    .then(|| operation.session_handle.to_string());
+                if item["sender"] != sender || item["session"].as_str() != session.as_deref() {
+                    return Err(JournalError::OperationConflict(op_id));
+                }
+                write_v2_item_id(tx, sender, &op_id.to_string(), item_id)?;
+            }
             let session = operation.session_handle;
             operation.state = OperationState::Committed;
             operation.updated_at_ms = now_ms();
@@ -1320,14 +1594,6 @@ impl JournalStore {
             {
                 let _ = self.prune_progress_request(op.session_handle, id);
             }
-        }
-    }
-}
-
-impl Drop for JournalStore {
-    fn drop(&mut self) {
-        if let Some(lock_file) = self.listener_lock.as_ref() {
-            let _ = lock_file.unlock();
         }
     }
 }
@@ -1729,6 +1995,40 @@ fn read_entry_by_event(
         .transpose()
 }
 
+fn read_v2_item_id(
+    connection: &Connection,
+    sender: &str,
+    local_id: &str,
+) -> Result<Option<String>, JournalError> {
+    connection
+        .query_row(
+            "SELECT item_id FROM v2_item_ids WHERE sender=?1 AND local_id=?2",
+            params![sender, local_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn write_v2_item_id(
+    tx: &Transaction<'_>,
+    sender: &str,
+    local_id: &str,
+    item_id: &str,
+) -> Result<(), JournalError> {
+    if let Some(saved) = read_v2_item_id(tx, sender, local_id)? {
+        if saved != item_id {
+            return Err(JournalError::ItemBindingConflict);
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO v2_item_ids(sender,local_id,item_id) VALUES(?1,?2,?3)",
+        params![sender, local_id, item_id],
+    )?;
+    Ok(())
+}
+
 fn read_operation(
     connection: &Connection,
     op_id: Uuid,
@@ -2042,25 +2342,6 @@ fn open_lock_file(path: &Path) -> Result<File, std::io::Error> {
     Ok(file)
 }
 
-fn read_lock_pid(path: &Path) -> Option<u32> {
-    // A second listener can arrive in the short interval after the lock is
-    // acquired and before the owner publishes its PID. Only local lock metadata
-    // is retried here; this does not drive server requests or feed polling.
-    for _ in 0..32 {
-        let mut content = String::new();
-        if File::open(path)
-            .and_then(|mut file| file.read_to_string(&mut content))
-            .is_ok()
-        {
-            if let Ok(pid) = content.trim().parse() {
-                return Some(pid);
-            }
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    None
-}
-
 #[cfg(unix)]
 fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -2087,7 +2368,7 @@ fn set_private_file(_file: &File) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2588,6 +2869,194 @@ mod tests {
     }
 
     #[test]
+    fn v2_send_lookup_and_server_item_binding_survive_a_reopened_journal() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let sender = "app:example";
+        let prepared = PreparedSend {
+            inputs: json!({"session":"new","sender":sender,"message":{"title":"Example"}}),
+            request: json!({"session":session,"sender":sender,"message":{"title":"Example"}}),
+            files: Vec::new(),
+        };
+        {
+            let mut store = open(&root, session);
+            let lock = store.lock_operation(key).unwrap();
+            let operation = store
+                .prepare_v2_send(&lock, session, prepared.clone(), Vec::new())
+                .unwrap();
+            assert_eq!(operation.session_handle, session);
+            assert_eq!(store.v2_item_id(sender, &key.to_string()).unwrap(), None);
+            let recovered = store
+                .prepare_v2_send(&lock, Uuid::new_v4(), prepared.clone(), Vec::new())
+                .unwrap();
+            assert_eq!(recovered.session_handle, session);
+            let mut changed = prepared.clone();
+            changed.inputs["sender"] = "app:changed".into();
+            assert!(matches!(
+                store.prepare_v2_send(&lock, session, changed, Vec::new()),
+                Err(JournalError::OperationConflict(id)) if id == key
+            ));
+            let admitted = json!({"rev":2,"message":{"sender":sender,"session":session,"item_id":"server/opaque"}});
+            let wrong_sender = json!({"rev":2,"message":{"sender":"app:other","session":session,"item_id":"server/opaque"}});
+            assert!(store.settle_operation(key, wrong_sender, None).is_err());
+            assert_eq!(store.v2_item_id(sender, &key.to_string()).unwrap(), None);
+            store.settle_operation(key, admitted, None).unwrap();
+        }
+        let store = open(&root, session);
+        let saved = store.operation(key).unwrap().unwrap();
+        assert_eq!(saved.state, OperationState::Committed);
+        assert_eq!(
+            store
+                .v2_item_id(sender, &key.to_string())
+                .unwrap()
+                .as_deref(),
+            Some("server/opaque")
+        );
+        assert_eq!(
+            store.v2_item_id("app:other", &key.to_string()).unwrap(),
+            None
+        );
+    }
+
+    fn sample_wire_request() -> PreparedRequest {
+        PreparedRequest {
+            method: RequestMethod::Put,
+            path: vec!["agent".into(), "messages".into(), "opaque/id".into()],
+            if_match: Some(r#""1""#.into()),
+            body: r#"{ "message" : {"title":"test"} }"#.into(),
+        }
+    }
+
+    #[test]
+    fn v2_write_freezes_wire_request_and_key_before_delivery() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let request = sample_wire_request();
+        {
+            let mut store = open(&root, session);
+            store
+                .prepare_v2_operation(key, session, "revise".into(), json!({}), Vec::new())
+                .unwrap();
+            let lock = store.lock_operation(key).unwrap();
+            let operation = store.begin_v2_write(&lock, request.clone()).unwrap();
+            assert_eq!(operation.state, OperationState::Unknown);
+        }
+
+        let mut store = open(&root, session);
+        let operation = store.operation(key).unwrap().unwrap();
+        assert_eq!(operation.op_id, key);
+        assert_eq!(operation.state, OperationState::Unknown);
+        assert_eq!(operation.prepared_request, Some(request.clone()));
+        let mut changed = request.clone();
+        changed.body = changed.body.replace(" : ", ":");
+        let lock = store.lock_operation(key).unwrap();
+        assert!(matches!(
+            store.begin_v2_write(&lock, changed),
+            Err(JournalError::OperationConflict(id)) if id == key
+        ));
+        assert_eq!(
+            store
+                .begin_v2_write(&lock, request.clone())
+                .unwrap()
+                .prepared_request,
+            Some(request),
+        );
+    }
+
+    #[test]
+    fn v2_write_does_not_retarget_an_earlier_protocol_operation() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        let mut store = open(&root, session);
+        store
+            .prepare_operation(key, session, "send".into(), json!({"v":1}))
+            .unwrap();
+
+        let lock = store.lock_operation(key).unwrap();
+        for state in [OperationState::Prepared, OperationState::Unknown] {
+            assert_eq!(store.operation(key).unwrap().unwrap().state, state);
+            assert!(matches!(
+                store.begin_v2_write(&lock, sample_wire_request()),
+                Err(JournalError::OperationConflict(id)) if id == key
+            ));
+            assert!(
+                store
+                    .operation(key)
+                    .unwrap()
+                    .unwrap()
+                    .prepared_request
+                    .is_none()
+            );
+            store.mark_operation_unknown(key).unwrap();
+        }
+    }
+
+    #[test]
+    fn v2_write_admission_refuses_settled_operations() {
+        let root = Scratch::new();
+        let mut store = open(&root, Uuid::nil());
+        for terminal in ["committed", "refused", "abandoned"] {
+            let key = Uuid::new_v4();
+            let wire = sample_wire_request();
+            store
+                .prepare_v2_operation(key, Uuid::nil(), "revise".into(), json!({}), Vec::new())
+                .unwrap();
+            let lock = store.lock_operation(key).unwrap();
+            store.begin_v2_write(&lock, wire.clone()).unwrap();
+            match terminal {
+                "committed" => store.settle_operation(key, json!({}), None).unwrap(),
+                "refused" => store.reject_operation(key, json!({})).unwrap(),
+                "abandoned" => {
+                    store.abandon_operation(key).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                store.begin_v2_write(&lock, wire),
+                Err(JournalError::NotUnresolved { op_id, .. }) if op_id == key
+            ));
+        }
+    }
+
+    #[test]
+    fn v2_freeze_survives_process_exit_at_its_first_commit() {
+        const TEST_ROOT: &str = "HARKLIGHT_TEST_FREEZE_ROOT";
+        const TEST_KEY: &str = "HARKLIGHT_TEST_FREEZE_KEY";
+        if let (Some(root), Ok(key)) = (std::env::var_os(TEST_ROOT), std::env::var(TEST_KEY)) {
+            let mut store = JournalStore::open(Path::new(&root), "device", Uuid::nil()).unwrap();
+            let lock = store.lock_operation(key.parse().unwrap()).unwrap();
+            EXIT_AFTER_NEXT_COMMIT.set(true);
+            store.begin_v2_write(&lock, sample_wire_request()).unwrap();
+            panic!("child should exit at the first commit");
+        }
+
+        let root = Scratch::new();
+        let key = Uuid::new_v4();
+        let mut store = JournalStore::open(&root.0, "device", Uuid::nil()).unwrap();
+        store
+            .prepare_v2_operation(key, Uuid::nil(), "revise".into(), json!({}), Vec::new())
+            .unwrap();
+        let output = process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "journal::tests::v2_freeze_survives_process_exit_at_its_first_commit",
+            ])
+            .env(TEST_ROOT, &root.0)
+            .env(TEST_KEY, key.to_string())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(73), "{output:?}");
+
+        let reopened = JournalStore::open(&root.0, "device", Uuid::nil()).unwrap();
+        let recorded = reopened.operation(key).unwrap().unwrap();
+        assert_eq!(recorded.state, OperationState::Unknown);
+        assert_eq!(recorded.prepared_request, Some(sample_wire_request()));
+    }
+
+    #[test]
     fn operation_key_is_durable_before_retry_and_conflicts_on_changed_payload() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
@@ -2801,34 +3270,6 @@ mod tests {
     }
 
     #[test]
-    fn listener_lease_blocks_only_another_listener() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut listener = open(&root, session);
-        listener.acquire_listener().unwrap();
-
-        let mut command = open(&root, session);
-        assert!(matches!(
-            command.acquire_listener(),
-            Err(JournalError::ListenerActive(pid)) if pid == process::id()
-        ));
-        command.record_entry(entry(session, 1, "hello")).unwrap();
-        command.mark_delivered("1").unwrap();
-        assert!(
-            command
-                .snapshot()
-                .unwrap()
-                .entry_by_event("1")
-                .unwrap()
-                .delivered_at_ms
-                .is_some()
-        );
-
-        drop(listener);
-        command.acquire_listener().unwrap();
-    }
-
-    #[test]
     fn operation_commit_and_acted_fact_share_one_snapshot() {
         let root = Scratch::new();
         let session = Uuid::new_v4();
@@ -2852,14 +3293,12 @@ mod tests {
     }
 
     #[test]
-    fn feed_cursor_is_origin_wide_while_pending_and_listener_leases_are_per_session() {
+    fn legacy_feed_cursor_spans_sessions() {
         let root = Scratch::new();
         let first_session = Uuid::new_v4();
         let second_session = Uuid::new_v4();
         let mut first = open(&root, first_session);
         let mut second = open(&root, second_session);
-        first.acquire_listener().unwrap();
-        second.acquire_listener().unwrap();
 
         first
             .record_entry(entry(second_session, 1, "for second"))

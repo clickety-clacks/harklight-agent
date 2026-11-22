@@ -24,6 +24,9 @@ use sha2::{Digest, Sha256};
 
 use crate::connect::{ConnectAddressResolver, resolve_configured_address};
 
+mod invitation;
+pub use invitation::start_invitation;
+
 const EXIT_LOCAL: i32 = 1;
 const EXIT_REFUSED: i32 = 2;
 const EXIT_UNSUPPORTED: i32 = 5;
@@ -95,14 +98,15 @@ struct EnrollmentContext {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ServerFile {
     address: String,
     name: String,
     port: u16,
     ca_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    origin_port: Option<u16>,
+    device_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,23 +218,35 @@ pub fn start(
     tls_name: Option<&str>,
     port: Option<&str>,
     label: Option<&str>,
-    origin_port: Option<u16>,
+    device_port: Option<u16>,
 ) -> Result<(), EnrollmentError> {
     let label = required(label, "--label")?;
-    if origin_port == Some(0) {
-        return Err(EnrollmentError::local("--origin-port must be nonzero"));
-    }
     let context = make_context(identity_dir, ca_file, connect, tls_name, port)?;
+    let device_port = device_port
+        .filter(|port| *port != 0)
+        .ok_or_else(|| EnrollmentError::local("provide --device-port for the enrolled API"))?;
 
     resolve_before_mutation(&context.endpoint)?;
     let transport = HttpsTransport::new(context.endpoint.clone(), &context.ca_pem)?;
+    initialize_identity(&context, device_port, None)?;
+    let pending = submit_existing(&context.identity_dir, label, &transport, &context.endpoint)?;
+    write_json_private(&context.identity_dir, "pending.json", &pending)?;
+    print_pending(&pending)
+}
+
+fn initialize_identity(
+    context: &EnrollmentContext,
+    device_port: u16,
+    device_url: Option<String>,
+) -> Result<(), EnrollmentError> {
     create_identity_directory(&context.identity_dir)?;
     let server = ServerFile {
         address: context.endpoint.address.clone(),
         name: context.endpoint.tls_name.clone(),
         port: context.endpoint.port,
         ca_sha256: context.ca_sha256.clone(),
-        origin_port,
+        device_port: Some(device_port),
+        device_url,
     };
     write_json_private(&context.identity_dir, "server.json", &server)?;
 
@@ -240,11 +256,7 @@ pub fn start(
         &context.identity_dir,
         "identity.pem",
         certificate_pem.as_bytes(),
-    )?;
-
-    let pending = submit_existing(&context.identity_dir, label, &transport, &context.endpoint)?;
-    write_json_private(&context.identity_dir, "pending.json", &pending)?;
-    print_pending(&pending)
+    )
 }
 
 pub fn retry(
@@ -255,6 +267,9 @@ pub fn retry(
     port: Option<&str>,
     label: Option<&str>,
 ) -> Result<(), EnrollmentError> {
+    if let Some(saved) = invitation::saved(identity_dir)? {
+        return saved.finish(true);
+    }
     let label = required(label, "--label")?;
     let context = make_context(identity_dir, ca_file, connect, tls_name, port)?;
     verify_existing_server(&context)?;
@@ -299,6 +314,9 @@ pub fn status(
     tls_name: Option<&str>,
     port: Option<&str>,
 ) -> Result<(), EnrollmentError> {
+    if let Some(saved) = invitation::saved(identity_dir)? {
+        return saved.finish(false);
+    }
     let context = make_context(identity_dir, ca_file, connect, tls_name, port)?;
     verify_existing_server(&context)?;
     resolve_before_mutation(&context.endpoint)?;
@@ -541,11 +559,24 @@ fn query_status(
     transport: &impl EnrollmentTransport,
     endpoint: &Endpoint,
 ) -> Result<StatusOutcome, EnrollmentError> {
+    query_bound_status(
+        identity_dir,
+        &pending.status_secret,
+        transport,
+        endpoint,
+        None,
+    )
+}
+
+fn query_bound_status(
+    identity_dir: &Path,
+    status_secret: &str,
+    transport: &impl EnrollmentTransport,
+    endpoint: &Endpoint,
+    expected_person: Option<&str>,
+) -> Result<StatusOutcome, EnrollmentError> {
     let response = transport
-        .post(
-            "/enroll/status",
-            &json!({"status_secret": pending.status_secret}),
-        )
+        .post("/enroll/status", &json!({"status_secret": status_secret}))
         .map_err(|error| request_error(error, endpoint))?;
     let value = parse_response(response, endpoint)?;
     if value["status"] == 404 && value["body"]["error"] == "not_found" {
@@ -559,13 +590,23 @@ fn query_status(
             "the Server returned an unsupported enrollment status response",
         ));
     }
-    let body = value.get("body").ok_or_else(|| {
-        EnrollmentError::unsupported("the Server returned an invalid enrollment status response")
-    })?;
+    status_outcome(identity_dir, &value["body"], expected_person)
+}
+
+fn status_outcome(
+    identity_dir: &Path,
+    body: &Value,
+    expected_person: Option<&str>,
+) -> Result<StatusOutcome, EnrollmentError> {
     match body.get("state").and_then(Value::as_str) {
         Some("approved") => {
             let person_id = nonempty_string(body, "person_id")?;
             let device_id = nonempty_string(body, "device_id")?;
+            if expected_person.is_some_and(|expected| expected != person_id) {
+                return Err(EnrollmentError::refused(
+                    "the approved enrollment does not match the invitation's account",
+                ));
+            }
             let enrollment = EnrollmentFile {
                 person_id: person_id.to_owned(),
                 device_id: device_id.to_owned(),
