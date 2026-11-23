@@ -25,7 +25,7 @@ impl AgentClient {
             || !nonempty_string(&receipt["message_id"])
             || !nonempty_string(&receipt["session_handle"])
             || !positive_at_most(&receipt["accepted_seq"], u64::MAX)
-            || !positive_at_most(&receipt["original_revision"], u64::MAX)
+            || receipt["original_revision"].as_u64() != Some(1)
             || result["seq"] != receipt["accepted_seq"]
             || result["revision"] != receipt["original_revision"]
             || result["session_handle"] != receipt["session_handle"]

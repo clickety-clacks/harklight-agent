@@ -119,6 +119,10 @@ fn exact_send_receipt_is_read_only_and_requires_a_matching_complete_result() {
         *conflicting.pointer_mut(path).unwrap() = value;
         cases.push((FixtureResponse::json(conflicting), 1));
     }
+    let mut later_revision = exact.clone();
+    later_revision["receipt"]["original_revision"] = json!(2);
+    later_revision["receipt"]["result"]["revision"] = json!(2);
+    cases.push((FixtureResponse::json(later_revision), 1));
     cases.push((
         FixtureResponse {
             status: "404 Not Found",
