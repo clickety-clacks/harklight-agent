@@ -193,6 +193,11 @@ enum Command {
         #[arg(long)]
         limit: Option<u64>,
     },
+    /// Read the Server's exact committed send receipt for this enrolled device.
+    SendReceiptGet {
+        #[arg(long, value_parser = parse_send_receipt_op_id)]
+        op_id: Uuid,
+    },
     /// Read the latest reported focus, or follow focus changes.
     Focus {
         #[arg(long)]
@@ -567,6 +572,7 @@ fn main() {
         Command::MessageGet { .. }
         | Command::Messages { .. }
         | Command::MessageEntries { .. }
+        | Command::SendReceiptGet { .. }
         | Command::FileGet { .. }
         | Command::Focus { follow: false } => run_device_read(&cli),
         _ => run_device_write(&cli),
@@ -673,6 +679,7 @@ fn run_device_read(cli: &Cli) {
             "message-entries",
             client.message_entries(item_id, before.as_deref(), *limit),
         ),
+        Command::SendReceiptGet { op_id } => ("send-receipt-get", client.send_receipt(*op_id)),
         Command::FileGet { file_id, output } => (
             "file-get",
             client.download_file(file_id).map(|mut file| {
@@ -718,6 +725,13 @@ fn run_device_read(cli: &Cli) {
         Err(error) if error.is_internal_error() => fail(format!("{operation}: {error}"), 1),
         Err(error) => fail(error.to_string(), 1),
     }
+}
+
+fn parse_send_receipt_op_id(input: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(input)
+        .ok()
+        .filter(|id| id.get_version_num() == 4 && id.get_variant() == uuid::Variant::RFC4122)
+        .ok_or_else(|| "--op-id must be a UUIDv4".into())
 }
 
 fn read_message_revision(

@@ -6,6 +6,40 @@ use uuid::Uuid;
 use super::{AgentClient, V2Error};
 
 impl AgentClient {
+    pub fn send_receipt(&self, op_id: Uuid) -> Result<Value, V2Error> {
+        let op_id = op_id.to_string();
+        let (response, request_id) =
+            self.read_correlated(&["agent", "send-receipts", &op_id], &[])?;
+        let receipt = &response["receipt"];
+        let result = &receipt["result"];
+        if receipt["op_id"] != op_id
+            || !nonempty_string(&receipt["device_id"])
+            || receipt["device_id"] != self.identity.device_id
+            || !nonempty_string(&receipt["person_id"])
+            || self
+                .identity
+                .person_id
+                .as_ref()
+                .is_some_and(|person| receipt["person_id"] != *person)
+            || !nonempty_string(&receipt["sender_id"])
+            || !nonempty_string(&receipt["message_id"])
+            || !nonempty_string(&receipt["session_handle"])
+            || !positive_at_most(&receipt["accepted_seq"], u64::MAX)
+            || !positive_at_most(&receipt["original_revision"], u64::MAX)
+            || result["seq"] != receipt["accepted_seq"]
+            || result["revision"] != receipt["original_revision"]
+            || result["session_handle"] != receipt["session_handle"]
+            || ["sender_id", "message_id"].into_iter().any(|field| {
+                result
+                    .get(field)
+                    .is_some_and(|value| value != &receipt[field])
+            })
+        {
+            return Err(invalid_response(&request_id));
+        }
+        Ok(response)
+    }
+
     pub fn messages(&self, session: Option<Uuid>, page: Option<&str>) -> Result<Value, V2Error> {
         let session = session.map(|session| session.to_string());
         let query: Vec<_> = [("session", session.as_deref()), ("page", page)]

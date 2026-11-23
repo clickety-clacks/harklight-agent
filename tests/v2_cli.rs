@@ -87,6 +87,186 @@ fn binary_uses_the_device_listener_for_the_historical_message_selector() {
 }
 
 #[test]
+fn exact_send_receipt_is_read_only_and_requires_a_matching_complete_result() {
+    use test_tls::FixtureResponse;
+
+    let operation = Uuid::new_v4().to_string();
+    let handle = Uuid::new_v4().to_string();
+    let exact = json!({"receipt":{
+        "person_id":"fixture-person","device_id":"fixture","op_id":operation,
+        "sender_id":"app:fixture","message_id":"original","session_handle":handle,
+        "accepted_seq":4,"original_revision":1,
+        "result":{"seq":4,"revision":1,"session_handle":handle,"original_field":true},
+    }});
+    let mut missing = exact.clone();
+    missing["receipt"]["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("session_handle");
+    let mut cases = vec![
+        (FixtureResponse::json(exact.clone()), 0),
+        (FixtureResponse::json(missing), 1),
+    ];
+    for (path, value) in [
+        ("/receipt/op_id", json!(Uuid::new_v4())),
+        ("/receipt/person_id", json!("another-person")),
+        ("/receipt/device_id", json!("another-device")),
+        ("/receipt/result/seq", json!(5)),
+        ("/receipt/result/revision", json!(2)),
+        ("/receipt/result/session_handle", json!(Uuid::new_v4())),
+    ] {
+        let mut conflicting = exact.clone();
+        *conflicting.pointer_mut(path).unwrap() = value;
+        cases.push((FixtureResponse::json(conflicting), 1));
+    }
+    cases.push((
+        FixtureResponse {
+            status: "404 Not Found",
+            headers: &[("Request-Id", "receipt-read")],
+            body: r#"{"error":"not_found"}"#.into(),
+            truncate: false,
+        },
+        2,
+    ));
+
+    for (response, exit) in cases {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![response]);
+        let fixture = CliFixture::new(&server, identity);
+        fs::write(
+            fixture.0.join("identity/enrollment.json"),
+            r#"{"device_id":"fixture","person_id":"fixture-person"}"#,
+        )
+        .unwrap();
+        let output = fixture.run(&["send-receipt-get", "--op-id", &operation]);
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        match exit {
+            0 => assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                exact
+            ),
+            1 => assert!(output.stdout.is_empty()),
+            2 => assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                json!({"kind":"refused","operation":"send-receipt-get","status":404,
+                    "error":"not_found","request_id":"receipt-read"}),
+            ),
+            _ => unreachable!(),
+        }
+        assert!(!fixture.0.join("state").exists());
+        let request = server.request();
+        assert_eq!(
+            request.line.trim_end(),
+            format!("GET /v2/agent/send-receipts/{operation} HTTP/1.1")
+        );
+        assert!(request.body.is_empty());
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|(name, _)| name == "idempotency-key")
+        );
+    }
+}
+
+#[test]
+fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation() {
+    use harklight_agent::journal::{JournalStore, OperationState};
+    use test_tls::FixtureResponse;
+
+    for (has_session, receipt_session, confirmed) in [
+        (true, Some(true), true),
+        (true, None, false),
+        (true, Some(false), false),
+        (false, None, true),
+    ] {
+        let key = Uuid::new_v4();
+        let operation = key.to_string();
+        let session = Uuid::new_v4().to_string();
+        let (responses, receiver) = std::sync::mpsc::channel();
+        let (server, identity) = SlowServer::mutual_tls_sequence_from(receiver);
+        let fixture = CliFixture::new(&server, identity);
+        let mut prepare = vec![
+            "send",
+            "--prepare",
+            "--op-id",
+            &operation,
+            "--sender-id",
+            "app:fixture",
+            "--title",
+            "Synthetic receipt",
+            "--type",
+            "fyi",
+        ];
+        if has_session {
+            prepare.extend(["--session", &session]);
+        }
+        let intent = fixture.run(&prepare);
+        assert!(intent.status.success(), "{intent:?}");
+        let intent: Value = serde_json::from_slice(&intent.stdout).unwrap();
+        let mut response = json!({"rev":4,"message":{
+            "item_id":"committed-item","rev":4,"revision":1,"sender":"app:fixture",
+            "message":intent["prepared"]["message"],"seen":false,"files":[],
+        }});
+        if let Some(matches) = receipt_session {
+            response["message"]["session"] = if matches {
+                json!(session)
+            } else {
+                json!(Uuid::new_v4())
+            };
+        }
+        responses
+            .send(vec![FixtureResponse::json(response.clone())])
+            .unwrap();
+        let execute = ["send", "--execute", "--op-id", &operation];
+        let first = fixture.run(&execute);
+        let wire = server.request();
+        assert_eq!(wire.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
+        assert!(
+            wire.headers
+                .contains(&("idempotency-key".into(), operation.clone()))
+        );
+        let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+        let saved = journal.operation(key).unwrap().unwrap();
+        for output in [
+            first,
+            fixture.run(&execute),
+            fixture.run(&prepare),
+            fixture.run(&["retry", "--op-id", &operation]),
+        ] {
+            if confirmed {
+                assert!(output.status.success(), "{output:?}");
+                let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(frame["kind"], "committed");
+                assert_eq!(frame["op_id"], operation);
+                assert_eq!(frame["response"], response);
+            } else {
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+                assert!(output.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("Do not resend."));
+            }
+        }
+        assert_eq!(saved.state, OperationState::Committed);
+        assert_eq!(saved.op_id, key);
+        assert_eq!(saved.response.as_ref(), Some(&response));
+        assert_eq!(
+            saved.prepared_request.as_ref().unwrap().body.as_bytes(),
+            wire.body
+        );
+        assert_eq!(
+            journal.operation(key).unwrap().unwrap().response,
+            saved.response
+        );
+        assert_eq!(
+            journal
+                .v2_item_id("app:fixture", &operation)
+                .unwrap()
+                .as_deref(),
+            confirmed.then_some("committed-item"),
+        );
+    }
+}
+
+#[test]
 fn binary_session_read_emits_an_empty_caught_up_boundary_from_caller_cursor() {
     let (server, identity) = SlowServer::mutual_tls(r#"{"rev":12,"changes":[],"more":false}"#);
     let fixture = CliFixture::new(&server, identity);

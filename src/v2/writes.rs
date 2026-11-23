@@ -475,7 +475,7 @@ pub(super) fn deliver(
                 .response
                 .clone()
                 .ok_or_else(|| WriteFailure::local("committed operation has no saved response"))?;
-            return Ok(committed(&operation, response));
+            return cached_committed(&operation, response);
         }
         OperationState::Rejected => {
             return Err(operation.response.map_or_else(
@@ -580,22 +580,31 @@ pub(super) fn deliver(
         )
     };
     match response {
-        Ok((response, request_id)) if valid_write_response(&operation.kind, request, &response) => {
-            journal
-                .settle_operation(key, response.clone(), None)
-                .map_err(|error| {
-                    correlated_unknown(&operation, &error.to_string(), request_id.as_deref())
-                })?;
+        Ok((response, request_id)) => {
+            let confirmed = valid_write_response(&operation.kind, request, &response);
+            let settlement = if confirmed {
+                journal.settle_operation(key, response.clone(), None)
+            } else if operation.kind == "send" {
+                journal.settle_unconfirmed_send(key, response.clone())
+            } else {
+                return Err(correlated_unknown(
+                    &operation,
+                    "server response did not match the operation",
+                    request_id.as_deref(),
+                ));
+            };
+            settlement.map_err(|error| {
+                correlated_unknown(&operation, &error.to_string(), request_id.as_deref())
+            })?;
             if !crate::journal::is_progress(&operation.request["message"]) {
                 files::cleanup_staged_uploads(&operation.uploads);
             }
-            Ok(committed(&operation, response))
+            if confirmed {
+                Ok(committed(&operation, response))
+            } else {
+                Err(unconfirmed_send())
+            }
         }
-        Ok((_, request_id)) => Err(correlated_unknown(
-            &operation,
-            "server response did not match the operation",
-            request_id.as_deref(),
-        )),
         Err(error) => Err(record_failure(journal, &operation, error)?),
     }
 }
@@ -815,7 +824,28 @@ pub(super) fn record_failure(
     Ok(WriteFailure::local(error.to_string()))
 }
 
-pub(super) fn committed(operation: &OperationRecord, response: Value) -> Value {
+fn unconfirmed_send() -> WriteFailure {
+    WriteFailure::local(
+        "Server acknowledged the send, but its result does not confirm the exact request. Do not resend.",
+    )
+}
+
+pub(super) fn cached_committed(
+    operation: &OperationRecord,
+    response: Value,
+) -> Result<Value, WriteFailure> {
+    if operation.kind == "send"
+        && !operation
+            .prepared_request
+            .as_ref()
+            .is_some_and(|request| valid_write_response("send", request, &response))
+    {
+        return Err(unconfirmed_send());
+    }
+    Ok(committed(operation, response))
+}
+
+fn committed(operation: &OperationRecord, response: Value) -> Value {
     let mut output = json!({
         "kind":"committed","operation":operation.kind,"op_id":operation.op_id,"response":response,
     });

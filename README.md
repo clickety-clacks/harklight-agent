@@ -51,6 +51,10 @@ files and writes the immutable intent locally. Run
 JSON records carry the same local request and operation IDs. A committed
 send also reports the opaque Server `item_id`.
 
+If a successful Server reply fails to confirm the exact send, the CLI
+reports it as unconfirmed with exit 1. The operation and reply remain in the
+journal and invoking the same operation again will not submit it again.
+
 Use `retry --op-id UUID` after exit 7. The CLI reuses the saved operation key,
 bytes and precondition. Use `journal-id` and pass that ID to
 `retry --journal-id ID` when a caller must distinguish a missing intent in
@@ -64,6 +68,9 @@ that already reached the Server can still have taken effect.
 - `message-get --item-id ID` reads an authoritative message and its revision
   and files. Add `--revision N` for a historical revision. The
   `--sender-id NAME --message-id ID` selector also resolves local references.
+- `send-receipt-get --op-id UUID` reads the exact original committed send
+  receipt for the enrolled device. It uses the configured device listener
+  and does not open the operation journal or repeat the send.
 - `reply --item-id ID --body TEXT` sends a chat turn. Add
   `--in-reply-to ENTRY` to correlate a person entry. A reply can carry files
   with no text.

@@ -133,6 +133,18 @@ impl SlowServer {
         .0
     }
 
+    #[allow(dead_code)] // Used by the executable-level fixture crate.
+    pub fn mutual_tls_sequence_from(
+        responses: std::sync::mpsc::Receiver<Vec<FixtureResponse>>,
+    ) -> (Self, TestIdentity) {
+        let (server, identity) = Self::serve(
+            Duration::ZERO,
+            std::iter::once_with(move || responses.recv().unwrap_or_default()).flatten(),
+            true,
+        );
+        (server, identity.unwrap())
+    }
+
     fn serve(
         delay: Duration,
         responses: impl IntoIterator<Item = FixtureResponse> + Send + 'static,

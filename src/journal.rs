@@ -1491,11 +1491,35 @@ impl JournalStore {
         response: Value,
         acted_event_id: Option<&str>,
     ) -> Result<(), JournalError> {
+        self.record_committed_operation(op_id, response, acted_event_id, true)
+    }
+
+    /// Retain the reply from a successful send HTTP response without binding
+    /// an item that the reply did not confirm.
+    pub(crate) fn settle_unconfirmed_send(
+        &mut self,
+        op_id: Uuid,
+        response: Value,
+    ) -> Result<(), JournalError> {
+        self.record_committed_operation(op_id, response, None, false)
+    }
+
+    fn record_committed_operation(
+        &mut self,
+        op_id: Uuid,
+        response: Value,
+        acted_event_id: Option<&str>,
+        bind_send_item: bool,
+    ) -> Result<(), JournalError> {
         let acted_event_id = acted_event_id.map(str::to_owned);
         let result = self.with_transaction(|tx| {
             let mut operation =
                 read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
-            if operation.protocol_v2 && operation.kind == "send" {
+            let v2_send = operation.protocol_v2 && operation.kind == "send";
+            if !bind_send_item && (!v2_send || operation.state != OperationState::Unknown) {
+                return Err(JournalError::OperationConflict(op_id));
+            }
+            if v2_send && bind_send_item {
                 let sender = operation.request["sender"]
                     .as_str()
                     .ok_or(JournalError::OperationConflict(op_id))?;
