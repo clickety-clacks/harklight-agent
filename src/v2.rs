@@ -72,6 +72,7 @@ impl AgentClient {
         path: &[&str],
         write: JsonWrite<'_>,
     ) -> Result<(Value, Option<String>), V2Error> {
+        let is_send = method == Method::POST && path == ["agent", "messages"];
         let mut request = self
             .client
             .request(method, self.url(path)?)
@@ -85,7 +86,13 @@ impl AgentClient {
                 .header(CONTENT_TYPE, "application/json")
                 .body(write.body.to_vec());
         }
-        self.read_json_correlated(request)
+        if is_send {
+            // Preserve even a non-object reply from acknowledged sends so
+            // settlement can refuse confirmation without replaying them.
+            self.read_value_correlated(request)
+        } else {
+            self.read_json_correlated(request)
+        }
     }
 
     pub fn delete(&self, path: &[&str], key: Uuid) -> Result<(), V2Error> {
@@ -162,6 +169,17 @@ impl AgentClient {
         &self,
         request: RequestBuilder,
     ) -> Result<(Value, Option<String>), V2Error> {
+        let (value, request_id) = self.read_value_correlated(request)?;
+        if !value.is_object() {
+            return Err(V2Error::InvalidResponse { request_id });
+        }
+        Ok((value, request_id))
+    }
+
+    fn read_value_correlated(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<(Value, Option<String>), V2Error> {
         let response = self.send_checked(request)?;
         let status = response.status().as_u16();
         let request_id = header(&response, "Request-Id").map(str::to_owned);
@@ -172,7 +190,6 @@ impl AgentClient {
         })?;
         serde_json::from_slice::<Value>(&bytes)
             .ok()
-            .filter(Value::is_object)
             .map(|value| (value, request_id.clone()))
             .ok_or(V2Error::InvalidResponse { request_id })
     }

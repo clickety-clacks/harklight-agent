@@ -177,19 +177,38 @@ fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation(
     use harklight_agent::journal::{JournalStore, OperationState};
     use test_tls::FixtureResponse;
 
-    for (has_session, receipt_session, mismatch, confirmed) in [
-        (true, Some(true), None, true),
-        (true, None, None, false),
-        (true, Some(false), None, false),
-        (
-            true,
-            Some(true),
-            Some(("title", json!("Different title"))),
-            false,
-        ),
-        (true, Some(true), Some(("created_at", json!(1))), false),
-        (false, None, None, true),
+    #[derive(Clone, Copy, Debug)]
+    enum Reply {
+        Complete,
+        CompleteChoice,
+        Sessionless,
+        MissingSession,
+        WrongSession,
+        WrongTitle,
+        WrongTime,
+        WrongRevision,
+        WrongChoice,
+        Array,
+        Null,
+    }
+    for reply in [
+        Reply::Complete,
+        Reply::CompleteChoice,
+        Reply::Sessionless,
+        Reply::MissingSession,
+        Reply::WrongSession,
+        Reply::WrongTitle,
+        Reply::WrongTime,
+        Reply::WrongRevision,
+        Reply::WrongChoice,
+        Reply::Array,
+        Reply::Null,
     ] {
+        let confirmed = matches!(
+            reply,
+            Reply::Complete | Reply::CompleteChoice | Reply::Sessionless
+        );
+        let choices = matches!(reply, Reply::CompleteChoice | Reply::WrongChoice);
         let key = Uuid::new_v4();
         let operation = key.to_string();
         let session = Uuid::new_v4().to_string();
@@ -206,9 +225,12 @@ fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation(
             "--title",
             "Synthetic receipt",
             "--type",
-            "fyi",
+            if choices { "request" } else { "fyi" },
         ];
-        if has_session {
+        if choices {
+            prepare.extend(["--choice", "Approve"]);
+        }
+        if !matches!(reply, Reply::Sessionless) {
             prepare.extend(["--session", &session]);
         }
         let intent = fixture.run(&prepare);
@@ -218,19 +240,28 @@ fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation(
             "item_id":"committed-item","rev":4,"revision":1,"sender":"app:fixture",
             "message":intent["prepared"]["message"],"seen":false,"files":[],
         }});
-        if let Some(matches) = receipt_session {
-            response["message"]["session"] = if matches {
-                json!(session)
-            } else {
-                json!(Uuid::new_v4())
-            };
+        if !matches!(reply, Reply::MissingSession | Reply::Sessionless) {
+            response["message"]["session"] = json!(session);
         }
-        if let Some((field, value)) = mismatch {
-            response["message"]["message"][field] = value;
+        match reply {
+            Reply::WrongSession => response["message"]["session"] = json!(Uuid::new_v4()),
+            Reply::WrongTitle => response["message"]["message"]["title"] = json!("Different title"),
+            Reply::WrongTime => response["message"]["message"]["created_at"] = json!(1),
+            Reply::WrongRevision => response["message"]["revision"] = json!(2),
+            Reply::WrongChoice => {
+                let choice = &mut response["message"]["message"]["answer_ui"]["actions"][0];
+                choice["label"] = json!("Reject");
+                choice["value"] = json!("Reject");
+            }
+            Reply::Array => response = json!([]),
+            Reply::Null => response = Value::Null,
+            _ => {}
         }
-        responses
-            .send(vec![FixtureResponse::json(response.clone())])
-            .unwrap();
+        let fixture_response = FixtureResponse {
+            status: "201 Created",
+            ..FixtureResponse::json(response.clone())
+        };
+        responses.send(vec![fixture_response]).unwrap();
         let execute = ["send", "--execute", "--op-id", &operation];
         let first = fixture.run(&execute);
         let wire = server.request();
@@ -241,27 +272,31 @@ fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation(
         );
         let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
         let saved = journal.operation(key).unwrap().unwrap();
+        let mut send = prepare.clone();
+        send.remove(1);
         for output in [
             first,
             fixture.run(&execute),
             fixture.run(&prepare),
             fixture.run(&["retry", "--op-id", &operation]),
+            fixture.run(&send),
         ] {
             if confirmed {
-                assert!(output.status.success(), "{output:?}");
+                assert!(output.status.success(), "{reply:?}: {output:?}");
                 let frame: Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(frame["kind"], "committed");
                 assert_eq!(frame["op_id"], operation);
                 assert_eq!(frame["response"], response);
             } else {
-                assert_eq!(output.status.code(), Some(1), "{output:?}");
+                assert_eq!(output.status.code(), Some(1), "{reply:?}: {output:?}");
                 assert!(output.stdout.is_empty());
                 assert!(String::from_utf8_lossy(&output.stderr).contains("Do not resend."));
             }
         }
         assert_eq!(saved.state, OperationState::Committed);
         assert_eq!(saved.op_id, key);
-        assert_eq!(saved.response.as_ref(), Some(&response));
+        // The journal's optional field reloads a literal JSON null as None.
+        assert_eq!(saved.response.as_ref().unwrap_or(&Value::Null), &response);
         assert_eq!(
             saved.prepared_request.as_ref().unwrap().body.as_bytes(),
             wire.body

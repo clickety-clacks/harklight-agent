@@ -471,11 +471,7 @@ pub(super) fn deliver(
     }
     match operation.state {
         OperationState::Committed => {
-            let response = operation
-                .response
-                .clone()
-                .ok_or_else(|| WriteFailure::local("committed operation has no saved response"))?;
-            return cached_committed(&operation, response);
+            return cached_committed(&operation);
         }
         OperationState::Rejected => {
             return Err(operation.response.map_or_else(
@@ -650,11 +646,13 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
     match kind {
         "send" => {
             valid_message(message)
+                && message["revision"].as_u64() == Some(1)
                 && message["sender"] == request_body["sender"]
                 && message["session"] == request_body["session"]
                 && ["title", "body", "created_at", "message_type", "progress"]
                     .into_iter()
                     .all(|field| message["message"][field] == request_body["message"][field])
+                && confirmed_answer_ui(&request_body["message"], &message["message"])
         }
         "revise" | "progress" | "retract" | "lifecycle" => {
             valid_message(message)
@@ -707,6 +705,25 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
         "session-end" => true,
         _ => false,
     }
+}
+
+fn confirmed_answer_ui(request: &Value, returned: &Value) -> bool {
+    let requested_ui = &request["answer_ui"];
+    let returned_ui = &returned["answer_ui"];
+    if returned_ui == requested_ui {
+        return true;
+    }
+    // A Server can explicitly degrade an unavailable custom screen to the
+    // documented plain reply (or omit the screen for non-requests).
+    requested_ui["schema"] == "attention-client.ui/1"
+        && returned["answer_ui_unavailable"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+        && if request["message_type"] == "request" {
+            returned_ui == &crate::commands::text_reply_answer_ui()
+        } else {
+            returned_ui.is_null()
+        }
 }
 
 fn valid_show_response(request: &Value, response: &Value) -> bool {
@@ -830,18 +847,20 @@ fn unconfirmed_send() -> WriteFailure {
     )
 }
 
-pub(super) fn cached_committed(
-    operation: &OperationRecord,
-    response: Value,
-) -> Result<Value, WriteFailure> {
+pub(super) fn cached_committed(operation: &OperationRecord) -> Result<Value, WriteFailure> {
     if operation.kind == "send"
         && !operation
             .prepared_request
             .as_ref()
-            .is_some_and(|request| valid_write_response("send", request, &response))
+            .zip(operation.response.as_ref())
+            .is_some_and(|(request, response)| valid_write_response("send", request, response))
     {
         return Err(unconfirmed_send());
     }
+    let response = operation
+        .response
+        .clone()
+        .ok_or_else(|| WriteFailure::local("committed operation has no saved response"))?;
     Ok(committed(operation, response))
 }
 
@@ -918,6 +937,22 @@ mod tests {
             server.ca_pem.as_bytes(),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn send_confirmation_accepts_only_the_documented_custom_screen_fallback() {
+        let request = json!({
+            "message_type":"request",
+            "answer_ui":{"schema":"attention-client.ui/1"}
+        });
+        let mut returned = json!({"answer_ui":crate::commands::text_reply_answer_ui()});
+        assert!(!confirmed_answer_ui(&request, &returned));
+
+        returned["answer_ui_unavailable"] = json!("The custom screen is unavailable");
+        assert!(confirmed_answer_ui(&request, &returned));
+
+        returned["answer_ui"]["actions"][0]["label"] = json!("Changed");
+        assert!(!confirmed_answer_ui(&request, &returned));
     }
 
     #[test]

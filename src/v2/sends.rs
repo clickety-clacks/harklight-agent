@@ -137,10 +137,8 @@ pub fn execute(
 }
 
 fn prepared_output(operation: OperationRecord) -> Result<Value, WriteFailure> {
-    if let Some(response) = &operation.response
-        && operation.state == crate::journal::OperationState::Committed
-    {
-        return writes::cached_committed(&operation, response.clone());
+    if operation.state == crate::journal::OperationState::Committed {
+        return writes::cached_committed(&operation);
     }
     if operation.state == crate::journal::OperationState::Rejected {
         return Err(WriteFailure::local(

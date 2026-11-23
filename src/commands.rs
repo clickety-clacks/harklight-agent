@@ -803,7 +803,7 @@ fn text_reply_action() -> Value {
     json!({"id":"reply","label":"Reply","kind":"text"})
 }
 
-fn text_reply_answer_ui() -> Value {
+pub(crate) fn text_reply_answer_ui() -> Value {
     json!({"schema":ANSWER_UI_SCHEMA,"actions":[text_reply_action()]})
 }
 
