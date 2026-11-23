@@ -173,11 +173,18 @@ fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation(
     use harklight_agent::journal::{JournalStore, OperationState};
     use test_tls::FixtureResponse;
 
-    for (has_session, receipt_session, confirmed) in [
-        (true, Some(true), true),
-        (true, None, false),
-        (true, Some(false), false),
-        (false, None, true),
+    for (has_session, receipt_session, mismatch, confirmed) in [
+        (true, Some(true), None, true),
+        (true, None, None, false),
+        (true, Some(false), None, false),
+        (
+            true,
+            Some(true),
+            Some(("title", json!("Different title"))),
+            false,
+        ),
+        (true, Some(true), Some(("created_at", json!(1))), false),
+        (false, None, None, true),
     ] {
         let key = Uuid::new_v4();
         let operation = key.to_string();
@@ -213,6 +220,9 @@ fn acknowledged_send_keeps_the_response_and_never_resubmits_on_bad_confirmation(
             } else {
                 json!(Uuid::new_v4())
             };
+        }
+        if let Some((field, value)) = mismatch {
+            response["message"]["message"][field] = value;
         }
         responses
             .send(vec![FixtureResponse::json(response.clone())])
