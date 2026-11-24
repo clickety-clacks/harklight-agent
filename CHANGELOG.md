@@ -1,5 +1,16 @@
 # Release notes
 
+## 0.2.4
+
+- `read --session UUID --pending --prepare` prepares a pending-only baseline for a
+  consumer that keeps its own checkpoint. It prints the pinned revision and a token and
+  serves nothing. `read --session UUID --pending --resume TOKEN` serves the waiting Chat
+  and answers for that attempt, and can be repeated with the same token after a crash.
+- `listen --follow --session UUID --after REV --on-expired exit` reports an expired
+  position in a `cursor_expired` line and exits 2 instead of taking a fresh baseline.
+- These are for callers that own their checkpoint. Ordinary `read` and `listen` are
+  unchanged. One consumer per conversation.
+
 ## 0.2.3
 
 - `listen --follow` reconnects after TLS and connection failures, unexpected
