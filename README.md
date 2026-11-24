@@ -113,8 +113,10 @@ including Chat on answered items. Use `messages` and `message-entries`
 to inspect historical state.
 The CLI keeps its active attempt in the journal. Restart with the same
 state directory and session scope to recover an interrupted attempt. An
-incomplete baseline can replay rows already printed. Deduplicate by item
-ID for answers and entry ID for Chat. A baseline row with `pending: false` updates an
+incomplete baseline can replay rows already printed. If an interrupted
+attempt's feed position has expired (HTTP 410), the CLI prints a new baseline
+that can replay rows even after an earlier `baseline_complete`. Deduplicate by
+item ID for answers and entry ID for Chat. A baseline row with `pending: false` updates an
 existing turn or a turn with a recorded action or receipt.
 
 Commit the baseline position only after the completion record.
