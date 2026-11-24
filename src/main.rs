@@ -441,8 +441,12 @@ struct EnrollStatusArgs {
 
 #[derive(Debug, Args)]
 struct FeedArgs {
-    #[arg(long)]
+    /// Take waiting work for this session only.
+    #[arg(long, value_name = "UUID")]
     session: Option<Uuid>,
+    /// Take every session's waiting work.
+    #[arg(long)]
+    all_sessions: bool,
     #[arg(long, conflicts_with = "snapshot")]
     after: Option<u64>,
     #[arg(long)]
@@ -453,7 +457,7 @@ struct FeedArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("mode").required(true).args(["follow","next"])))]
+#[command(group(ArgGroup::new("mode").args(["follow", "next"])))]
 struct ListenArgs {
     #[command(flatten)]
     feed: FeedArgs,
@@ -578,6 +582,20 @@ fn main() {
 
 fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     use std::io::{self, Write};
+
+    if let Some(args) = args {
+        if args.session.is_some() == args.all_sessions {
+            fail(
+                "Choose exactly one of --session UUID or --all-sessions. --all-sessions takes every session's waiting work.".into(),
+                commands::EXIT_REFUSED,
+            );
+        }
+        if let Command::Listen(listen) = &cli.command {
+            if !listen.follow && !listen.next {
+                fail("Choose --follow or --next.".into(), commands::EXIT_REFUSED);
+            }
+        }
+    }
 
     let identity = device_identity(cli);
     let journal = device_journal(cli, &identity.device_id);
@@ -1169,7 +1187,10 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["agent", "listen", "--follow", "--origin"]).is_err());
-        assert!(Cli::try_parse_from(["agent", "listen", "--snapshot", "--next"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["agent", "listen", "--all-sessions", "--snapshot", "--next"])
+                .is_ok()
+        );
     }
 
     #[test]

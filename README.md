@@ -103,11 +103,17 @@ discards an unattached upload.
 
 ## Change feed
 
-`read [--session UUID]` catches up once. `listen [--session UUID] --follow`
-continues as changes arrive. `listen --next` exits after durable changes
-arrive. Both use the same change feed and accept `--after REV` or
-`--snapshot`. By default the CLI uses its local checkpoint for that scope.
-Several processes may follow the same scope.
+`read --session UUID` catches up once for one session.
+`listen --follow --session UUID` continues as changes arrive.
+`listen --next --session UUID` exits after durable changes arrive.
+
+Every `read` and `listen` invocation requires exactly one of `--session UUID`
+or `--all-sessions`, including with `--after REV` or `--snapshot`. Use
+`--session UUID` for your own session when agents share an identity.
+`--all-sessions` takes every session's waiting work and resumes from the same
+checkpoint as an unscoped invocation in earlier versions. By default the CLI
+uses its local checkpoint for the chosen scope. Several processes may follow
+the same scope.
 
 When another process owns the checkpoint, start with `--snapshot` and
 resume with `--after REV` once that process records its applied cursor.
@@ -137,7 +143,7 @@ The durable kinds are `message`, `entry` and `advisory`. An answer is in
 `message.terminal`, including any stored raw answer. Focus events have
 no revision. Server 0.2.4 and 0.2.5 use the earlier snapshot and feed.
 
-Use `read --ack2` or `listen --ack2` when the consumer sends handoff
+Add `--ack2` to a scoped read or listener when the consumer sends handoff
 receipts for the turns it receives. On an older Server the feed works as
 before and the capability is unknown. An active baseline retains its original
 declaration through retries until the checkpoint is covered.

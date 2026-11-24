@@ -1,5 +1,13 @@
 # Release notes
 
+## 0.2.2
+
+- `read` and `listen` require exactly one of `--session UUID` or `--all-sessions`,
+  including with `--snapshot` and `--after`. Missing or conflicting scopes exit 2
+  before loading the identity, opening the journal, or contacting the Server.
+  `--all-sessions` takes every session's waiting work and resumes from the
+  existing unscoped checkpoint.
+
 ## 0.2.1
 
 - Agent-owned default `read` and `listen` recover pending Chat and answers on first contact or cursor expiry on a supporting Server. This includes Chat on answered items and turns retained from 0.1. The local journal retains the attempt across interruption.
