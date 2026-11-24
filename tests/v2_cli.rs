@@ -156,6 +156,40 @@ fn binary_marks_foreign_message_get_as_an_account_view() {
 }
 
 #[test]
+fn binary_refuses_to_retract_an_id_with_matches_across_pages() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({
+            "rev":4, "next_page":"another",
+            "items":[{"item_id":"i4", "rev":4, "message":{"message_id":"shared"}}]
+        })),
+        FixtureResponse::json(json!({
+            "rev":4,
+            "items":[{"item_id":"i2", "rev":2, "message":{"message_id":"shared"}}]
+        })),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["retract", "--message-id", "shared"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("matches multiple items"));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]
+            .line
+            .starts_with("GET /v2/search?message_id=shared ")
+    );
+    assert!(
+        requests[1]
+            .line
+            .starts_with("GET /v2/search?message_id=shared&page=another ")
+    );
+}
+
+#[test]
 fn feed_refuses_missing_or_conflicting_scope_before_io() {
     let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
     let session = Uuid::new_v4().to_string();
