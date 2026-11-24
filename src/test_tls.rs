@@ -133,9 +133,45 @@ impl SlowServer {
         .0
     }
 
-    fn serve(
+    fn serve<I>(
         delay: Duration,
-        responses: impl IntoIterator<Item = FixtureResponse> + Send + 'static,
+        responses: I,
+        require_identity: bool,
+    ) -> (Self, Option<TestIdentity>)
+    where
+        I: IntoIterator<Item = FixtureResponse>,
+        I::IntoIter: Send + 'static,
+    {
+        Self::serve_requests(
+            delay,
+            responses
+                .into_iter()
+                .map(|response| move |_: &RecordedRequest| Some(response)),
+            require_identity,
+        )
+    }
+
+    #[allow(dead_code)] // The executable integration tests use scripted responses.
+    pub fn respond_to(
+        respond: impl Fn(&RecordedRequest) -> Option<FixtureResponse> + Send + Sync + 'static,
+    ) -> Self {
+        let respond = Arc::new(respond);
+        Self::serve_requests(
+            Duration::ZERO,
+            std::iter::repeat_with(move || {
+                let respond = Arc::clone(&respond);
+                move |request: &RecordedRequest| respond(request)
+            }),
+            false,
+        )
+        .0
+    }
+
+    fn serve_requests(
+        delay: Duration,
+        handlers: impl IntoIterator<Item = impl FnOnce(&RecordedRequest) -> Option<FixtureResponse>>
+        + Send
+        + 'static,
         require_identity: bool,
     ) -> (Self, Option<TestIdentity>) {
         let ca_key = KeyPair::generate().unwrap();
@@ -187,7 +223,7 @@ impl SlowServer {
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
             let mut recorded = Vec::new();
-            for response in responses {
+            for respond in handlers {
                 let (tcp, _) = listener.accept().unwrap();
                 let connection = ServerConnection::new(Arc::clone(&config)).unwrap();
                 let mut reader = BufReader::new(StreamOwned::new(connection, tcp));
@@ -212,6 +248,14 @@ impl SlowServer {
                 let mut request_body = vec![0; request_content_length];
                 reader.read_exact(&mut request_body).unwrap();
 
+                let request = RecordedRequest {
+                    line: request_line,
+                    headers,
+                    body: request_body,
+                };
+                let Some(response) = respond(&request) else {
+                    break;
+                };
                 thread::sleep(delay);
 
                 let mut stream = reader.into_inner();
@@ -239,11 +283,7 @@ impl SlowServer {
                 stream.flush().unwrap();
                 stream.conn.send_close_notify();
                 let _ = stream.conn.complete_io(&mut stream.sock);
-                recorded.push(RecordedRequest {
-                    line: request_line,
-                    headers,
-                    body: request_body,
-                });
+                recorded.push(request);
             }
             recorded
         });

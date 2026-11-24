@@ -19,6 +19,7 @@ pub struct AgentClient {
     address: String,
     server_binding: String,
     identity: EnrolledIdentity,
+    ack2: bool,
 }
 
 impl AgentClient {
@@ -31,6 +32,7 @@ impl AgentClient {
             server_binding: identity.server_binding(),
             address: identity.address.clone(),
             identity,
+            ack2: false,
         })
     }
 
@@ -138,10 +140,22 @@ impl AgentClient {
             .and_then(|bytes| serde_json::from_slice::<ErrorBody>(&bytes).ok());
         let request_id =
             request_id.or_else(|| body.as_ref().and_then(|body| body.request_id.clone()));
+        if (400..500).contains(&status)
+            && !body.as_ref().is_some_and(|body| {
+                body.error.as_deref().and_then(error_status) == Some(status)
+                    && body.retryable == Some(false)
+                    && body
+                        .request_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty() && id.chars().count() <= 128)
+            })
+        {
+            return Err(V2Error::UnexpectedClientError { status, request_id });
+        }
         let (token, field) = body
             .and_then(|body| {
                 body.error
-                    .filter(|token| known_error(token))
+                    .filter(|token| error_status(token).is_some())
                     .map(|token| (token, body.field))
             })
             .map_or((None, None), |(token, field)| (Some(token), field));
@@ -198,32 +212,30 @@ pub struct JsonWrite<'a> {
 #[derive(Deserialize)]
 struct ErrorBody {
     error: Option<String>,
+    retryable: Option<bool>,
     request_id: Option<String>,
     field: Option<String>,
 }
 
-fn known_error(token: &str) -> bool {
-    matches!(
-        token,
-        "not_found"
-            | "invalid_field"
-            | "stale_request"
-            | "already_answered"
-            | "already_closed"
-            | "already_retracted"
-            | "not_answered"
-            | "idempotency_conflict"
-            | "precondition_failed"
-            | "cursor_expired"
-            | "unauthorized"
-            | "forbidden"
-            | "retry_later"
-            | "storage_unavailable"
-            | "internal_error"
-            | "payload_too_large"
-            | "unsupported"
-            | "account_paused"
-    )
+fn error_status(token: &str) -> Option<u16> {
+    Some(match token {
+        "invalid_field" | "unsupported" => 400,
+        "unauthorized" => 401,
+        "forbidden" | "account_paused" => 403,
+        "not_found" => 404,
+        "stale_request"
+        | "already_answered"
+        | "already_closed"
+        | "already_retracted"
+        | "not_answered"
+        | "idempotency_conflict" => 409,
+        "cursor_expired" => 410,
+        "precondition_failed" => 412,
+        "payload_too_large" => 413,
+        "internal_error" => 500,
+        "retry_later" | "storage_unavailable" => 503,
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -240,6 +252,13 @@ pub enum V2Error {
     LocalFile(#[source] std::io::Error),
     #[error("server sent an unexpected response (request ID {request_id:?})")]
     InvalidResponse { request_id: Option<String> },
+    #[error(
+        "HTTP {status} response was outside the Harklight API. Check the configured address or device port."
+    )]
+    UnexpectedClientError {
+        status: u16,
+        request_id: Option<String>,
+    },
     #[error("could not read HTTP {status} response (request ID {request_id:?}): {source}")]
     ResponseRead {
         status: u16,
@@ -264,9 +283,10 @@ impl V2Error {
 
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            Self::Transport { .. } | Self::InvalidResponse { .. } | Self::ResponseRead { .. } => {
-                true
-            }
+            Self::Transport { .. }
+            | Self::InvalidResponse { .. }
+            | Self::UnexpectedClientError { .. }
+            | Self::ResponseRead { .. } => true,
             Self::Http { status, .. } => *status >= 500,
             Self::InvalidPath | Self::LocalFile(_) => false,
         }
@@ -413,13 +433,13 @@ mod tests {
             Duration::ZERO,
             "409 Conflict",
             &[("Request-Id", "header-id")],
-            r#"{"error":"unexpected_detail","request_id":"body-id"}"#,
+            r#"{"error":"unexpected_detail","retryable":false,"request_id":"body-id"}"#,
         );
         let error = client_for(&bad_token).read(&["me"], &[]).unwrap_err();
         assert!(!error.to_string().contains("unexpected_detail"));
         assert!(matches!(
             error,
-            V2Error::Http { status: 409, token: None, request_id: Some(id), .. } if id == "header-id"
+            V2Error::UnexpectedClientError { status: 409, request_id: Some(id) } if id == "header-id"
         ));
         bad_token.request();
 
@@ -427,15 +447,28 @@ mod tests {
             Duration::ZERO,
             "400 Bad Request",
             &[("Request-Id", "request-id")],
-            r#"{"error":"invalid_field","field":"sender"}"#,
+            r#"{"error":"invalid_field","retryable":false,"field":"sender"}"#,
         );
         let error = client_for(&no_body_id).read(&["me"], &[]).unwrap_err();
         assert!(matches!(
             error,
-            V2Error::Http { status: 400, token: Some(token), field: Some(field), request_id: Some(id), .. }
-                if token == "invalid_field" && field == "sender" && id == "request-id"
+            V2Error::UnexpectedClientError { status: 400, request_id: Some(id) } if id == "request-id"
         ));
         no_body_id.request();
+
+        let valid = SlowServer::respond(
+            Duration::ZERO,
+            "400 Bad Request",
+            &[("Request-Id", "header-id")],
+            r#"{"error":"invalid_field","retryable":false,"field":"sender","request_id":"body-id"}"#,
+        );
+        let error = client_for(&valid).read(&["me"], &[]).unwrap_err();
+        assert!(matches!(
+            error,
+            V2Error::Http { status: 400, token: Some(token), field: Some(field), request_id: Some(id), .. }
+                if token == "invalid_field" && field == "sender" && id == "header-id"
+        ));
+        valid.request();
     }
 
     #[test]

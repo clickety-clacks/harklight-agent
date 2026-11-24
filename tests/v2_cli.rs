@@ -106,6 +106,56 @@ fn binary_session_read_emits_an_empty_caught_up_boundary_from_caller_cursor() {
 }
 
 #[test]
+fn ack2_opt_in_covers_the_baseline_json_and_sse_delivery_requests() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"rev":5,"next_page":"attempt"})),
+        FixtureResponse::json(json!({"rev":5,"changes":[]})),
+        FixtureResponse::json(json!({"rev":5,"changes":[],"more":false})),
+        FixtureResponse {
+            status: "200 OK",
+            headers: &[
+                ("Content-Type", "text/event-stream"),
+                ("Harklight-Ack2", "true"),
+            ],
+            body: concat!(
+                "id: 6\nevent: entry\n",
+                r#"data: {"item_id":"item","entry_id":"new","rev":6}"#,
+                "\n\n",
+            )
+            .into(),
+            truncate: false,
+        },
+        FixtureResponse::json(json!({"rev":6,"messages":[]})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["listen", "--next", "--ack2"]);
+    assert!(output.status.success(), "{output:?}");
+    let rows: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.last().unwrap()["data"]["entry_id"], "new");
+    assert!(fixture.run(&["messages"]).status.success());
+    let requests = server.requests();
+    for request in &requests[..4] {
+        assert!(
+            request
+                .headers
+                .contains(&("harklight-ack2".into(), "true".into()))
+        );
+    }
+    assert!(
+        !requests[4]
+            .headers
+            .iter()
+            .any(|(name, _)| name == "harklight-ack2")
+    );
+}
+
+#[test]
 fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
     use test_tls::FixtureResponse;
 
@@ -300,6 +350,103 @@ fn journal_known_legacy_progress_miss_does_not_fall_through_to_current_id() {
 }
 
 #[test]
+fn wrong_port_http_error_keeps_a_staged_upload_retryable() {
+    use harklight_agent::journal::{JournalStore, OperationState};
+    use test_tls::FixtureResponse;
+
+    let bytes = b"synthetic attachment";
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"limits":{"upload_cap_bytes_per_file":"none"}})),
+        wrong_port_response(),
+        FixtureResponse::json(json!({
+            "file_id":"uploaded","name":"fixture.txt","size":bytes.len(),
+            "sha256":hex::encode(Sha256::digest(bytes)),
+        })),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let file = fixture.0.join("fixture.txt");
+    fs::write(&file, bytes).unwrap();
+    let key = Uuid::new_v4();
+    let operation = key.to_string();
+    let output = fixture.run(&[
+        "file-upload",
+        "--file",
+        file.to_str().unwrap(),
+        "--op-id",
+        &operation,
+    ]);
+    assert_eq!(output.status.code(), Some(7), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["kind"], "outcome_unknown");
+    assert_eq!(result["status"], 400);
+    assert_eq!(result["op_id"], operation);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("address or device port"));
+
+    let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+    let saved = journal.operation(key).unwrap().unwrap();
+    assert_eq!(saved.state, OperationState::Unknown);
+    let staged = saved.uploads[0].staged_path.as_ref().unwrap();
+    assert_eq!(fs::read(staged).unwrap(), bytes);
+    fs::remove_file(file).unwrap();
+
+    let retry = fixture.run(&["retry", "--op-id", &operation]);
+    assert!(retry.status.success(), "{retry:?}");
+    assert_eq!(
+        journal.operation(key).unwrap().unwrap().state,
+        OperationState::Committed
+    );
+    assert!(!staged.exists());
+    let requests = server.requests();
+    assert_eq!(requests[0].line.trim_end(), "GET /v2/me HTTP/1.1");
+    for request in &requests[1..] {
+        assert_eq!(request.line.trim_end(), "POST /v2/files HTTP/1.1");
+        assert!(
+            request
+                .headers
+                .contains(&("idempotency-key".into(), operation.clone()))
+        );
+        assert_eq!(request.body, bytes);
+    }
+}
+
+#[test]
+fn wrong_port_http_error_is_a_read_failure_in_json_and_sse() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        wrong_port_response(),
+        wrong_port_response(),
+        FixtureResponse::json(json!({"rev":5,"changes":[],"more":false})),
+        wrong_port_response(),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    for args in [
+        &["messages"][..],
+        &["read", "--after", "5"][..],
+        &["listen", "--follow", "--after", "5"][..],
+    ] {
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("address or device port"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("refused"));
+    }
+    assert!(
+        server.requests()[3]
+            .headers
+            .contains(&("accept".into(), "text/event-stream".into()))
+    );
+}
+
+fn wrong_port_response() -> test_tls::FixtureResponse {
+    test_tls::FixtureResponse {
+        status: "400 Bad Request",
+        headers: &[("Content-Type", "text/plain")],
+        body: "Bad Request".into(),
+        truncate: false,
+    }
+}
+
+#[test]
 fn malformed_or_mismatched_write_responses_keep_the_saved_operation() {
     use harklight_agent::journal::{JournalStore, OperationState};
     use test_tls::FixtureResponse;
@@ -386,6 +533,12 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     use test_tls::FixtureResponse;
 
     let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse {
+            status: "404 Not Found",
+            headers: &[],
+            body: r#"{"error":"not_found","retryable":false,"request_id":"unsupported"}"#.into(),
+            truncate: false,
+        },
         FixtureResponse::json(json!({"rev":10,"messages":[]})),
         FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
         internal_error_response(),
@@ -443,14 +596,14 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
 
     let requests = server.requests();
-    assert!(requests[2].line.contains("after=10"));
     assert!(requests[3].line.contains("after=10"));
+    assert!(requests[4].line.contains("after=10"));
     assert!(
-        requests[4]
+        requests[5]
             .headers
             .contains(&("last-event-id".into(), "10".into()))
     );
-    assert!(requests[5].line.contains("after=12"));
+    assert!(requests[6].line.contains("after=12"));
 }
 
 #[test]

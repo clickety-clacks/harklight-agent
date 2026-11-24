@@ -18,6 +18,9 @@ use crate::journal::{JournalError, JournalStore};
 
 use super::{AgentClient, V2Error, header};
 
+mod delivery;
+use delivery::{baseline_replay, delivery_baseline};
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Change {
     pub rev: u64,
@@ -53,6 +56,7 @@ struct Batch {
     more: bool,
 }
 
+#[derive(Clone, Copy)]
 pub enum Start {
     Journal,
     After(u64),
@@ -110,14 +114,37 @@ impl FeedError {
 }
 
 impl AgentClient {
-    fn change_batch(&self, session: Option<Uuid>, after: u64) -> Result<Batch, FeedError> {
-        let after = after.to_string();
-        let session = session.map(|session| session.to_string());
-        let mut query = vec![("after", after.as_str())];
-        if let Some(session) = &session {
-            query.push(("session", session));
+    pub fn with_ack2(mut self, ack2: bool) -> Self {
+        self.ack2 = ack2;
+        self
+    }
+
+    fn delivery_request(
+        request: reqwest::blocking::RequestBuilder,
+        ack2: bool,
+    ) -> reqwest::blocking::RequestBuilder {
+        if ack2 {
+            request.header("Harklight-Ack2", "true")
+        } else {
+            request
         }
-        let value = self.read(&["agent", "changes"], &query)?;
+    }
+
+    fn change_batch(
+        &self,
+        session: Option<Uuid>,
+        after: u64,
+        ack2: bool,
+    ) -> Result<Batch, FeedError> {
+        let mut url = self.url(&["agent", "changes"])?;
+        url.query_pairs_mut()
+            .append_pair("after", &after.to_string());
+        if let Some(session) = session {
+            url.query_pairs_mut()
+                .append_pair("session", &session.to_string());
+        }
+        let request = self.client.get(url).header(ACCEPT, "application/json");
+        let value = self.read_json(Self::delivery_request(request, ack2))?;
         serde_json::from_value(value).map_err(|_| FeedError::InvalidChange)
     }
 
@@ -126,18 +153,18 @@ impl AgentClient {
         stream_client: &reqwest::blocking::Client,
         session: Option<Uuid>,
         after: u64,
+        ack2: bool,
     ) -> Result<EventStream, FeedError> {
         let mut url = self.url(&["agent", "changes"])?;
         if let Some(session) = session {
             url.query_pairs_mut()
                 .append_pair("session", &session.to_string());
         }
-        let response = self.send_checked(
-            stream_client
-                .get(url)
-                .header(ACCEPT, "text/event-stream")
-                .header("Last-Event-ID", after.to_string()),
-        )?;
+        let request = stream_client
+            .get(url)
+            .header(ACCEPT, "text/event-stream")
+            .header("Last-Event-ID", after.to_string());
+        let response = self.send_checked(Self::delivery_request(request, ack2))?;
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -153,6 +180,24 @@ impl AgentClient {
             request_id: header(&response, "Request-Id").map(str::to_owned),
             reader: BufReader::new(response),
         })
+    }
+
+    fn delivery_page(
+        &self,
+        session: Option<Uuid>,
+        page: Option<&str>,
+        ack2: bool,
+    ) -> Result<Value, FeedError> {
+        let mut url = self.url(&["agent", "delivery-baseline"])?;
+        if let Some(session) = session {
+            url.query_pairs_mut()
+                .append_pair("session", &session.to_string());
+        }
+        if let Some(page) = page {
+            url.query_pairs_mut().append_pair("page", page);
+        }
+        let request = self.client.get(url).header(ACCEPT, "application/json");
+        Ok(self.read_json(Self::delivery_request(request, ack2))?)
     }
 }
 
@@ -256,47 +301,113 @@ pub fn run(
         _ => saved,
     };
     let mut baseline_reason = "first_contact";
+    // Keep the namespace used by earlier Agent-owned attempts.
+    let baseline_key = format!(
+        "delivery-baseline:{}:{scope}:journal",
+        client.server_binding()
+    );
     let mut checkpoint = saved;
     let mut backoff_secs = 1u64;
     let focus_only = matches!(mode, Mode::Focus);
+    if uses_journal && journal.delivery_attempt(&baseline_key)?.is_some() {
+        cursor = None;
+    }
     if focus_only {
         let focus = client.read(&["agent", "focus"], &[])?;
         output(&json!({"kind":"focus","data":{"focus":focus}})).map_err(FeedError::Output)?;
         cursor = Some(0);
     }
 
+    let mut output_changes = false;
+    let mut feed_ack2 = client.ack2;
     'resume: loop {
+        if !uses_journal {
+            output_changes = false;
+        }
+        let mut delivery_lock = None;
+        let mut delivered_baseline = None;
         let mut start_position = match cursor {
             Some(rev) => rev,
-            None => match baseline(client, session) {
-                Ok((rev, records)) => {
-                    emit_value(
+            None => {
+                let delivery = if uses_journal {
+                    delivery_lock = Some(journal.lock_delivery_baseline(&baseline_key)?);
+                    let current = journal.v2_feed_cursor(&scope)?;
+                    if current != checkpoint {
+                        checkpoint = current;
+                        cursor = current;
+                        continue 'resume;
+                    }
+                    delivery_baseline(
+                        client,
+                        journal,
+                        session,
+                        &baseline_key,
+                        baseline_reason,
                         &mut output,
-                        json!({"kind":"baseline","rev":rev,"reason":baseline_reason}),
-                    )?;
-                    for change in &records {
-                        emit_change(&mut output, change)?;
+                    )
+                } else {
+                    Ok(None)
+                };
+                match delivery {
+                    Ok(Some(baseline)) => {
+                        output_changes |= !baseline.changes.is_empty();
+                        feed_ack2 = baseline.ack2;
+                        let rev = baseline.rev;
+                        delivered_baseline = Some(baseline);
+                        rev
                     }
-                    emit_value(&mut output, json!({"kind":"baseline_complete","rev":rev}))?;
-                    if uses_journal {
-                        journal.record_v2_feed(&scope, checkpoint, rev, &records, true)?;
-                        checkpoint = Some(rev);
+                    Ok(None) => {
+                        drop(delivery_lock.take());
+                        match baseline(client, session) {
+                            Ok((rev, records)) => {
+                                emit_value(
+                                    &mut output,
+                                    json!({"kind":"baseline","rev":rev,"reason":baseline_reason}),
+                                )?;
+                                for change in &records {
+                                    emit_change(&mut output, change)?;
+                                }
+                                emit_value(
+                                    &mut output,
+                                    json!({"kind":"baseline_complete","rev":rev}),
+                                )?;
+                                if uses_journal {
+                                    journal
+                                        .record_v2_feed(&scope, checkpoint, rev, &records, true)?;
+                                    checkpoint = Some(rev);
+                                }
+                                rev
+                            }
+                            Err(error)
+                                if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) =>
+                            {
+                                delay(&mut backoff_secs, retry_delay(&error));
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
-                    rev
+                    Err(error) if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) => {
+                        drop(delivery_lock);
+                        delay(&mut backoff_secs, retry_delay(&error));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) => {
-                    delay(&mut backoff_secs, retry_delay(&error));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            },
+            }
         };
 
-        let mut output_changes = false;
         loop {
-            let batch = match client.change_batch(session, start_position) {
+            let batch = match client.change_batch(session, start_position, feed_ack2) {
                 Ok(batch) => batch,
                 Err(error) if cursor_expired(&error) => {
+                    if delivered_baseline.is_some() {
+                        let mut attempt = journal
+                            .delivery_attempt(&baseline_key)?
+                            .ok_or(FeedError::InvalidSnapshot)?;
+                        attempt.renew = true;
+                        journal.save_delivery_attempt(&baseline_key, &attempt)?;
+                    }
                     cursor = None;
                     baseline_reason = "cursor_expired";
                     if focus_only {
@@ -305,7 +416,8 @@ pub fn run(
                     continue 'resume;
                 }
                 Err(error) if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) => {
-                    cursor = Some(start_position);
+                    cursor = delivered_baseline.is_none().then_some(start_position);
+                    drop(delivery_lock.take());
                     delay(&mut backoff_secs, retry_delay(&error));
                     continue 'resume;
                 }
@@ -322,16 +434,36 @@ pub fn run(
             if batch.rev < start_position || (batch.more && batch.rev == start_position) {
                 return Err(FeedError::InvalidChange);
             }
+            if let Some(baseline) = delivered_baseline.take() {
+                journal.finish_delivery_baseline(
+                    &baseline_key,
+                    &scope,
+                    checkpoint,
+                    start_position,
+                    &baseline.changes,
+                )?;
+                feed_ack2 = client.ack2;
+                checkpoint = Some(start_position);
+                drop(delivery_lock.take());
+            }
             if !focus_only {
                 for change in &batch.changes {
-                    emit_change(&mut output, change)?;
+                    if !uses_journal || !baseline_replay(journal, &baseline_key, change)? {
+                        emit_change(&mut output, change)?;
+                        output_changes = true;
+                    }
                 }
             }
             if uses_journal {
-                journal.record_v2_feed(&scope, checkpoint, batch.rev, &batch.changes, false)?;
+                journal.record_feed_after_delivery(
+                    &scope,
+                    checkpoint,
+                    batch.rev,
+                    &batch.changes,
+                    &baseline_key,
+                )?;
                 checkpoint = Some(batch.rev);
             }
-            output_changes |= !batch.changes.is_empty();
             start_position = batch.rev;
             if !batch.more {
                 break;
@@ -349,45 +481,48 @@ pub fn run(
         let Some(stream_client) = &stream_client else {
             return Ok(());
         };
-        let mut stream = match client.open_changes(stream_client, session, start_position) {
-            Ok(stream) => stream,
-            Err(error) if cursor_expired(&error) => {
-                cursor = if focus_only {
-                    Some(first_snapshot_position(client, session)?)
-                } else {
-                    None
-                };
-                baseline_reason = "cursor_expired";
-                continue;
-            }
-            Err(error) if retry_delay(&error).is_some() => {
-                cursor = Some(start_position);
-                delay(&mut backoff_secs, retry_delay(&error));
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let mut stream =
+            match client.open_changes(stream_client, session, start_position, feed_ack2) {
+                Ok(stream) => stream,
+                Err(error) if cursor_expired(&error) => {
+                    cursor = if focus_only {
+                        Some(first_snapshot_position(client, session)?)
+                    } else {
+                        None
+                    };
+                    baseline_reason = "cursor_expired";
+                    continue;
+                }
+                Err(error) if retry_delay(&error).is_some() => {
+                    cursor = Some(start_position);
+                    delay(&mut backoff_secs, retry_delay(&error));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         while let Some(event) = stream.next()? {
             match event {
                 Event::Change(change) => {
                     if change.rev <= start_position {
                         continue;
                     }
-                    if !focus_only {
+                    let emitted = !focus_only
+                        && (!uses_journal || !baseline_replay(journal, &baseline_key, &change)?);
+                    if emitted {
                         emit_change(&mut output, &change)?;
                     }
                     if uses_journal {
-                        journal.record_v2_feed(
+                        journal.record_feed_after_delivery(
                             &scope,
                             checkpoint,
                             change.rev,
                             std::slice::from_ref(&change),
-                            false,
+                            &baseline_key,
                         )?;
                         checkpoint = Some(change.rev);
                     }
                     start_position = change.rev;
-                    if matches!(mode, Mode::Next) {
+                    if emitted && matches!(mode, Mode::Next) {
                         return Ok(());
                     }
                 }
@@ -568,6 +703,7 @@ fn add_snapshot(
 
 #[cfg(test)]
 mod tests {
+    mod model;
     use std::path::PathBuf;
 
     use crate::{
@@ -659,6 +795,243 @@ mod tests {
             body: r#"{"error":"cursor_expired","retryable":false,"request_id":"expired"}"#.into(),
             truncate: false,
         }
+    }
+
+    fn baseline_unsupported() -> FixtureResponse {
+        FixtureResponse {
+            status: "404 Not Found",
+            headers: &[],
+            body: r#"{"error":"not_found","retryable":false,"request_id":"unsupported"}"#.into(),
+            truncate: false,
+        }
+    }
+
+    fn retained_turns(session: Uuid) -> (Value, Value) {
+        let chat = json!({
+            "rev":36,"kind":"entry","data":{
+                "entry_id":"retained-chat","item_id":"answered","session":session,
+                "rev":36,"position":1,"kind":"reply","author":"person",
+                "request_revision":1,"text":"Waiting chat","delivery":{"delivered":false}
+            }
+        });
+        let answer = json!({
+            "rev":38,"kind":"message","data":{
+                "item_id":"answered","session":session,"rev":38,"sender":"app:fixture",
+                "legacy_message_id":"old-request","revision":1,"message":{},"seen":false,"files":[],
+                "terminal":{"state":"answered","at_ms":100,"answer":null,
+                    "delivery":{"delivered":false}}
+            }
+        });
+        (chat, answer)
+    }
+
+    fn delivery_page(rev: u64, changes: Vec<Value>, next: Option<&str>) -> FixtureResponse {
+        let mut page = json!({"rev":rev,"changes":changes});
+        if let Some(next) = next {
+            page["next_page"] = next.into();
+        }
+        FixtureResponse::json(page)
+    }
+
+    fn delivery_start(rev: u64, page: &str) -> FixtureResponse {
+        FixtureResponse::json(json!({"rev":rev,"next_page":page}))
+    }
+
+    #[test]
+    fn first_delivery_read_keeps_retained_chat_and_answer_and_skips_ack1_only_replay() {
+        let (_root, journal) = open();
+        let session = Uuid::new_v4();
+        let scope = session.to_string();
+        let (chat, mut answer) = retained_turns(session);
+        let mut stale_answer = answer.clone();
+        stale_answer["rev"] = 42.into();
+        stale_answer["data"]["rev"] = 42.into();
+        stale_answer["data"]["seen"] = true.into();
+        answer["rev"] = 45.into();
+        answer["data"]["rev"] = 45.into();
+        let mut ack1 = chat.clone();
+        ack1["rev"] = 41.into();
+        ack1["data"]["rev"] = 41.into();
+        ack1["data"]["delivery"]["delivered"] = true.into();
+        let mut edited_answer = answer.clone();
+        edited_answer["rev"] = 46.into();
+        edited_answer["data"]["rev"] = 46.into();
+        edited_answer["data"]["result"] = json!({"status":"applied"});
+        let mut arriving_chat = chat.clone();
+        arriving_chat["rev"] = 47.into();
+        arriving_chat["data"]["rev"] = 47.into();
+        arriving_chat["data"]["entry_id"] = "arrived-after-bound".into();
+        let server = SlowServer::sequence(vec![
+            delivery_start(40, "first"),
+            delivery_page(40, vec![chat.clone()], Some("second")),
+            delivery_page(40, vec![answer.clone()], None),
+            FixtureResponse::json(
+                json!({"rev":47,"changes":[ack1,stale_answer,edited_answer.clone(),arriving_chat.clone()],"more":false}),
+            ),
+            FixtureResponse::json(json!({"rev":47,"changes":[],"more":false})),
+        ]);
+        let client = client(&server);
+        let mut output = Vec::new();
+        run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Journal,
+            Mode::Read,
+            |value| {
+                if output.len() < 4 {
+                    assert_eq!(journal.v2_feed_cursor(&scope).unwrap(), None);
+                }
+                output.push(value.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            [
+                json!({"kind":"baseline","reason":"first_contact","rev":40}),
+                chat,
+                answer,
+                json!({"kind":"baseline_complete","rev":40}),
+                edited_answer,
+                arriving_chat,
+                json!({"kind":"caught_up","rev":47}),
+            ]
+        );
+        output.clear();
+        run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Journal,
+            Mode::Read,
+            |value| {
+                output.push(value.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, [json!({"kind":"caught_up","rev":47})]);
+        assert_eq!(journal.v2_feed_cursor(&scope).unwrap(), Some(47));
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
+        let requests = server.requests();
+        assert!(
+            requests[0]
+                .line
+                .contains(&format!("/agent/delivery-baseline?session={session} "))
+        );
+        assert!(requests[1].line.contains("&page=first "));
+        assert!(requests[2].line.contains("&page=second "));
+        assert!(requests[3].line.contains("after=40"));
+        assert!(requests[4].line.contains("after=47"));
+    }
+
+    #[test]
+    fn an_active_delivery_attempt_never_falls_back_to_the_legacy_snapshot() {
+        let (_root, journal) = open();
+        let server = SlowServer::sequence(vec![
+            delivery_start(40, "active"),
+            baseline_unsupported(),
+            delivery_page(40, vec![], None),
+            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
+        ]);
+        let client = client(&server).with_ack2(true);
+        let error = run(&client, &journal, None, Start::Journal, Mode::Read, |_| {
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FeedError::Api(V2Error::Http { status: 404, .. })
+        ));
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
+        let client = client.with_ack2(false);
+        run(&client, &journal, None, Start::Journal, Mode::Read, |_| {
+            Ok(())
+        })
+        .unwrap();
+        let requests = server.requests();
+        assert_eq!(requests[1].line, requests[2].line);
+        assert!(
+            requests[2]
+                .headers
+                .contains(&("harklight-ack2".into(), "true".into()))
+        );
+        assert!(
+            requests[3]
+                .headers
+                .contains(&("harklight-ack2".into(), "true".into()))
+        );
+    }
+
+    #[test]
+    fn interrupted_expired_cursor_baseline_resumes_after_restart_and_before_listening() {
+        let (root, journal) = open();
+        let session = Uuid::new_v4();
+        let scope = session.to_string();
+        let (chat, answer) = retained_turns(session);
+        journal.record_v2_feed(&scope, None, 3, &[], false).unwrap();
+        let server = SlowServer::sequence(vec![
+            expired(),
+            delivery_start(40, "first"),
+            delivery_page(40, vec![chat.clone()], Some("second")),
+            delivery_page(40, vec![answer.clone()], None),
+            delivery_page(40, vec![chat.clone()], Some("second")),
+            delivery_page(40, vec![answer.clone()], None),
+            expired(),
+            delivery_start(50, "later"),
+            delivery_page(40, vec![chat.clone()], Some("second")),
+            delivery_page(40, vec![answer.clone()], None),
+            delivery_page(50, vec![], None),
+            FixtureResponse::json(json!({"rev":50,"changes":[],"more":false})),
+        ]);
+        let client = client(&server);
+        let err = run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Journal,
+            Mode::Read,
+            |value| {
+                assert_eq!(journal.v2_feed_cursor(&scope).unwrap(), Some(3));
+                if *value == answer {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, FeedError::Output(_)));
+        drop(journal);
+        let journal = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
+        let mut output = Vec::new();
+        run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Journal,
+            Mode::Next,
+            |value| {
+                output.push(value.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output.iter().filter(|row| **row == chat).count(), 2);
+        assert_eq!(output.iter().filter(|row| **row == answer).count(), 2);
+        assert_eq!(
+            output[0],
+            json!({"kind":"baseline","reason":"cursor_expired","rev":40})
+        );
+        assert_eq!(output.last(), Some(&json!({"kind":"caught_up","rev":50})));
+        assert_eq!(journal.v2_feed_cursor(&scope).unwrap(), Some(50));
+        let requests = server.requests();
+        assert!(requests[4].line.contains("&page=first "));
+        assert!(requests[5].line.contains("&page=second "));
+        assert!(requests[6].line.contains("after=40"));
+        assert!(requests[7].line.contains("delivery-baseline"));
+        assert!(requests[11].line.contains("after=50"));
     }
 
     fn rebuild(session: Uuid) -> Vec<FixtureResponse> {
@@ -777,6 +1150,7 @@ mod tests {
         let (_root, journal) = open();
         let session = Uuid::new_v4();
         let server = SlowServer::sequence(vec![
+            baseline_unsupported(),
             FixtureResponse::json(json!({"rev":2,"messages":[]})),
             FixtureResponse::json(json!({"rev":7,"changes":[],"more":false})),
         ]);
@@ -799,13 +1173,15 @@ mod tests {
         );
         assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
         assert_eq!(output.last(), Some(&json!({"kind":"caught_up","rev":7})));
-        assert!(server.requests()[1].line.contains("after=2"));
+        assert!(server.requests()[2].line.contains("after=2"));
     }
     #[test]
     fn default_checkpoint_does_not_advance_when_output_is_interrupted() {
         let (_root, journal) = open();
-        let baseline =
-            SlowServer::sequence(vec![FixtureResponse::json(json!({"rev":40,"messages":[]}))]);
+        let baseline = SlowServer::sequence(vec![
+            baseline_unsupported(),
+            FixtureResponse::json(json!({"rev":40,"messages":[]})),
+        ]);
         let error = run(
             &client(&baseline),
             &journal,
@@ -859,5 +1235,69 @@ mod tests {
         assert!(matches!(error, FeedError::Output(_)));
         assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(40));
         live.requests();
+    }
+    #[test]
+    fn default_reader_replays_both_pages_after_a_broken_completion_record() {
+        for (first, retry) in [(Mode::Read, Mode::Read), (Mode::Next, Mode::Next)] {
+            check_broken_completion_record(first, retry);
+        }
+    }
+
+    fn check_broken_completion_record(first_mode: Mode, retry_mode: Mode) {
+        let (root, journal) = open();
+        let session = Uuid::new_v4();
+        let (chat, answer) = retained_turns(session);
+        let server = SlowServer::sequence(vec![
+            delivery_start(40, "first"),
+            delivery_page(40, vec![chat.clone()], Some("second")),
+            delivery_page(40, vec![answer.clone()], None),
+            delivery_page(40, vec![chat.clone()], Some("second")),
+            delivery_page(40, vec![answer.clone()], None),
+            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
+        ]);
+        let client = client(&server);
+        let mut incomplete_capture = Vec::new();
+        let error = run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Journal,
+            first_mode,
+            |row| {
+                if row["kind"] == "baseline_complete" {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                incomplete_capture.push(row.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, FeedError::Output(_)));
+        assert!(incomplete_capture.contains(&chat) && incomplete_capture.contains(&answer));
+        assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
+        drop(incomplete_capture);
+        drop(journal);
+        let journal = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
+        let mut retry = Vec::new();
+        run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Journal,
+            retry_mode,
+            |row| {
+                retry.push(row.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            journal.v2_feed_cursor(&session.to_string()).unwrap(),
+            Some(40)
+        );
+        assert!(
+            retry.contains(&chat) && retry.contains(&answer),
+            "incomplete capture became unrecoverable: {retry:?}"
+        );
     }
 }

@@ -98,14 +98,48 @@ arrive. Both use the same change feed and accept `--after REV` or
 `--snapshot`. By default the CLI uses its local checkpoint for that scope.
 Several processes may follow the same scope.
 
-Use `--after REV` with your own committed cursor when another process
-consumes stdout. On first contact or cursor expiry, the CLI emits
-`baseline`, snapshot rows and `baseline_complete`. Commit the baseline
-position only after the completion record. `caught_up` supplies the last
-complete batch position, including when the batch is empty. Durable records
-carry `kind`, `rev` and `data`. The durable kinds are `message`, `entry`
-and `advisory`. An answer is in `message.terminal`, including any stored
-raw answer. Focus events have no revision.
+When another process owns the checkpoint, start with `--snapshot` and
+resume with `--after REV` once that process records its applied cursor.
+Use the same identity, endpoint, session filter and state directory across
+both commands, and give each independent consumer its own state directory.
+Both explicit starts keep the Agent 0.2.0 snapshot and resume behavior on
+all Servers and leave the CLI's default checkpoint untouched. A supplied
+`--after REV` is a feed cursor.
+
+On first contact or cursor expiry, the CLI emits
+`baseline`, baseline rows and `baseline_complete`. With Server support,
+Agent-owned default reads and listeners recover pending Chat and answers,
+including Chat on answered items. Use `messages` and `message-entries`
+to inspect historical state.
+The CLI keeps its active attempt in the journal. Restart with the same
+state directory and session scope to recover an interrupted attempt. An
+incomplete baseline can replay rows already printed. Deduplicate by item
+ID for answers and entry ID for Chat. A baseline row with `pending: false` updates an
+existing turn or a turn with a recorded action or receipt.
+
+Commit the baseline position only after the completion record.
+`caught_up` supplies the last complete batch position, including when
+the batch is empty. Durable records carry `kind`, `rev` and `data`.
+The durable kinds are `message`, `entry` and `advisory`. An answer is in
+`message.terminal`, including any stored raw answer. Focus events have
+no revision. Server 0.2.4 and 0.2.5 use the earlier snapshot and feed.
+
+Use `read --ack2` or `listen --ack2` when the consumer sends handoff
+receipts for the turns it receives. On an older Server the feed works as
+before and the capability is unknown. An active baseline retains its original
+declaration through retries until the checkpoint is covered.
+
+### Hosted upgrade to 0.2.1
+
+With the Server that supports the delivery baseline, keep using
+`harklight-agent read --session UUID` for the first or subsequent read and
+`harklight-agent listen --follow --session UUID` for a continuous listener.
+Run the same command with the same state directory after interruption.
+Use the default Agent-owned checkpoint on Hosted to recover pending work
+when the checkpoint is missing or expired. Caller-managed `--snapshot`
+and `--after` invocations keep the Agent 0.2.0 behavior, including its gap
+for waiting Chat on answered items during a historical snapshot. Server
+0.2.4 and 0.2.5 retain that earlier behavior for default reads as well.
 
 Use `focus` to read current focus and `show --item-id ID [--chat]` to request
 a view on a device. `advisory-ack --item-id ID --advisory-id ID` records
