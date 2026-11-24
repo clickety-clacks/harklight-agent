@@ -1298,3 +1298,71 @@ fn caller_follow_exits_on_expiry_without_rebaselining() {
         );
     }
 }
+
+#[test]
+fn caller_pending_refuses_missing_or_conflicting_scope_before_serving() {
+    let session = Uuid::new_v4().to_string();
+    let chat = json!({
+        "kind":"entry","rev":11,"data":{"entry_id":"waiting","item_id":"item","rev":11,
+            "author":"person","kind":"reply","text":"still waiting"},
+    });
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        test_tls::FixtureResponse::json(json!({"rev":15,"next_page":"original"})),
+        test_tls::FixtureResponse::json(json!({"rev":15,"next_page":"fresh"})),
+        test_tls::FixtureResponse::json(json!({"rev":15,"changes":[chat]})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let prepared = fixture.run(&["read", "--session", &session, "--pending", "--prepare"]);
+    assert!(prepared.status.success(), "{prepared:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prepared.stdout).unwrap()["token"],
+        "original"
+    );
+
+    for action in [&["--prepare"][..], &["--resume", "original"][..]] {
+        for scope in [
+            &[][..],
+            &["--all-sessions"][..],
+            &["--session", &session, "--all-sessions"][..],
+        ] {
+            let mut args = vec!["read", "--pending"];
+            args.extend(scope);
+            args.extend(action);
+            let rejected = fixture.run(&args);
+            assert_eq!(rejected.status.code(), Some(2), "{args:?}: {rejected:?}");
+            assert!(rejected.stdout.is_empty(), "{args:?}: {rejected:?}");
+            let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+            assert!(diagnostic.contains("--session"), "{args:?}: {diagnostic}");
+            assert!(!fixture.0.join("state").exists());
+        }
+    }
+
+    let prepared = fixture.run(&["read", "--session", &session, "--pending", "--prepare"]);
+    assert!(prepared.status.success(), "{prepared:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prepared.stdout).unwrap()["token"],
+        "fresh"
+    );
+    let resumed = fixture.run(&[
+        "read",
+        "--session",
+        &session,
+        "--pending",
+        "--resume",
+        "fresh",
+    ]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    let output = String::from_utf8(resumed.stdout).unwrap();
+    let rows: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows[1], chat);
+    assert!(!fixture.0.join("state").exists());
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].line.contains("page="));
+    assert!(!requests[1].line.contains("page="));
+    assert!(requests[2].line.contains("page=fresh"));
+}

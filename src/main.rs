@@ -602,9 +602,19 @@ fn main() {
     }
 }
 
+fn require_feed_scope(args: &FeedArgs) {
+    if args.session.is_some() == args.all_sessions {
+        fail(
+            "Choose exactly one of --session UUID or --all-sessions. --all-sessions takes every session's waiting work.".into(),
+            commands::EXIT_REFUSED,
+        );
+    }
+}
+
 fn run_pending_read(cli: &Cli, args: &ReadArgs) {
     use std::io::{self, Write};
 
+    require_feed_scope(&args.feed);
     let session = args.feed.session.expect("pending read requires a session");
     let client = AgentClient::new(device_identity(cli))
         .unwrap_or_else(|error| fail(error.to_string(), 1))
@@ -629,12 +639,7 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     use std::io::{self, Write};
 
     if let Some(args) = args {
-        if args.session.is_some() == args.all_sessions {
-            fail(
-                "Choose exactly one of --session UUID or --all-sessions. --all-sessions takes every session's waiting work.".into(),
-                commands::EXIT_REFUSED,
-            );
-        }
+        require_feed_scope(args);
         if let Command::Listen(listen) = &cli.command {
             if !listen.follow && !listen.next {
                 fail("Choose --follow or --next.".into(), commands::EXIT_REFUSED);
