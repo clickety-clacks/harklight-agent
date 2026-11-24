@@ -11,6 +11,12 @@ use crate::v2::{AgentClient, V2Error};
 
 use super::{Change, FeedError, emit_change, emit_value};
 
+pub(super) struct DeliveredBaseline {
+    pub rev: u64,
+    pub ack2: bool,
+    pub changes: Vec<Change>,
+}
+
 /// A supported delivery baseline emits pending turns in their original order.
 /// The original token remains the recoverable start of the attempt.
 pub(super) fn delivery_baseline(
@@ -21,11 +27,14 @@ pub(super) fn delivery_baseline(
     reason: &str,
     caller_supplies_cursor: bool,
     output: &mut impl FnMut(&Value) -> io::Result<()>,
-) -> Result<Option<(u64, bool)>, FeedError> {
+) -> Result<Option<DeliveredBaseline>, FeedError> {
     let mut attempt = match journal.delivery_attempt(key)? {
         Some(attempt) if !attempt.renew => attempt,
         previous => {
             let continued = previous.is_some();
+            let ack2 = previous
+                .as_ref()
+                .map_or(client.ack2, |attempt| attempt.ack2);
             let mut prior = Vec::new();
             if let Some(previous) = previous {
                 prior = previous.prior;
@@ -35,7 +44,7 @@ pub(super) fn delivery_baseline(
                     ack2: previous.ack2,
                 });
             }
-            let start = match client.delivery_page(session, None, client.ack2) {
+            let start = match client.delivery_page(session, None, ack2) {
                 Ok(start) => start,
                 Err(FeedError::Api(V2Error::Http {
                     status: 404,
@@ -49,7 +58,7 @@ pub(super) fn delivery_baseline(
                 first_page: next_delivery_page(&start)?
                     .ok_or(FeedError::InvalidSnapshot)?
                     .to_owned(),
-                ack2: client.ack2,
+                ack2,
                 expired: continued || reason == "cursor_expired",
                 complete: false,
                 renew: false,
@@ -65,8 +74,9 @@ pub(super) fn delivery_baseline(
         "first_contact"
     };
     let rev = attempt.rev;
-    let mut emitted = false;
     emit_value(output, json!({"kind":"baseline","rev":rev,"reason":reason}))?;
+    // Stdout can succeed before the receiver loses the rest of the baseline.
+    // Deduplicate within this emission only until the full boundary succeeds.
     let mut emitted_turns = BTreeMap::<String, Change>::new();
     let current = DeliveryPages {
         rev,
@@ -95,12 +105,8 @@ pub(super) fn delivery_baseline(
             let next = next_delivery_page(&response)?;
             for change in &changes {
                 let id = change.resource_key()?;
-                let previous = if caller_supplies_cursor {
-                    emitted_turns.get(&id).cloned()
-                } else {
-                    journal.baseline_change(key, change)?
-                };
-                if previous.as_ref().is_some_and(|prior| {
+                let previous = emitted_turns.get(&id);
+                if previous.is_some_and(|prior| {
                     prior.rev > change.rev || same_baseline_content(prior, change)
                 }) {
                     continue;
@@ -115,11 +121,7 @@ pub(super) fn delivery_baseline(
                 } else {
                     emit_change(output, change)?;
                 }
-                journal.record_baseline_change(key, change)?;
-                if caller_supplies_cursor {
-                    emitted_turns.insert(id, change.clone());
-                }
-                emitted = true;
+                emitted_turns.insert(id, change.clone());
             }
             match next {
                 Some(next) => page = next.to_owned(),
@@ -127,12 +129,17 @@ pub(super) fn delivery_baseline(
             }
         }
     }
-    if caller_supplies_cursor && !attempt.complete {
-        attempt.complete = true;
-        journal.save_delivery_attempt(key, &attempt)?;
-    }
+    let changes: Vec<_> = emitted_turns.into_values().collect();
     emit_value(output, json!({"kind":"baseline_complete","rev":rev}))?;
-    Ok(Some((rev, emitted)))
+    if caller_supplies_cursor {
+        attempt.complete = true;
+        journal.record_caller_baseline(key, &attempt, &changes)?;
+    }
+    Ok(Some(DeliveredBaseline {
+        rev,
+        ack2: attempt.ack2,
+        changes,
+    }))
 }
 
 fn next_delivery_page(response: &Value) -> Result<Option<&str>, FeedError> {

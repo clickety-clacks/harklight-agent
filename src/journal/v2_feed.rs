@@ -182,25 +182,37 @@ impl JournalStore {
         })
     }
 
-    pub(crate) fn record_baseline_change(
+    pub(crate) fn record_caller_baseline(
         &self,
         key: &str,
-        change: &Change,
+        attempt: &DeliveryAttempt,
+        changes: &[Change],
     ) -> Result<(), JournalError> {
-        self.with_transaction(|tx| store_change(tx, key, change))
+        self.with_transaction(|tx| {
+            for change in changes {
+                store_change(tx, key, change)?;
+            }
+            tx.execute(
+                "UPDATE meta SET value=?2 WHERE key=?1",
+                params![key, serde_json::to_string(attempt)?],
+            )?;
+            Ok(())
+        })
     }
 
     pub(crate) fn finish_delivery_baseline(
         &self,
         key: &str,
-        scope: Option<&str>,
+        scope: &str,
         observed: Option<u64>,
         position: u64,
+        changes: &[Change],
     ) -> Result<(), JournalError> {
         self.with_transaction(|tx| {
-            if let Some(scope) = scope
-                && cursor(tx, scope)? == observed
-            {
+            if cursor(tx, scope)? == observed {
+                for change in changes {
+                    store_change(tx, key, change)?;
+                }
                 tx.execute("DELETE FROM v2_feed_resources WHERE scope=?1", [scope])?;
                 tx.execute(
                     "INSERT INTO v2_feed_resources(scope,resource,rev,payload)

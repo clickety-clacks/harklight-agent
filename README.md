@@ -112,8 +112,8 @@ the baseline contains pending Chat and answers, including on answered
 items. Use `messages` and `message-entries` to inspect historical state.
 The CLI keeps its active attempt in the journal. Restart with the same
 state directory and session scope to recover an interrupted attempt. An
-interrupted downstream consumer should deduplicate by item ID for answers
-and entry ID for Chat. A baseline row with `pending: false` updates an
+incomplete baseline can replay rows already printed. Deduplicate by item
+ID for answers and entry ID for Chat. A baseline row with `pending: false` updates an
 existing turn or a turn with a recorded action or receipt.
 
 Commit the baseline position only after the completion record.
@@ -125,7 +125,8 @@ no revision. Server 0.2.4 and 0.2.5 use the earlier snapshot and feed.
 
 Use `read --ack2` or `listen --ack2` when the consumer sends handoff
 receipts for the turns it receives. On an older Server the feed works as
-before and the capability is unknown.
+before and the capability is unknown. An active baseline retains its original
+declaration through retries until the checkpoint is covered.
 
 ### Hosted upgrade to 0.2.1
 
