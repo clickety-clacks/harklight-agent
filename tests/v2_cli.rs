@@ -1133,3 +1133,236 @@ fn enroll_invitation_cli(identity: &std::path::Path, args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
+
+#[test]
+fn caller_pending_prepares_and_replays_without_agent_state() {
+    let session = Uuid::new_v4().to_string();
+    let changes = json!([
+        {"kind":"entry","rev":11,"data":{"entry_id":"chat","item_id":"closed","rev":11,
+            "author":"person","kind":"reply","delivery":{"acted":true}}},
+        {"kind":"message","rev":12,"data":{"item_id":"closed","session":session,"rev":12,
+            "terminal":{"state":"answered"}}},
+    ]);
+    let page = |i: usize| {
+        test_tls::FixtureResponse::json(if i == 0 {
+            json!({"rev":15,"changes":[changes[i]],"next_page":"page 2"})
+        } else {
+            json!({"rev":15,"changes":[changes[i]]})
+        })
+    };
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        test_tls::FixtureResponse::json(json!({"rev":15,"next_page":"token +/"})),
+        page(0),
+        page(1),
+        page(0),
+        page(1),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let read = |flag, token| {
+        let mut args = vec!["read", "--session", &session, "--pending", flag];
+        args.extend(token);
+        let result = fixture.run(&args);
+        assert!(result.status.success(), "{result:?}");
+        assert!(!fixture.0.join("state").exists());
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        read("--prepare", None),
+        [json!({"kind":"baseline_prepared","session":session,"rev":15,"token":"token +/"})]
+    );
+    let first = read("--resume", Some("token +/"));
+    assert_eq!(first, read("--resume", Some("token +/")));
+    assert_eq!(first[0]["kind"], "baseline");
+    assert_eq!(first[1]["pending"], false);
+    assert_eq!(first[1]["data"], changes[0]["data"]);
+    assert_eq!(first[2], changes[1]);
+    assert_eq!(first[3], json!({"kind":"baseline_complete","rev":15}));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 5);
+    assert!(!requests[0].line.contains("page="));
+    assert!(requests[1].line.contains("page=token+%2B%2F"));
+    assert!(requests[2].line.contains("page=page+2"));
+    assert_eq!(requests[1].line, requests[3].line);
+}
+
+#[test]
+fn caller_pending_token_or_missing_route_never_starts_fresh() {
+    let session = Uuid::new_v4().to_string();
+    for (status, body, exit, kind) in [
+        (
+            "400 Bad Request",
+            r#"{"error":"invalid_field","field":"page","retryable":false,"request_id":"invalid"}"#,
+            2,
+            "token_invalid",
+        ),
+        (
+            "404 Not Found",
+            r#"{"error":"not_found","retryable":false,"request_id":"old-server"}"#,
+            5,
+            "unsupported",
+        ),
+    ] {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![test_tls::FixtureResponse {
+            status,
+            headers: &[],
+            body: body.into(),
+            truncate: false,
+        }]);
+        let fixture = CliFixture::new(&server, identity);
+        let result = fixture.run(&[
+            "read",
+            "--session",
+            &session,
+            "--pending",
+            "--resume",
+            "bad",
+        ]);
+        assert_eq!(result.status.code(), Some(exit), "{result:?}");
+        let row: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(row["kind"], kind);
+        if exit == 2 {
+            assert_eq!(row["reason"], "invalid_field");
+            assert_eq!(row["field"], "page");
+        }
+        assert!(!fixture.0.join("state").exists());
+        assert!(server.request_line().contains("page=bad"));
+    }
+}
+
+#[test]
+fn caller_follow_exits_on_expiry_without_rebaselining() {
+    let session = Uuid::new_v4().to_string();
+    for stream in [false, true] {
+        let responses = if stream {
+            vec![
+                test_tls::FixtureResponse::json(json!({"rev":11,"changes":[],"more":false})),
+                test_tls::FixtureResponse {
+                    status: "200 OK",
+                    headers: &[("Content-Type", "text/event-stream")],
+                    body: "event: closing\ndata: {\"reason\":\"cursor_expired\"}\n\n".into(),
+                    truncate: false,
+                },
+            ]
+        } else {
+            vec![test_tls::FixtureResponse {
+                status: "410 Gone",
+                headers: &[],
+                body: r#"{"error":"cursor_expired","retryable":false,"request_id":"expired"}"#
+                    .into(),
+                truncate: false,
+            }]
+        };
+        let (server, identity) = SlowServer::mutual_tls_sequence(responses);
+        let fixture = CliFixture::new(&server, identity);
+        let journal = harklight_agent::journal::JournalStore::open(
+            &fixture.0.join("state"),
+            "fixture",
+            Uuid::nil(),
+        )
+        .unwrap();
+        journal
+            .record_v2_feed(&session, None, 7, &[], false)
+            .unwrap();
+        let result = fixture.run(&[
+            "listen",
+            "--session",
+            &session,
+            "--follow",
+            "--after",
+            "10",
+            "--on-expired",
+            "exit",
+        ]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let rows: Vec<Value> = String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let rev = if stream { 11 } else { 10 };
+        assert_eq!(
+            rows.last(),
+            Some(&json!({"kind":"cursor_expired","rev":rev}))
+        );
+        assert_eq!(rows.len(), if stream { 2 } else { 1 });
+        assert_eq!(journal.v2_feed_cursor(&session).unwrap(), Some(7));
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|request| request.line.contains("/agent/changes"))
+        );
+    }
+}
+
+#[test]
+fn caller_pending_refuses_missing_or_conflicting_scope_before_serving() {
+    let session = Uuid::new_v4().to_string();
+    let chat = json!({
+        "kind":"entry","rev":11,"data":{"entry_id":"waiting","item_id":"item","rev":11,
+            "author":"person","kind":"reply","text":"still waiting"},
+    });
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        test_tls::FixtureResponse::json(json!({"rev":15,"next_page":"original"})),
+        test_tls::FixtureResponse::json(json!({"rev":15,"next_page":"fresh"})),
+        test_tls::FixtureResponse::json(json!({"rev":15,"changes":[chat]})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let prepared = fixture.run(&["read", "--session", &session, "--pending", "--prepare"]);
+    assert!(prepared.status.success(), "{prepared:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prepared.stdout).unwrap()["token"],
+        "original"
+    );
+
+    for action in [&["--prepare"][..], &["--resume", "original"][..]] {
+        for scope in [
+            &[][..],
+            &["--all-sessions"][..],
+            &["--session", &session, "--all-sessions"][..],
+        ] {
+            let mut args = vec!["read", "--pending"];
+            args.extend(scope);
+            args.extend(action);
+            let rejected = fixture.run(&args);
+            assert_eq!(rejected.status.code(), Some(2), "{args:?}: {rejected:?}");
+            assert!(rejected.stdout.is_empty(), "{args:?}: {rejected:?}");
+            let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+            assert!(diagnostic.contains("--session"), "{args:?}: {diagnostic}");
+            assert!(!fixture.0.join("state").exists());
+        }
+    }
+
+    let prepared = fixture.run(&["read", "--session", &session, "--pending", "--prepare"]);
+    assert!(prepared.status.success(), "{prepared:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&prepared.stdout).unwrap()["token"],
+        "fresh"
+    );
+    let resumed = fixture.run(&[
+        "read",
+        "--session",
+        &session,
+        "--pending",
+        "--resume",
+        "fresh",
+    ]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    let output = String::from_utf8(resumed.stdout).unwrap();
+    let rows: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows[1], chat);
+    assert!(!fixture.0.join("state").exists());
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].line.contains("page="));
+    assert!(!requests[1].line.contains("page="));
+    assert!(requests[2].line.contains("page=fresh"));
+}

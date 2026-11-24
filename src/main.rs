@@ -164,7 +164,7 @@ enum Command {
         op_id: Option<Uuid>,
     },
     Listen(ListenArgs),
-    Read(FeedArgs),
+    Read(ReadArgs),
     /// Read an authoritative sent message and its file references.
     #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "sender_id"])))]
     MessageGet {
@@ -457,6 +457,25 @@ struct FeedArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("pending_action").args(["prepare", "resume"])))]
+struct ReadArgs {
+    #[command(flatten)]
+    feed: FeedArgs,
+    /// Read a caller-owned pending baseline without opening the Agent journal.
+    #[arg(long, requires_all = ["session", "pending_action"], conflicts_with_all = ["snapshot", "after"])]
+    pending: bool,
+    #[arg(long, requires = "pending")]
+    prepare: bool,
+    #[arg(long, requires = "pending", value_name = "TOKEN")]
+    resume: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum OnExpired {
+    Exit,
+}
+
+#[derive(Debug, Args)]
 #[command(group(ArgGroup::new("mode").args(["follow", "next"])))]
 struct ListenArgs {
     #[command(flatten)]
@@ -465,6 +484,8 @@ struct ListenArgs {
     follow: bool,
     #[arg(long)]
     next: bool,
+    #[arg(long, requires_all = ["follow", "session", "after"])]
+    on_expired: Option<OnExpired>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -560,7 +581,8 @@ fn main() {
     }
 
     match &cli.command {
-        Command::Read(args) => run_device_feed(&cli, Some(args), feed::Mode::Read),
+        Command::Read(args) if args.pending => run_pending_read(&cli, args),
+        Command::Read(args) => run_device_feed(&cli, Some(&args.feed), feed::Mode::Read),
         Command::Listen(args) => run_device_feed(
             &cli,
             Some(&args.feed),
@@ -580,16 +602,44 @@ fn main() {
     }
 }
 
+fn require_feed_scope(args: &FeedArgs) {
+    if args.session.is_some() == args.all_sessions {
+        fail(
+            "Choose exactly one of --session UUID or --all-sessions. --all-sessions takes every session's waiting work.".into(),
+            commands::EXIT_REFUSED,
+        );
+    }
+}
+
+fn run_pending_read(cli: &Cli, args: &ReadArgs) {
+    use std::io::{self, Write};
+
+    require_feed_scope(&args.feed);
+    let session = args.feed.session.expect("pending read requires a session");
+    let client = AgentClient::new(device_identity(cli))
+        .unwrap_or_else(|error| fail(error.to_string(), 1))
+        .with_ack2(args.feed.ack2);
+    let mut stdout = io::stdout().lock();
+    let result = feed::pending::run(&client, session, args.resume.as_deref(), |value| {
+        writeln!(stdout, "{value}")?;
+        stdout.flush()
+    });
+    if let Err(error) = result {
+        if let Some(value) = error.machine_result() {
+            writeln!(stdout, "{value}")
+                .and_then(|_| stdout.flush())
+                .unwrap_or_else(|error| fail(error.to_string(), 1));
+            std::process::exit(error.exit_code());
+        }
+        fail(error.to_string(), error.exit_code());
+    }
+}
+
 fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     use std::io::{self, Write};
 
     if let Some(args) = args {
-        if args.session.is_some() == args.all_sessions {
-            fail(
-                "Choose exactly one of --session UUID or --all-sessions. --all-sessions takes every session's waiting work.".into(),
-                commands::EXIT_REFUSED,
-            );
-        }
+        require_feed_scope(args);
         if let Command::Listen(listen) = &cli.command {
             if !listen.follow && !listen.next {
                 fail("Choose --follow or --next.".into(), commands::EXIT_REFUSED);
@@ -606,7 +656,13 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     let start = match args {
         Some(FeedArgs {
             after: Some(rev), ..
-        }) => feed::Start::After(*rev),
+        }) => {
+            if matches!(&cli.command, Command::Listen(args) if args.on_expired.is_some()) {
+                feed::Start::AfterUntilExpired(*rev)
+            } else {
+                feed::Start::After(*rev)
+            }
+        }
         Some(FeedArgs { snapshot: true, .. }) => feed::Start::Snapshot,
         _ => feed::Start::Journal,
     };
@@ -621,6 +677,13 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
         stdout.flush()
     });
     if let Err(error) = result {
+        if let feed::FeedError::CursorExpired { rev } = error {
+            let value = serde_json::json!({"kind":"cursor_expired","rev":rev});
+            writeln!(stdout, "{value}")
+                .and_then(|_| stdout.flush())
+                .unwrap_or_else(|error| fail(error.to_string(), 1));
+            std::process::exit(2);
+        }
         if error.is_internal_error() {
             fail(format!("{failure_context}: {error}"), error.exit_code());
         }
@@ -1542,7 +1605,7 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(cli.command, Command::Read(FeedArgs { session: Some(session), .. }) if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
+            matches!(cli.command, Command::Read(ReadArgs { feed: FeedArgs { session: Some(session), .. }, .. }) if session.to_string() == "123e4567-e89b-42d3-a456-426614174000")
         );
 
         assert!(
