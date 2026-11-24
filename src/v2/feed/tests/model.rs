@@ -169,7 +169,7 @@ impl Server {
                 }
                 if sse {
                     // A terminal error lets Follow and empty Next traces leave the loop.
-                    return Some(sse_closing("session_closed"));
+                    return Some(sse_closing("revoked"));
                 }
                 let mut response = FixtureResponse::json(json!({
                     "rev": self.head, "changes": [], "more": false,

@@ -753,7 +753,7 @@ fn follow_retries_bad_responses_from_its_last_good_position() {
 }
 
 #[test]
-fn follow_saves_receipt_only_revisions_without_reprinting_the_reply() {
+fn follow_prints_all_delivered_revisions_in_batch_and_stream() {
     use harklight_agent::journal::JournalStore;
     use test_tls::FixtureResponse;
 
@@ -767,47 +767,105 @@ fn follow_saves_receipt_only_revisions_without_reprinting_the_reply() {
     let mut acted = delivered.clone();
     acted["rev"] = 13.into();
     acted["delivery"]["acted"] = true.into();
-    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
-        FixtureResponse::json(json!({
-            "rev":11,"changes":[{"rev":11,"kind":"entry","data":first}],"more":false,
-        })),
-        FixtureResponse {
-            status: "200 OK",
-            headers: &[("Content-Type", "text/event-stream")],
-            body: format!(
-                "id: 12\nevent: entry\ndata: {delivered}\n\n\
-                 id: 13\nevent: entry\ndata: {acted}\n\n\
-                 event: closing\ndata: {{\"reason\":\"session_closed\"}}\n\n"
-            ),
-            truncate: false,
-        },
-    ]);
-    let fixture = CliFixture::new(&server, identity);
-    let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
-    journal.record_v2_feed("", None, 10, &[], false).unwrap();
+    for stream_receipt in [false, true] {
+        let mut batch = vec![json!({"rev":11,"kind":"entry","data":first})];
+        if !stream_receipt {
+            batch.push(json!({"rev":12,"kind":"entry","data":delivered}));
+        }
+        let batch_rev = if stream_receipt { 11 } else { 12 };
+        let stream = if stream_receipt {
+            format!("id: 12\nevent: entry\ndata: {delivered}\n\n")
+        } else {
+            String::new()
+        };
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+            FixtureResponse::json(json!({"rev":batch_rev,"changes":batch,"more":false})),
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[("Content-Type", "text/event-stream")],
+                body: format!(
+                    "{stream}id: 13\nevent: entry\ndata: {acted}\n\n\
+                     event: closing\ndata: {{\"reason\":\"revoked\"}}\n\n"
+                ),
+                truncate: false,
+            },
+        ]);
+        let fixture = CliFixture::new(&server, identity);
+        let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+        journal.record_v2_feed("", None, 10, &[], false).unwrap();
 
-    let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
-    assert_eq!(result.status.code(), Some(2), "{result:?}");
-    let rows: Vec<Value> = String::from_utf8(result.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .filter(|row: &Value| row["kind"] == "entry")
-        .collect();
-    assert_eq!(
-        rows,
-        [
-            json!({"kind":"entry","rev":11,"data":first}),
-            json!({"kind":"entry","rev":13,"data":acted}),
-        ]
-    );
-    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
-    let requests = server.requests();
-    assert!(
-        requests[1]
-            .headers
-            .contains(&("last-event-id".into(), "11".into()))
-    );
+        let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let rows: Vec<Value> = String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &Value| row["kind"] == "entry")
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                json!({"kind":"entry","rev":11,"data":first}),
+                json!({"kind":"entry","rev":12,"data":delivered}),
+                json!({"kind":"entry","rev":13,"data":acted}),
+            ]
+        );
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
+        let requests = server.requests();
+        assert!(
+            requests[1]
+                .headers
+                .contains(&("last-event-id".into(), batch_rev.to_string()))
+        );
+    }
+}
+
+#[test]
+fn follow_reconnects_after_an_unrecognized_closing_reason() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let batch = || FixtureResponse::json(json!({"rev":10,"changes":[],"more":false}));
+    let stream = |body: &str| FixtureResponse {
+        status: "200 OK",
+        headers: &[("Content-Type", "text/event-stream")],
+        body: body.into(),
+        truncate: false,
+    };
+    for terminal in ["revoked", "account_paused"] {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+            batch(),
+            stream("event: closing\ndata: {\"reason\":\"upstream_maintenance\"}\n\n"),
+            batch(),
+            stream(&format!(
+                "id: 11\nevent: entry\ndata: {{\"entry_id\":\"one\",\"rev\":11}}\n\n\
+                 event: closing\ndata: {{\"reason\":\"{terminal}\"}}\n\n"
+            )),
+        ]);
+        let fixture = CliFixture::new(&server, identity);
+        let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+        journal.record_v2_feed("", None, 10, &[], false).unwrap();
+
+        let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let diagnostic = String::from_utf8(result.stderr).unwrap();
+        for detail in ["upstream_maintenance", "live updates resumed", terminal] {
+            assert_eq!(diagnostic.matches(detail).count(), 1, "{diagnostic}");
+        }
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(11));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        for request in requests.iter().step_by(2) {
+            assert!(request.line.contains("after=10"), "{}", request.line);
+        }
+        for request in requests.iter().skip(1).step_by(2) {
+            assert!(
+                request
+                    .headers
+                    .contains(&("last-event-id".into(), "10".into()))
+            );
+        }
+    }
 }
 
 #[test]

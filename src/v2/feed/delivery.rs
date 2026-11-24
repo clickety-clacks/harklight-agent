@@ -105,7 +105,7 @@ pub(super) fn delivery_baseline(
                 let id = change.resource_key()?;
                 let previous = emitted_turns.get(&id);
                 if previous.is_some_and(|prior| {
-                    prior.rev > change.rev || same_ignoring_ack1(prior, change)
+                    prior.rev > change.rev || same_baseline_content(prior, change)
                 }) {
                     continue;
                 }
@@ -175,7 +175,7 @@ fn settled_turn(change: &Change) -> bool {
     delivery["acted"] == true || !delivery["outcome"].is_null()
 }
 
-pub(super) fn same_ignoring_ack1(prior: &Change, current: &Change) -> bool {
+fn same_baseline_content(prior: &Change, current: &Change) -> bool {
     let without_ack1 = |change: &Change| {
         let mut data = change.data.clone();
         data.as_object_mut()
@@ -211,5 +211,5 @@ pub(super) fn baseline_replay(
     }
     Ok(journal
         .baseline_change(key, change)?
-        .is_some_and(|prior| prior.rev >= change.rev || same_ignoring_ack1(&prior, change)))
+        .is_some_and(|prior| prior.rev >= change.rev || same_baseline_content(&prior, change)))
 }
