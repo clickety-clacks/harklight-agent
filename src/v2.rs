@@ -250,6 +250,8 @@ pub enum V2Error {
     InvalidPath,
     #[error("local file failed before the request: {0}")]
     LocalFile(#[source] std::io::Error),
+    #[error("message ID matches multiple items; use --item-id to choose one")]
+    AmbiguousMessageId,
     #[error("server sent an unexpected response (request ID {request_id:?})")]
     InvalidResponse { request_id: Option<String> },
     #[error(
@@ -277,6 +279,10 @@ pub enum V2Error {
 }
 
 impl V2Error {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Http { status: 404, token: Some(token), .. } if token == "not_found")
+    }
+
     pub fn is_internal_error(&self) -> bool {
         matches!(self, Self::Http { status: 500, token: Some(token), .. } if token == "internal_error")
     }
@@ -288,7 +294,7 @@ impl V2Error {
             | Self::UnexpectedClientError { .. }
             | Self::ResponseRead { .. } => true,
             Self::Http { status, .. } => *status >= 500,
-            Self::InvalidPath | Self::LocalFile(_) => false,
+            Self::InvalidPath | Self::LocalFile(_) | Self::AmbiguousMessageId => false,
         }
     }
 }

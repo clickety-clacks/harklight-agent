@@ -87,6 +87,75 @@ fn binary_uses_the_device_listener_for_the_historical_message_selector() {
 }
 
 #[test]
+fn binary_searches_the_account_on_the_device_listener() {
+    let session = Uuid::new_v4().to_string();
+    let (server, identity) =
+        SlowServer::mutual_tls(r#"{"rev":3,"items":[],"next_page":"opaque-page"}"#);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&[
+        "search",
+        "--session",
+        &session,
+        "--sender",
+        "app:second",
+        "--message-id",
+        "legacy-id",
+        "--state",
+        "retracted",
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["next_page"], "opaque-page");
+
+    let line = server.request_line();
+    assert!(line.starts_with("GET /v2/search?"), "{line}");
+    for filter in [
+        format!("session={session}"),
+        "sender=app%3Asecond".into(),
+        "message_id=legacy-id".into(),
+        "state=retracted".into(),
+    ] {
+        assert!(line.contains(&filter), "{line}");
+    }
+}
+
+#[test]
+fn binary_marks_foreign_message_get_as_an_account_view() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse {
+            status: "404 Not Found",
+            ..FixtureResponse::json(json!({
+                "error":"not_found", "retryable":false, "request_id":"fixture-404"
+            }))
+        },
+        FixtureResponse::json(json!({
+            "rev":4,
+            "item":{
+                "item_id":"i23", "rev":4, "sender":"app:second",
+                "request_revision":1, "message":{"title":"Other sender"},
+                "seen":false, "files":[], "terminal":null
+            }
+        })),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["message-get", "--item-id", "i23"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["view"], "account");
+    assert_eq!(result["item"]["item_id"], "i23");
+    let requests = server.requests();
+    assert_eq!(
+        requests[0].line.trim_end(),
+        "GET /v2/agent/messages/i23 HTTP/1.1"
+    );
+    assert_eq!(requests[1].line.trim_end(), "GET /v2/items/i23 HTTP/1.1");
+}
+
+#[test]
 fn feed_refuses_missing_or_conflicting_scope_before_io() {
     let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
     let session = Uuid::new_v4().to_string();

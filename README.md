@@ -73,10 +73,22 @@ that already reached the Server can still have taken effect.
 
 ## Messages, replies and Progress
 
-- `messages [--session UUID] [--page TOKEN]` lists retained messages.
-- `message-get --item-id ID` reads an authoritative message and its revision
-  and files. Add `--revision N` for a historical revision. The
-  `--sender-id NAME --message-id ID` selector also resolves local references.
+- `messages [--session UUID] [--page TOKEN]` lists the current identity's
+  retained sent messages with the existing response shape.
+- `search [--session UUID] [--sender NAME] [--message-id ID] [--state STATE]
+  [--page TOKEN]` lists retained messages across the account, newest first.
+  Repeat the filters with the returned `next_page` token.
+- `message-get --item-id ID` reads a message and its file references. Add
+  `--revision N` for a historical revision. `--message-id ID` resolves a
+  unique ID across the account. The existing `--sender-id NAME --message-id
+  ID` selector still supports qualified legacy IDs.
+- `message-entries --item-id ID` or `--message-id ID` pages through entries.
+  Both reads prefer the existing sent-message view. If the Server answers
+  `not_found` for that view, the CLI tries the account view and marks the
+  response with `"view":"account"`. The account message uses the person's
+  `item` shape, with no origin-only session, legacy ID alias, raw answer
+  or advisories. Account entries omit the sender's delivery and file-use
+  receipts. Use `file-get` to download a referenced attachment.
 - `reply --item-id ID --body TEXT` sends a chat turn. Add
   `--in-reply-to ENTRY` to correlate a person entry. A reply can carry files
   with no text.
@@ -89,7 +101,9 @@ that already reached the Server can still have taken effect.
   to revise it conditionally. The CLI reads the current content and revision
   together and keeps its existing attachments. Retry a lost outcome with
   the original operation key.
-- `retract --item-id ID`, `lifecycle --item-id ID --action ACTION`,
+- `retract --item-id ID` or `retract --message-id ID` retracts an open account
+  message. If the message ID matches several items, use the intended item ID.
+- `lifecycle --item-id ID --action ACTION`,
   `result --item-id ID --status STATUS` and `session end --session UUID`
   apply their respective state changes.
 - `receipt --item-id ID` records answer handoff. Add `--entry-id ENTRY` for
