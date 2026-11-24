@@ -87,6 +87,91 @@ fn binary_uses_the_device_listener_for_the_historical_message_selector() {
 }
 
 #[test]
+fn feed_refuses_missing_or_conflicting_scope_before_io() {
+    let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let session = Uuid::new_v4().to_string();
+    for command in [
+        &["read"][..],
+        &["listen"][..],
+        &["listen", "--next"][..],
+        &["listen", "--follow"][..],
+    ] {
+        for start in [&[][..], &["--snapshot"][..], &["--after", "5"][..]] {
+            for scope in [&[][..], &["--all-sessions", "--session", &session][..]] {
+                let output = Command::new(env!("CARGO_BIN_EXE_harklight-agent"))
+                    .arg("--identity-dir")
+                    .arg(root.join("identity"))
+                    .arg("--ca-file")
+                    .arg(root.join("ca.pem"))
+                    .arg("--state-dir")
+                    .arg(root.join("state"))
+                    .args(command)
+                    .args(start)
+                    .args(scope)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert_eq!(
+                    String::from_utf8(output.stderr).unwrap().trim_end(),
+                    "Choose exactly one of --session UUID or --all-sessions. --all-sessions takes every session's waiting work."
+                );
+                assert!(!root.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_identity_reads_pending_replies_separately_by_session() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let one = Uuid::new_v4().to_string();
+    let two = Uuid::new_v4().to_string();
+    let responses = [(&one, "reply-one"), (&two, "reply-two")]
+        .into_iter()
+        .flat_map(|(session, entry)| {
+            [
+                FixtureResponse::json(json!({"rev":10,"next_page":entry})),
+                FixtureResponse::json(json!({"rev":10,"changes":[{
+                    "kind":"entry","rev":7,"data":{
+                        "entry_id":entry,"item_id":"item","rev":7,
+                        "session":session,"author":"person","kind":"reply"
+                    }
+                }]})),
+                FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
+            ]
+        })
+        .collect();
+    let (server, identity) = SlowServer::mutual_tls_sequence(responses);
+    let fixture = CliFixture::new(&server, identity);
+    let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+    for (session, entry, other) in [(&one, "reply-one", &two), (&two, "reply-two", &one)] {
+        let output = fixture.run(&["read", "--session", session]);
+        assert!(output.status.success(), "{output:?}");
+        let entries: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["kind"] == "entry")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["data"]["entry_id"], entry);
+        assert_eq!(journal.v2_feed_cursor(session).unwrap(), Some(10));
+        if session == &one {
+            assert_eq!(journal.v2_feed_cursor(other).unwrap(), None);
+        }
+    }
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
+    for (requests, session) in server.requests().chunks(3).zip([one, two]) {
+        for request in requests {
+            assert!(request.line.contains(&format!("session={session}")));
+        }
+    }
+}
+
+#[test]
 fn binary_session_read_emits_an_empty_caught_up_boundary_from_caller_cursor() {
     let (server, identity) = SlowServer::mutual_tls(r#"{"rev":12,"changes":[],"more":false}"#);
     let fixture = CliFixture::new(&server, identity);
@@ -130,7 +215,7 @@ fn ack2_opt_in_covers_the_baseline_json_and_sse_delivery_requests() {
         FixtureResponse::json(json!({"rev":6,"messages":[]})),
     ]);
     let fixture = CliFixture::new(&server, identity);
-    let output = fixture.run(&["listen", "--next", "--ack2"]);
+    let output = fixture.run(&["listen", "--next", "--all-sessions", "--ack2"]);
     assert!(output.status.success(), "{output:?}");
     let rows: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
@@ -420,10 +505,11 @@ fn wrong_port_http_error_is_a_read_failure_in_json_and_sse() {
         wrong_port_response(),
     ]);
     let fixture = CliFixture::new(&server, identity);
+    let session = Uuid::new_v4().to_string();
     for args in [
         &["messages"][..],
-        &["read", "--after", "5"][..],
-        &["listen", "--follow", "--after", "5"][..],
+        &["read", "--all-sessions", "--after", "5"][..],
+        &["listen", "--follow", "--session", &session, "--after", "5"][..],
     ] {
         let output = fixture.run(args);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
@@ -533,14 +619,6 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     use test_tls::FixtureResponse;
 
     let (server, identity) = SlowServer::mutual_tls_sequence(vec![
-        FixtureResponse {
-            status: "404 Not Found",
-            headers: &[],
-            body: r#"{"error":"not_found","retryable":false,"request_id":"unsupported"}"#.into(),
-            truncate: false,
-        },
-        FixtureResponse::json(json!({"rev":10,"messages":[]})),
-        FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
         internal_error_response(),
         FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
         FixtureResponse {
@@ -555,11 +633,10 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
         FixtureResponse::json(json!({"rev":13,"changes":[],"more":false})),
     ]);
     let fixture = CliFixture::new(&server, identity);
-    assert!(fixture.run(&["read"]).status.success());
     let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
-    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(10));
+    journal.record_v2_feed("", None, 10, &[], false).unwrap();
 
-    let batch = fixture.run(&["listen", "--follow"]);
+    let batch = fixture.run(&["listen", "--follow", "--all-sessions"]);
     assert_eq!(batch.status.code(), Some(1), "{batch:?}");
     assert!(batch.stdout.is_empty());
     let diagnostic = String::from_utf8(batch.stderr).unwrap();
@@ -573,7 +650,7 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     }
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(10));
 
-    let stream = fixture.run(&["listen", "--follow"]);
+    let stream = fixture.run(&["listen", "--follow", "--all-sessions"]);
     assert_eq!(stream.status.code(), Some(1), "{stream:?}");
     let diagnostic = String::from_utf8(stream.stderr).unwrap();
     for detail in [
@@ -592,18 +669,18 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1]["rev"], 12);
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(12));
-    assert!(fixture.run(&["read"]).status.success());
+    assert!(fixture.run(&["read", "--all-sessions"]).status.success());
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
 
     let requests = server.requests();
-    assert!(requests[3].line.contains("after=10"));
-    assert!(requests[4].line.contains("after=10"));
+    assert!(requests[0].line.contains("after=10"));
+    assert!(requests[1].line.contains("after=10"));
     assert!(
-        requests[5]
+        requests[2]
             .headers
             .contains(&("last-event-id".into(), "10".into()))
     );
-    assert!(requests[6].line.contains("after=12"));
+    assert!(requests[3].line.contains("after=12"));
 }
 
 #[test]
