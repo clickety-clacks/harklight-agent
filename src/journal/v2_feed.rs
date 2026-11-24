@@ -17,6 +17,17 @@ pub(crate) struct DeliveryAttempt {
     pub expired: bool,
     #[serde(default)]
     pub complete: bool,
+    #[serde(default)]
+    pub renew: bool,
+    #[serde(default)]
+    pub prior: Vec<DeliveryPages>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct DeliveryPages {
+    pub rev: u64,
+    pub first_page: String,
+    pub ack2: bool,
 }
 
 impl JournalStore {

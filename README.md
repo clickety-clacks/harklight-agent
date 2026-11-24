@@ -98,8 +98,15 @@ arrive. Both use the same change feed and accept `--after REV` or
 `--snapshot`. By default the CLI uses its local checkpoint for that scope.
 Several processes may follow the same scope.
 
-Use `--after REV` with your own committed cursor when another process
-consumes stdout. On first contact or cursor expiry, the CLI emits
+When another process owns the checkpoint, start with `--snapshot` and
+resume with `--after REV` once that process records its applied cursor.
+Use the same identity, endpoint, session filter and state directory across
+both commands, and give each independent consumer its own state directory.
+Neither explicit start advances the CLI's default checkpoint. A covering
+`--after` acknowledges the caller's baseline after its own capture, even
+if the previous CLI process ended before catching up.
+
+On first contact or cursor expiry, the CLI emits
 `baseline`, delivery rows and `baseline_complete`. With Server support,
 the baseline contains pending Chat and answers, including on answered
 items. Use `messages` and `message-entries` to inspect historical state.
@@ -119,6 +126,18 @@ no revision. Server 0.2.4 and 0.2.5 use the earlier snapshot and feed.
 Use `read --ack2` or `listen --ack2` when the consumer sends handoff
 receipts for the turns it receives. On an older Server the feed works as
 before and the capability is unknown.
+
+### Hosted upgrade to 0.2.1
+
+With the Server that supports the delivery baseline, keep using
+`harklight-agent read --session UUID` for the first or subsequent read and
+`harklight-agent listen --follow --session UUID` for a continuous listener.
+Run the same command with the same state directory after interruption.
+The CLI recovers a pending baseline automatically when the checkpoint is
+missing or expired. A caller-managed listener uses `--snapshot` on first
+contact and replaces it with `--after REV` after committing its own cursor.
+Server 0.2.4 and 0.2.5 retain the older snapshot behavior, including its
+gap for waiting Chat on answered items.
 
 Use `focus` to read current focus and `show --item-id ID [--chat]` to request
 a view on a device. `advisory-ack --item-id ID --advisory-id ID` records

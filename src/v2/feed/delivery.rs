@@ -1,9 +1,12 @@
-use std::{collections::BTreeSet, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::journal::{DeliveryAttempt, JournalStore};
+use crate::journal::{DeliveryAttempt, DeliveryPages, JournalStore};
 use crate::v2::{AgentClient, V2Error};
 
 use super::{Change, FeedError, emit_change, emit_value};
@@ -19,16 +22,26 @@ pub(super) fn delivery_baseline(
     caller_supplies_cursor: bool,
     output: &mut impl FnMut(&Value) -> io::Result<()>,
 ) -> Result<Option<(u64, bool)>, FeedError> {
-    let attempt = match journal.delivery_attempt(key)? {
-        Some(attempt) => attempt,
-        None => {
+    let mut attempt = match journal.delivery_attempt(key)? {
+        Some(attempt) if !attempt.renew => attempt,
+        previous => {
+            let continued = previous.is_some();
+            let mut prior = Vec::new();
+            if let Some(previous) = previous {
+                prior = previous.prior;
+                prior.push(DeliveryPages {
+                    rev: previous.rev,
+                    first_page: previous.first_page,
+                    ack2: previous.ack2,
+                });
+            }
             let start = match client.delivery_page(session, None, client.ack2) {
                 Ok(start) => start,
                 Err(FeedError::Api(V2Error::Http {
                     status: 404,
                     token: Some(token),
                     ..
-                })) if token == "not_found" => return Ok(None),
+                })) if !continued && token == "not_found" => return Ok(None),
                 Err(error) => return Err(error),
             };
             let attempt = DeliveryAttempt {
@@ -37,8 +50,10 @@ pub(super) fn delivery_baseline(
                     .ok_or(FeedError::InvalidSnapshot)?
                     .to_owned(),
                 ack2: client.ack2,
-                expired: reason == "cursor_expired",
+                expired: continued || reason == "cursor_expired",
                 complete: false,
+                renew: false,
+                prior,
             };
             journal.save_delivery_attempt(key, &attempt)?;
             attempt
@@ -52,57 +67,69 @@ pub(super) fn delivery_baseline(
     let rev = attempt.rev;
     let mut emitted = false;
     emit_value(output, json!({"kind":"baseline","rev":rev,"reason":reason}))?;
-    let mut page = attempt.first_page;
-    let mut visited = BTreeSet::new();
-    let mut emitted_ids = BTreeSet::new();
-    loop {
-        if !visited.insert(page.clone()) {
-            return Err(FeedError::InvalidSnapshot);
-        }
-        let response = client.delivery_page(session, Some(&page), attempt.ack2)?;
-        if response["rev"] != rev {
-            return Err(FeedError::InvalidSnapshot);
-        }
-        let changes: Vec<Change> = serde_json::from_value(response["changes"].clone())
-            .map_err(|_| FeedError::InvalidSnapshot)?;
-        if changes
-            .iter()
-            .any(|change| !valid_pending_change(change, session))
-        {
-            return Err(FeedError::InvalidSnapshot);
-        }
-        let next = next_delivery_page(&response)?;
-        for change in &changes {
-            let id = change.resource_key()?;
-            let previous = if !caller_supplies_cursor || emitted_ids.contains(&id) {
-                journal.baseline_change(key, change)?
-            } else {
-                None
-            };
-            if previous
-                .as_ref()
-                .is_some_and(|prior| prior.rev > change.rev || same_baseline_content(prior, change))
+    let mut emitted_turns = BTreeMap::<String, Change>::new();
+    let current = DeliveryPages {
+        rev,
+        first_page: attempt.first_page.clone(),
+        ack2: attempt.ack2,
+    };
+    for pages in attempt.prior.iter().chain(std::iter::once(&current)) {
+        let mut page = pages.first_page.clone();
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(page.clone()) {
+                return Err(FeedError::InvalidSnapshot);
+            }
+            let response = client.delivery_page(session, Some(&page), pages.ack2)?;
+            if response["rev"] != pages.rev {
+                return Err(FeedError::InvalidSnapshot);
+            }
+            let changes: Vec<Change> = serde_json::from_value(response["changes"].clone())
+                .map_err(|_| FeedError::InvalidSnapshot)?;
+            if changes
+                .iter()
+                .any(|change| !valid_pending_change(change, session))
             {
-                continue;
+                return Err(FeedError::InvalidSnapshot);
             }
-            if previous.is_some() || settled_turn(change) {
-                emit_value(
-                    output,
-                    json!({
-                        "kind":change.kind,"rev":change.rev,"data":change.data,"pending":false,
-                    }),
-                )?;
-            } else {
-                emit_change(output, change)?;
+            let next = next_delivery_page(&response)?;
+            for change in &changes {
+                let id = change.resource_key()?;
+                let previous = if caller_supplies_cursor {
+                    emitted_turns.get(&id).cloned()
+                } else {
+                    journal.baseline_change(key, change)?
+                };
+                if previous.as_ref().is_some_and(|prior| {
+                    prior.rev > change.rev || same_baseline_content(prior, change)
+                }) {
+                    continue;
+                }
+                if previous.is_some() || settled_turn(change) {
+                    emit_value(
+                        output,
+                        json!({
+                            "kind":change.kind,"rev":change.rev,"data":change.data,"pending":false,
+                        }),
+                    )?;
+                } else {
+                    emit_change(output, change)?;
+                }
+                journal.record_baseline_change(key, change)?;
+                if caller_supplies_cursor {
+                    emitted_turns.insert(id, change.clone());
+                }
+                emitted = true;
             }
-            journal.record_baseline_change(key, change)?;
-            emitted_ids.insert(id);
-            emitted = true;
+            match next {
+                Some(next) => page = next.to_owned(),
+                None => break,
+            }
         }
-        match next {
-            Some(next) => page = next.to_owned(),
-            None => break,
-        }
+    }
+    if caller_supplies_cursor && !attempt.complete {
+        attempt.complete = true;
+        journal.save_delivery_attempt(key, &attempt)?;
     }
     emit_value(output, json!({"kind":"baseline_complete","rev":rev}))?;
     Ok(Some((rev, emitted)))

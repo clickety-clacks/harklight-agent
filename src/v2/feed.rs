@@ -297,8 +297,7 @@ pub fn run(
     let mut baseline_reason = "first_contact";
     let reader = match start {
         Start::Journal => "journal",
-        Start::After(_) => "caller",
-        Start::Snapshot => "snapshot",
+        Start::After(_) | Start::Snapshot => "caller",
     };
     let baseline_key = format!(
         "delivery-baseline:{}:{scope}:{reader}",
@@ -307,13 +306,20 @@ pub fn run(
     let mut checkpoint = saved;
     let mut backoff_secs = 1u64;
     let focus_only = matches!(mode, Mode::Focus);
-    let caller_supplies_cursor = matches!(start, Start::After(_));
+    let caller_supplies_cursor = matches!(start, Start::After(_) | Start::Snapshot);
     if !focus_only && journal.delivery_attempt(&baseline_key)?.is_some() {
         let _lock = journal.lock_delivery_baseline(&baseline_key)?;
-        if let Some(attempt) = journal.delivery_attempt(&baseline_key)? {
+        if let Some(mut attempt) = journal.delivery_attempt(&baseline_key)? {
             if matches!(start, Start::After(after) if attempt.complete && after >= attempt.rev) {
                 journal.clear_delivery_attempt(&baseline_key)?;
             } else {
+                if let Start::After(after) = start {
+                    let retained = attempt.prior.len();
+                    attempt.prior.retain(|pages| pages.rev > after);
+                    if attempt.prior.len() != retained {
+                        journal.save_delivery_attempt(&baseline_key, &attempt)?;
+                    }
+                }
                 cursor = None;
             }
         }
@@ -399,7 +405,15 @@ pub fn run(
                 Ok(batch) => batch,
                 Err(error) if cursor_expired(&error) => {
                     if applying_delivery {
-                        journal.clear_delivery_attempt(&baseline_key)?;
+                        if caller_supplies_cursor {
+                            let mut attempt = journal
+                                .delivery_attempt(&baseline_key)?
+                                .ok_or(FeedError::InvalidSnapshot)?;
+                            attempt.renew = true;
+                            journal.save_delivery_attempt(&baseline_key, &attempt)?;
+                        } else {
+                            journal.clear_delivery_attempt(&baseline_key)?;
+                        }
                     }
                     cursor = None;
                     baseline_reason = "cursor_expired";
@@ -428,13 +442,7 @@ pub fn run(
                 return Err(FeedError::InvalidChange);
             }
             if applying_delivery {
-                if caller_supplies_cursor {
-                    let mut attempt = journal
-                        .delivery_attempt(&baseline_key)?
-                        .ok_or(FeedError::InvalidSnapshot)?;
-                    attempt.complete = true;
-                    journal.save_delivery_attempt(&baseline_key, &attempt)?;
-                } else {
+                if !caller_supplies_cursor {
                     journal.finish_delivery_baseline(
                         &baseline_key,
                         uses_journal.then_some(scope.as_str()),
@@ -965,7 +973,6 @@ mod tests {
         let session = Uuid::new_v4();
         let (chat, _) = retained_turns(session);
         let server = SlowServer::sequence(vec![
-            expired(),
             delivery_start(40, "same-attempt"),
             delivery_page(40, vec![chat.clone()], None),
             FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
@@ -974,13 +981,13 @@ mod tests {
             FixtureResponse::json(json!({"rev":41,"changes":[],"more":false})),
         ]);
         let client = client(&server);
-        for cursor in [3, 3, 40] {
+        for start in [Start::Snapshot, Start::Snapshot, Start::After(40)] {
             let mut output = Vec::new();
             run(
                 &client,
                 &journal,
                 Some(session),
-                Start::After(cursor),
+                start,
                 Mode::Read,
                 |value| {
                     output.push(value.clone());
@@ -988,12 +995,89 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(output.contains(&chat), cursor == 3);
+            assert_eq!(output.contains(&chat), matches!(start, Start::Snapshot));
         }
         assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
         let requests = server.requests();
-        assert_eq!(requests[2].line, requests[4].line);
-        assert!(requests[6].line.contains("after=40"));
+        assert_eq!(requests[1].line, requests[3].line);
+        assert!(requests[5].line.contains("after=40"));
+    }
+
+    #[test]
+    fn caller_recovery_retains_an_unacknowledged_attempt_across_baseline_expiry() {
+        let (root, journal) = open();
+        let session = Uuid::new_v4();
+        let (chat, answer) = retained_turns(session);
+        let server = SlowServer::sequence(vec![
+            delivery_start(40, "old"),
+            delivery_page(40, vec![chat.clone()], None),
+            expired(),
+            delivery_start(50, "new"),
+            delivery_page(40, vec![chat.clone()], None),
+            baseline_unsupported(),
+            delivery_page(40, vec![chat.clone()], None),
+            delivery_page(50, vec![answer.clone()], None),
+            FixtureResponse::json(json!({"rev":50,"changes":[],"more":false})),
+            FixtureResponse::json(json!({"rev":51,"changes":[],"more":false})),
+        ]);
+        let client = client(&server);
+        let error = run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Snapshot,
+            Mode::Read,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FeedError::Api(V2Error::Http { status: 404, .. })
+        ));
+
+        drop(journal);
+        let journal = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
+        let mut output = Vec::new();
+        run(
+            &client,
+            &journal,
+            Some(session),
+            Start::Snapshot,
+            Mode::Read,
+            |value| {
+                output.push(value.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            [
+                json!({"kind":"baseline","reason":"cursor_expired","rev":50}),
+                chat,
+                answer,
+                json!({"kind":"baseline_complete","rev":50}),
+                json!({"kind":"caught_up","rev":50}),
+            ]
+        );
+        run(
+            &client,
+            &journal,
+            Some(session),
+            Start::After(50),
+            Mode::Read,
+            |value| {
+                assert_eq!(*value, json!({"kind":"caught_up","rev":51}));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
+        let requests = server.requests();
+        assert_eq!(requests[1].line, requests[4].line);
+        assert_eq!(requests[4].line, requests[6].line);
+        assert_eq!(requests[5].line, requests[7].line);
+        assert!(requests[9].line.contains("after=50"));
     }
 
     #[test]
