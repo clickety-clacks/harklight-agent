@@ -849,27 +849,33 @@ mod tests {
         let (_root, journal) = open();
         let session = Uuid::new_v4();
         let scope = session.to_string();
-        let (chat, answer) = retained_turns(session);
+        let (chat, mut answer) = retained_turns(session);
+        let mut stale_answer = answer.clone();
+        stale_answer["rev"] = 42.into();
+        stale_answer["data"]["rev"] = 42.into();
+        stale_answer["data"]["seen"] = true.into();
+        answer["rev"] = 45.into();
+        answer["data"]["rev"] = 45.into();
         let mut ack1 = chat.clone();
         ack1["rev"] = 41.into();
         ack1["data"]["rev"] = 41.into();
         ack1["data"]["delivery"]["delivered"] = true.into();
         let mut edited_answer = answer.clone();
-        edited_answer["rev"] = 42.into();
-        edited_answer["data"]["rev"] = 42.into();
+        edited_answer["rev"] = 46.into();
+        edited_answer["data"]["rev"] = 46.into();
         edited_answer["data"]["result"] = json!({"status":"applied"});
         let mut arriving_chat = chat.clone();
-        arriving_chat["rev"] = 43.into();
-        arriving_chat["data"]["rev"] = 43.into();
+        arriving_chat["rev"] = 47.into();
+        arriving_chat["data"]["rev"] = 47.into();
         arriving_chat["data"]["entry_id"] = "arrived-after-bound".into();
         let server = SlowServer::sequence(vec![
             delivery_start(40, "first"),
             delivery_page(40, vec![chat.clone()], Some("second")),
             delivery_page(40, vec![answer.clone()], None),
             FixtureResponse::json(
-                json!({"rev":43,"changes":[ack1,edited_answer.clone(),arriving_chat.clone()],"more":false}),
+                json!({"rev":47,"changes":[ack1,stale_answer,edited_answer.clone(),arriving_chat.clone()],"more":false}),
             ),
-            FixtureResponse::json(json!({"rev":43,"changes":[],"more":false})),
+            FixtureResponse::json(json!({"rev":47,"changes":[],"more":false})),
         ]);
         let client = client(&server);
         let mut output = Vec::new();
@@ -897,7 +903,7 @@ mod tests {
                 json!({"kind":"baseline_complete","rev":40}),
                 edited_answer,
                 arriving_chat,
-                json!({"kind":"caught_up","rev":43}),
+                json!({"kind":"caught_up","rev":47}),
             ]
         );
         output.clear();
@@ -913,8 +919,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(output, [json!({"kind":"caught_up","rev":43})]);
-        assert_eq!(journal.v2_feed_cursor(&scope).unwrap(), Some(43));
+        assert_eq!(output, [json!({"kind":"caught_up","rev":47})]);
+        assert_eq!(journal.v2_feed_cursor(&scope).unwrap(), Some(47));
         assert_eq!(journal.v2_feed_cursor("").unwrap(), None);
         let requests = server.requests();
         assert!(
@@ -925,7 +931,7 @@ mod tests {
         assert!(requests[1].line.contains("&page=first "));
         assert!(requests[2].line.contains("&page=second "));
         assert!(requests[3].line.contains("after=40"));
-        assert!(requests[4].line.contains("after=43"));
+        assert!(requests[4].line.contains("after=47"));
     }
 
     #[test]
