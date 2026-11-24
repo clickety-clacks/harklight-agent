@@ -19,6 +19,7 @@ pub struct AgentClient {
     address: String,
     server_binding: String,
     identity: EnrolledIdentity,
+    ack2: bool,
 }
 
 impl AgentClient {
@@ -31,6 +32,7 @@ impl AgentClient {
             server_binding: identity.server_binding(),
             address: identity.address.clone(),
             identity,
+            ack2: false,
         })
     }
 

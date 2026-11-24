@@ -21,6 +21,7 @@ use uuid::Uuid;
 mod progress_files;
 mod v2_feed;
 pub(crate) use progress_files::is_progress;
+pub(crate) use v2_feed::DeliveryAttempt;
 
 #[derive(Debug, Error)]
 pub enum JournalError {

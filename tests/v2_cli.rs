@@ -106,6 +106,56 @@ fn binary_session_read_emits_an_empty_caught_up_boundary_from_caller_cursor() {
 }
 
 #[test]
+fn ack2_opt_in_covers_the_baseline_json_and_sse_delivery_requests() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"rev":5,"next_page":"attempt"})),
+        FixtureResponse::json(json!({"rev":5,"changes":[]})),
+        FixtureResponse::json(json!({"rev":5,"changes":[],"more":false})),
+        FixtureResponse {
+            status: "200 OK",
+            headers: &[
+                ("Content-Type", "text/event-stream"),
+                ("Harklight-Ack2", "true"),
+            ],
+            body: concat!(
+                "id: 6\nevent: entry\n",
+                r#"data: {"item_id":"item","entry_id":"new","rev":6}"#,
+                "\n\n",
+            )
+            .into(),
+            truncate: false,
+        },
+        FixtureResponse::json(json!({"rev":6,"messages":[]})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["listen", "--next", "--ack2"]);
+    assert!(output.status.success(), "{output:?}");
+    let rows: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.last().unwrap()["data"]["entry_id"], "new");
+    assert!(fixture.run(&["messages"]).status.success());
+    let requests = server.requests();
+    for request in &requests[..4] {
+        assert!(
+            request
+                .headers
+                .contains(&("harklight-ack2".into(), "true".into()))
+        );
+    }
+    assert!(
+        !requests[4]
+            .headers
+            .iter()
+            .any(|(name, _)| name == "harklight-ack2")
+    );
+}
+
+#[test]
 fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
     use test_tls::FixtureResponse;
 
@@ -483,6 +533,12 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     use test_tls::FixtureResponse;
 
     let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse {
+            status: "404 Not Found",
+            headers: &[],
+            body: r#"{"error":"not_found","retryable":false,"request_id":"unsupported"}"#.into(),
+            truncate: false,
+        },
         FixtureResponse::json(json!({"rev":10,"messages":[]})),
         FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
         internal_error_response(),
@@ -540,14 +596,14 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
 
     let requests = server.requests();
-    assert!(requests[2].line.contains("after=10"));
     assert!(requests[3].line.contains("after=10"));
+    assert!(requests[4].line.contains("after=10"));
     assert!(
-        requests[4]
+        requests[5]
             .headers
             .contains(&("last-event-id".into(), "10".into()))
     );
-    assert!(requests[5].line.contains("after=12"));
+    assert!(requests[6].line.contains("after=12"));
 }
 
 #[test]

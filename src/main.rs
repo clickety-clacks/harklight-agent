@@ -447,6 +447,9 @@ struct FeedArgs {
     after: Option<u64>,
     #[arg(long)]
     snapshot: bool,
+    /// Declare that this consumer issues handoff receipts.
+    #[arg(long)]
+    ack2: bool,
 }
 
 #[derive(Debug, Args)]
@@ -578,7 +581,9 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
 
     let identity = device_identity(cli);
     let journal = device_journal(cli, &identity.device_id);
-    let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let client = AgentClient::new(identity)
+        .unwrap_or_else(|error| fail(error.to_string(), 1))
+        .with_ack2(args.is_some_and(|args| args.ack2));
     let session = args.and_then(|args| args.session);
     let start = match args {
         Some(FeedArgs {

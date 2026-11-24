@@ -100,12 +100,25 @@ Several processes may follow the same scope.
 
 Use `--after REV` with your own committed cursor when another process
 consumes stdout. On first contact or cursor expiry, the CLI emits
-`baseline`, snapshot rows and `baseline_complete`. Commit the baseline
-position only after the completion record. `caught_up` supplies the last
-complete batch position, including when the batch is empty. Durable records
-carry `kind`, `rev` and `data`. The durable kinds are `message`, `entry`
-and `advisory`. An answer is in `message.terminal`, including any stored
-raw answer. Focus events have no revision.
+`baseline`, delivery rows and `baseline_complete`. With Server support,
+the baseline contains pending Chat and answers, including on answered
+items. Use `messages` and `message-entries` to inspect historical state.
+The CLI keeps its active attempt in the journal. Restart with the same
+state directory and session scope to recover an interrupted attempt. An
+interrupted downstream consumer should deduplicate by item ID for answers
+and entry ID for Chat. A baseline row with `pending: false` updates an
+existing turn or a turn with a recorded action or receipt.
+
+Commit the baseline position only after the completion record.
+`caught_up` supplies the last complete batch position, including when
+the batch is empty. Durable records carry `kind`, `rev` and `data`.
+The durable kinds are `message`, `entry` and `advisory`. An answer is in
+`message.terminal`, including any stored raw answer. Focus events have
+no revision. Server 0.2.4 and 0.2.5 use the earlier snapshot and feed.
+
+Use `read --ack2` or `listen --ack2` when the consumer sends handoff
+receipts for the turns it receives. On an older Server the feed works as
+before and the capability is unknown.
 
 Use `focus` to read current focus and `show --item-id ID [--chat]` to request
 a view on a device. `advisory-ack --item-id ID --advisory-id ID` records

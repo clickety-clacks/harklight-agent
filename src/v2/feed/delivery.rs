@@ -1,0 +1,187 @@
+use std::{collections::BTreeSet, io};
+
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::journal::{DeliveryAttempt, JournalStore};
+use crate::v2::{AgentClient, V2Error};
+
+use super::{Change, FeedError, emit_change, emit_value};
+
+/// A supported delivery baseline emits pending turns in their original order.
+/// The original token remains the recoverable start of the attempt.
+pub(super) fn delivery_baseline(
+    client: &AgentClient,
+    journal: &JournalStore,
+    session: Option<Uuid>,
+    key: &str,
+    reason: &str,
+    caller_supplies_cursor: bool,
+    output: &mut impl FnMut(&Value) -> io::Result<()>,
+) -> Result<Option<(u64, bool)>, FeedError> {
+    let attempt = match journal.delivery_attempt(key)? {
+        Some(attempt) => attempt,
+        None => {
+            let start = match client.delivery_page(session, None, client.ack2) {
+                Ok(start) => start,
+                Err(FeedError::Api(V2Error::Http {
+                    status: 404,
+                    token: Some(token),
+                    ..
+                })) if token == "not_found" => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let attempt = DeliveryAttempt {
+                rev: start["rev"].as_u64().ok_or(FeedError::InvalidSnapshot)?,
+                first_page: next_delivery_page(&start)?
+                    .ok_or(FeedError::InvalidSnapshot)?
+                    .to_owned(),
+                ack2: client.ack2,
+                expired: reason == "cursor_expired",
+                complete: false,
+            };
+            journal.save_delivery_attempt(key, &attempt)?;
+            attempt
+        }
+    };
+    let reason = if attempt.expired {
+        "cursor_expired"
+    } else {
+        "first_contact"
+    };
+    let rev = attempt.rev;
+    let mut emitted = false;
+    emit_value(output, json!({"kind":"baseline","rev":rev,"reason":reason}))?;
+    let mut page = attempt.first_page;
+    let mut visited = BTreeSet::new();
+    let mut emitted_ids = BTreeSet::new();
+    loop {
+        if !visited.insert(page.clone()) {
+            return Err(FeedError::InvalidSnapshot);
+        }
+        let response = client.delivery_page(session, Some(&page), attempt.ack2)?;
+        if response["rev"] != rev {
+            return Err(FeedError::InvalidSnapshot);
+        }
+        let changes: Vec<Change> = serde_json::from_value(response["changes"].clone())
+            .map_err(|_| FeedError::InvalidSnapshot)?;
+        if changes
+            .iter()
+            .any(|change| !valid_pending_change(change, session))
+        {
+            return Err(FeedError::InvalidSnapshot);
+        }
+        let next = next_delivery_page(&response)?;
+        for change in &changes {
+            let id = change.resource_key()?;
+            let previous = if !caller_supplies_cursor || emitted_ids.contains(&id) {
+                journal.baseline_change(key, change)?
+            } else {
+                None
+            };
+            if previous
+                .as_ref()
+                .is_some_and(|prior| prior.rev > change.rev || same_baseline_content(prior, change))
+            {
+                continue;
+            }
+            if previous.is_some() || settled_turn(change) {
+                emit_value(
+                    output,
+                    json!({
+                        "kind":change.kind,"rev":change.rev,"data":change.data,"pending":false,
+                    }),
+                )?;
+            } else {
+                emit_change(output, change)?;
+            }
+            journal.record_baseline_change(key, change)?;
+            emitted_ids.insert(id);
+            emitted = true;
+        }
+        match next {
+            Some(next) => page = next.to_owned(),
+            None => break,
+        }
+    }
+    emit_value(output, json!({"kind":"baseline_complete","rev":rev}))?;
+    Ok(Some((rev, emitted)))
+}
+
+fn next_delivery_page(response: &Value) -> Result<Option<&str>, FeedError> {
+    match &response["next_page"] {
+        Value::Null => Ok(None),
+        Value::String(token) if !token.is_empty() => Ok(Some(token)),
+        _ => Err(FeedError::InvalidSnapshot),
+    }
+}
+
+fn valid_pending_change(change: &Change, session: Option<Uuid>) -> bool {
+    if change.resource_key().is_err()
+        || session.is_some_and(|session| {
+            (change.kind == "message" || change.data.get("session").is_some())
+                && change.data["session"] != session.to_string()
+        })
+    {
+        return false;
+    }
+    match change.kind.as_str() {
+        "entry" => {
+            change.data["author"] == "person"
+                && change.data["kind"] == "reply"
+                && change.data["item_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+        }
+        "message" => change.data["terminal"]["state"] == "answered",
+        _ => false,
+    }
+}
+
+fn settled_turn(change: &Change) -> bool {
+    let delivery = if change.kind == "message" {
+        &change.data["terminal"]["delivery"]
+    } else {
+        &change.data["delivery"]
+    };
+    delivery["acted"] == true || !delivery["outcome"].is_null()
+}
+
+fn same_baseline_content(prior: &Change, current: &Change) -> bool {
+    let without_ack1 = |change: &Change| {
+        let mut data = change.data.clone();
+        data.as_object_mut()
+            .expect("validated feed data")
+            .remove("rev");
+        let turn = if change.kind == "message" {
+            data.get_mut("terminal").and_then(Value::as_object_mut)
+        } else {
+            data.as_object_mut()
+        };
+        if let Some(turn) = turn
+            && let Some(delivery) = turn.get_mut("delivery").and_then(Value::as_object_mut)
+        {
+            delivery.remove("delivered");
+            if delivery.is_empty() {
+                turn.remove("delivery");
+            }
+        }
+        data
+    };
+    // A later representation can add ACK1 and a resource revision. Any
+    // other projected change still needs to reach the consumer.
+    without_ack1(prior) == without_ack1(current)
+}
+
+pub(super) fn baseline_replay(
+    journal: &JournalStore,
+    key: &str,
+    change: &Change,
+) -> Result<bool, FeedError> {
+    if !valid_pending_change(change, None) {
+        return Ok(false);
+    }
+    Ok(journal
+        .baseline_change(key, change)?
+        .is_some_and(|prior| prior.rev >= change.rev || same_baseline_content(&prior, change)))
+}
