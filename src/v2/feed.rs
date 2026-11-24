@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
+    error::Error as _,
     io::{self, BufRead, BufReader},
     thread,
     time::Duration,
@@ -63,6 +64,7 @@ pub enum Start {
     Snapshot,
 }
 
+#[derive(Clone, Copy)]
 pub enum Mode {
     Read,
     Follow,
@@ -145,7 +147,19 @@ impl AgentClient {
         }
         let request = self.client.get(url).header(ACCEPT, "application/json");
         let value = self.read_json(Self::delivery_request(request, ack2))?;
-        serde_json::from_value(value).map_err(|_| FeedError::InvalidChange)
+        let batch: Batch = serde_json::from_value(value).map_err(|_| FeedError::InvalidChange)?;
+        let mut previous = after;
+        for change in &batch.changes {
+            change.resource_key()?;
+            if change.rev <= previous || change.rev > batch.rev {
+                return Err(FeedError::InvalidChange);
+            }
+            previous = change.rev;
+        }
+        if batch.rev < after || (batch.more && batch.rev == after) {
+            return Err(FeedError::InvalidChange);
+        }
+        Ok(batch)
     }
 
     fn open_changes(
@@ -280,14 +294,11 @@ pub fn run(
 ) -> Result<(), FeedError> {
     // The blocking transport applies this timeout to each response read.
     // Healthy feeds carry a heartbeat well within it.
-    let stream_client = if matches!(mode, Mode::Read) {
+    let stream_timeout = Some(Duration::from_secs(60));
+    let mut stream_client = if matches!(mode, Mode::Read) {
         None
     } else {
-        Some(
-            client
-                .identity
-                .device_client_with_timeout(Some(Duration::from_secs(60)))?,
-        )
+        Some(client.identity.device_client_with_timeout(stream_timeout)?)
     };
     let scope = session.map(|id| id.to_string()).unwrap_or_default();
     let uses_journal = matches!(start, Start::Journal) && !matches!(mode, Mode::Focus);
@@ -307,7 +318,8 @@ pub fn run(
         client.server_binding()
     );
     let mut checkpoint = saved;
-    let mut backoff_secs = 1u64;
+    let mut retry = FeedRetry::new(mode);
+    let mut client = client.clone();
     let focus_only = matches!(mode, Mode::Focus);
     if uses_journal && journal.delivery_attempt(&baseline_key)?.is_some() {
         cursor = None;
@@ -320,7 +332,16 @@ pub fn run(
 
     let mut output_changes = false;
     let mut feed_ack2 = client.ack2;
+    let mut emitted_baseline = BTreeMap::new();
     'resume: loop {
+        if retry.reconnecting() {
+            // Discard both pools so a proxy response can't pin the listener to
+            // an old connection after the configured address starts working.
+            client.client = client.identity.device_client()?;
+            stream_client = Some(client.identity.device_client_with_timeout(stream_timeout)?);
+        } else {
+            emitted_baseline.clear();
+        }
         if !uses_journal {
             output_changes = false;
         }
@@ -335,14 +356,16 @@ pub fn run(
                     if current != checkpoint {
                         checkpoint = current;
                         cursor = current;
+                        emitted_baseline.clear();
                         continue 'resume;
                     }
                     delivery_baseline(
-                        client,
+                        &client,
                         journal,
                         session,
                         &baseline_key,
                         baseline_reason,
+                        &mut emitted_baseline,
                         &mut output,
                     )
                 } else {
@@ -358,7 +381,7 @@ pub fn run(
                     }
                     Ok(None) => {
                         drop(delivery_lock.take());
-                        match baseline(client, session) {
+                        match baseline(&client, session) {
                             Ok((rev, records)) => {
                                 emit_value(
                                     &mut output,
@@ -378,21 +401,17 @@ pub fn run(
                                 }
                                 rev
                             }
-                            Err(error)
-                                if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) =>
-                            {
-                                delay(&mut backoff_secs, retry_delay(&error));
+                            Err(error) => {
+                                retry.wait(Some(error))?;
                                 continue;
                             }
-                            Err(error) => return Err(error),
                         }
                     }
-                    Err(error) if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) => {
+                    Err(error) => {
                         drop(delivery_lock);
-                        delay(&mut backoff_secs, retry_delay(&error));
+                        retry.wait(Some(error))?;
                         continue;
                     }
-                    Err(error) => return Err(error),
                 }
             }
         };
@@ -411,29 +430,17 @@ pub fn run(
                     cursor = None;
                     baseline_reason = "cursor_expired";
                     if focus_only {
-                        cursor = Some(first_snapshot_position(client, session)?);
+                        cursor = Some(first_snapshot_position(&client, session)?);
                     }
                     continue 'resume;
                 }
-                Err(error) if retry_delay(&error).is_some() && !matches!(mode, Mode::Read) => {
+                Err(error) => {
                     cursor = delivered_baseline.is_none().then_some(start_position);
                     drop(delivery_lock.take());
-                    delay(&mut backoff_secs, retry_delay(&error));
+                    retry.wait(Some(error))?;
                     continue 'resume;
                 }
-                Err(error) => return Err(error),
             };
-            let mut previous = start_position;
-            for change in &batch.changes {
-                change.resource_key()?;
-                if change.rev <= previous || change.rev > batch.rev {
-                    return Err(FeedError::InvalidChange);
-                }
-                previous = change.rev;
-            }
-            if batch.rev < start_position || (batch.more && batch.rev == start_position) {
-                return Err(FeedError::InvalidChange);
-            }
             if let Some(baseline) = delivered_baseline.take() {
                 journal.finish_delivery_baseline(
                     &baseline_key,
@@ -442,6 +449,7 @@ pub fn run(
                     start_position,
                     &baseline.changes,
                 )?;
+                emitted_baseline.clear();
                 feed_ack2 = client.ack2;
                 checkpoint = Some(start_position);
                 drop(delivery_lock.take());
@@ -486,21 +494,25 @@ pub fn run(
                 Ok(stream) => stream,
                 Err(error) if cursor_expired(&error) => {
                     cursor = if focus_only {
-                        Some(first_snapshot_position(client, session)?)
+                        Some(first_snapshot_position(&client, session)?)
                     } else {
                         None
                     };
                     baseline_reason = "cursor_expired";
                     continue;
                 }
-                Err(error) if retry_delay(&error).is_some() => {
+                Err(error) => {
                     cursor = Some(start_position);
-                    delay(&mut backoff_secs, retry_delay(&error));
+                    retry.wait(Some(error))?;
                     continue;
                 }
-                Err(error) => return Err(error),
             };
-        while let Some(event) = stream.next()? {
+        let stream_error = loop {
+            let event = match stream.next() {
+                Ok(Some(event)) => event,
+                Ok(None) => break None,
+                Err(error) => break Some(error),
+            };
             match event {
                 Event::Change(change) => {
                     if change.rev <= start_position {
@@ -531,26 +543,27 @@ pub fn run(
                 Event::Closing(reason) => match reason.as_str() {
                     "cursor_expired" => {
                         cursor = if focus_only {
-                            Some(first_snapshot_position(client, session)?)
+                            Some(first_snapshot_position(&client, session)?)
                         } else {
                             None
                         };
                         baseline_reason = "cursor_expired";
                         continue 'resume;
                     }
-                    "storage_unavailable" | "server_shutdown" => break,
+                    "storage_unavailable" | "server_shutdown" => break None,
                     "internal_error" => {
-                        return Err(FeedError::InternalClosing {
-                            request_id: stream.request_id,
+                        break Some(FeedError::InternalClosing {
+                            request_id: stream.request_id.take(),
                         });
                     }
                     _ => return Err(FeedError::Closed(reason)),
                 },
             }
-            backoff_secs = 1;
-        }
+            retry.recovered();
+        };
         cursor = Some(start_position);
-        delay(&mut backoff_secs, None);
+        drop(stream);
+        retry.wait(stream_error)?;
     }
 }
 
@@ -571,7 +584,67 @@ fn emit_change(
     )
 }
 
-fn retry_delay(error: &FeedError) -> Option<u64> {
+const MAX_BACKOFF_SECS: u64 = 25;
+
+struct FeedRetry {
+    mode: Mode,
+    backoff_secs: u64,
+    conditions: BTreeSet<String>,
+}
+
+impl FeedRetry {
+    fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            backoff_secs: 1,
+            conditions: BTreeSet::new(),
+        }
+    }
+
+    fn following(&self) -> bool {
+        matches!(self.mode, Mode::Follow)
+    }
+
+    fn reconnecting(&self) -> bool {
+        !self.conditions.is_empty()
+    }
+
+    fn wait(&mut self, error: Option<FeedError>) -> Result<(), FeedError> {
+        let (retry_after, error) = match error {
+            Some(error) => {
+                let Some(delay) = retry_delay(&self.mode, &error) else {
+                    return Err(error);
+                };
+                (delay, Some(error))
+            }
+            None => (0, None),
+        };
+        let mut seconds = self.backoff_secs.max(retry_after);
+        if self.following() {
+            let (condition, detail) = retry_diagnostic(error.as_ref());
+            if self.conditions.insert(condition) {
+                eprintln!("listen: {detail}; reconnecting");
+            }
+            seconds = seconds.min(MAX_BACKOFF_SECS);
+        }
+        thread::sleep(Duration::from_secs(seconds));
+        self.backoff_secs = (self.backoff_secs * 2).min(MAX_BACKOFF_SECS);
+        Ok(())
+    }
+
+    fn recovered(&mut self) {
+        if !self.conditions.is_empty() {
+            eprintln!("listen: live updates resumed");
+            self.conditions.clear();
+        }
+        self.backoff_secs = 1;
+    }
+}
+
+fn retry_delay(mode: &Mode, error: &FeedError) -> Option<u64> {
+    if matches!(mode, Mode::Read) {
+        return None;
+    }
     match error {
         FeedError::Api(V2Error::Http {
             status: 503,
@@ -579,15 +652,72 @@ fn retry_delay(error: &FeedError) -> Option<u64> {
             ..
         }) => Some(retry_after.unwrap_or(0)),
         FeedError::Api(V2Error::Transport { .. } | V2Error::ResponseRead { .. }) => Some(0),
+        FeedError::Api(
+            V2Error::UnexpectedClientError { .. }
+            | V2Error::InvalidResponse { .. }
+            | V2Error::Http {
+                status: 300..=399 | 500..=599,
+                ..
+            },
+        )
+        | FeedError::InvalidChange
+        | FeedError::InvalidSnapshot
+        | FeedError::InternalClosing { .. }
+            if matches!(mode, Mode::Follow) =>
+        {
+            Some(0)
+        }
         _ => None,
     }
 }
 
-fn delay(seconds: &mut u64, retry_after: Option<u64>) {
-    thread::sleep(Duration::from_secs(
-        (*seconds).max(retry_after.unwrap_or(0)),
-    ));
-    *seconds = (*seconds * 2).min(25);
+fn retry_diagnostic(error: Option<&FeedError>) -> (String, String) {
+    let Some(error) = error else {
+        return ("disconnected".into(), "feed connection ended".into());
+    };
+    if error.is_internal_error() {
+        return ("internal_error".into(), error.to_string());
+    }
+    let condition = match error {
+        FeedError::Api(V2Error::Transport { source, .. }) => {
+            let mut causes = Vec::new();
+            let mut condition = String::from("transport");
+            let mut cause = source.source();
+            while let Some(error) = cause {
+                causes.push(error.to_string());
+                if let Some(io_error) = error.downcast_ref::<io::Error>() {
+                    condition = format!("transport: {:?}", io_error.kind());
+                    // Certificate messages can contain the current verification
+                    // time. Use the error variant to recognize repeat failures.
+                    if let Some(tls) = io_error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+                    {
+                        condition = match tls {
+                            rustls::Error::InvalidCertificate(cert) => {
+                                format!("certificate: {:?}", std::mem::discriminant(cert))
+                            }
+                            _ => format!("TLS: {:?}", std::mem::discriminant(tls)),
+                        };
+                    }
+                }
+                cause = error.source();
+            }
+            let mut detail = error.to_string();
+            if !causes.is_empty() {
+                detail.push_str(": ");
+                detail.push_str(&causes.join(": "));
+            }
+            return (condition, detail);
+        }
+        FeedError::Api(
+            V2Error::Http { status, .. } | V2Error::UnexpectedClientError { status, .. },
+        ) => format!("HTTP {status}"),
+        FeedError::Api(V2Error::InvalidResponse { .. }) => "unexpected response".into(),
+        FeedError::Api(V2Error::ResponseRead { status, .. }) => format!("HTTP {status} body"),
+        _ => error.to_string(),
+    };
+    (condition, error.to_string())
 }
 
 fn cursor_expired(error: &FeedError) -> bool {

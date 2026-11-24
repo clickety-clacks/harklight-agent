@@ -10,6 +10,7 @@ enum Fault {
     None,
     PrepareResponse,
     SecondPageResponse,
+    SecondPageOnce,
     OpeningRecord,
     ChatRecord,
     CompletionRecord,
@@ -140,7 +141,15 @@ impl Server {
                     rows.push(row);
                 }
                 let mut response = delivery_page(token.pin, rows, next.as_deref());
-                response.truncate = offset != 0 && matches!(self.fault, Fault::SecondPageResponse);
+                if offset != 0 {
+                    response.truncate = matches!(
+                        self.fault,
+                        Fault::SecondPageResponse | Fault::SecondPageOnce
+                    );
+                    if matches!(self.fault, Fault::SecondPageOnce) {
+                        self.fault = Fault::None;
+                    }
+                }
                 Some(response)
             }
             "/v2/agent/changes" => {
@@ -160,7 +169,7 @@ impl Server {
                 }
                 if sse {
                     // A terminal error lets Follow and empty Next traces leave the loop.
-                    return Some(sse_closing("internal_error"));
+                    return Some(sse_closing("session_closed"));
                 }
                 let mut response = FixtureResponse::json(json!({
                     "rev": self.head, "changes": [], "more": false,
@@ -336,10 +345,7 @@ fn caller_owned_starts_keep_legacy_feed_and_snapshot_paths() {
             }
             if !ack2 {
                 expected.push("/v2/agent/changes");
-                assert!(matches!(
-                    call.error,
-                    Some(FeedError::InternalClosing { .. })
-                ));
+                assert!(matches!(call.error, Some(FeedError::Closed(_))));
             } else {
                 assert!(call.error.is_none());
             }
@@ -494,10 +500,7 @@ fn baseline_model_follow_renews_after_sse_expiry_without_replaying_committed_wor
         Fault::None,
         model.session,
     );
-    assert!(matches!(
-        follow.error,
-        Some(FeedError::InternalClosing { .. })
-    ));
+    assert!(matches!(follow.error, Some(FeedError::Closed(_))));
     let last_baseline = follow
         .requests
         .iter()
@@ -536,4 +539,27 @@ fn baseline_model_follow_renews_after_sse_expiry_without_replaying_committed_wor
     assert!(resume.error.is_none());
     assert!(resume.turns().is_empty());
     assert!(resume.requests.iter().all(|(_, declared)| !*declared));
+}
+
+#[test]
+fn follow_resumes_partial_baseline_without_reprinting_the_first_page() {
+    let model = Harness::new();
+    let follow = model.call(
+        Start::Journal,
+        Mode::Follow,
+        true,
+        Fault::SecondPageOnce,
+        model.session,
+    );
+    assert!(matches!(follow.error, Some(FeedError::Closed(_))));
+    assert_eq!(follow.turns(), ["retained-chat", "answered"]);
+    assert_eq!(follow.cursor, Some(PIN));
+    assert_eq!(
+        follow
+            .requests
+            .iter()
+            .filter(|(path, _)| path.contains("page=0-0"))
+            .count(),
+        2
+    );
 }

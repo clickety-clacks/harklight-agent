@@ -1,6 +1,6 @@
 [package]
 name = "harklight-agent"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.89"
 description = "Host CLI for request-bound Harklight conversations"
@@ -17,6 +17,7 @@ hex = "0.4.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sha2 = "0.10.9"
