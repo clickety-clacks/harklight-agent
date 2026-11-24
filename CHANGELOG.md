@@ -1,5 +1,12 @@
 # Release notes
 
+## 0.2.3
+
+- `listen --follow` reconnects after TLS and connection failures, unexpected
+  responses and feed `internal_error` failures. It backs off up to 25 seconds
+  and resumes from its last completed position. Valid API refusals such as
+  `unauthorized`, `forbidden`, `account_paused`, and `not_found` still stop the listener.
+
 ## 0.2.2
 
 - `read` and `listen` require exactly one of `--session UUID` or `--all-sessions`,

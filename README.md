@@ -108,6 +108,11 @@ discards an unattached upload.
 `read --session UUID` catches up once for one session.
 `listen --follow --session UUID` continues as changes arrive.
 `listen --next --session UUID` exits after durable changes arrive.
+`listen --follow` reconnects after connection or TLS failures, unexpected
+responses, and feed `internal_error`. It resumes from its last completed
+position, waits up to 25 seconds between attempts, and reports failures and
+recovery on stderr. Valid API refusals and local configuration errors still
+exit.
 
 Every `read` and `listen` invocation requires exactly one of `--session UUID`
 or `--all-sessions`, including with `--after REV` or `--snapshot`. Use

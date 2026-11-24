@@ -509,7 +509,7 @@ fn wrong_port_http_error_is_a_read_failure_in_json_and_sse() {
     for args in [
         &["messages"][..],
         &["read", "--all-sessions", "--after", "5"][..],
-        &["listen", "--follow", "--session", &session, "--after", "5"][..],
+        &["listen", "--next", "--session", &session, "--after", "5"][..],
     ] {
         let output = fixture.run(args);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
@@ -614,7 +614,7 @@ fn malformed_or_mismatched_write_responses_keep_the_saved_operation() {
 }
 
 #[test]
-fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
+fn single_shot_internal_feed_errors_keep_their_exit_codes_and_cursor() {
     use harklight_agent::journal::JournalStore;
     use test_tls::FixtureResponse;
 
@@ -623,11 +623,11 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
         FixtureResponse::json(json!({"rev":10,"changes":[],"more":false})),
         FixtureResponse {
             status: "200 OK",
-            headers: &[("Content-Type", "text/event-stream"), ("Request-Id", "stream-fault")],
-            body: concat!(
-                "id: 12\nevent: entry\ndata: {\"entry_id\":\"one\",\"item_id\":\"item\",\"rev\":12}\n\n",
-                "event: closing\ndata: {\"reason\":\"internal_error\"}\n\n"
-            ).into(),
+            headers: &[
+                ("Content-Type", "text/event-stream"),
+                ("Request-Id", "stream-fault"),
+            ],
+            body: concat!("event: closing\ndata: {\"reason\":\"internal_error\"}\n\n").into(),
             truncate: false,
         },
         FixtureResponse::json(json!({"rev":13,"changes":[],"more":false})),
@@ -636,21 +636,16 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
     let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
     journal.record_v2_feed("", None, 10, &[], false).unwrap();
 
-    let batch = fixture.run(&["listen", "--follow", "--all-sessions"]);
+    let batch = fixture.run(&["read", "--all-sessions"]);
     assert_eq!(batch.status.code(), Some(1), "{batch:?}");
     assert!(batch.stdout.is_empty());
     let diagnostic = String::from_utf8(batch.stderr).unwrap();
-    for detail in [
-        "listen",
-        "live updates paused",
-        "internal_error",
-        "boundary-fault",
-    ] {
+    for detail in ["read", "internal_error", "boundary-fault"] {
         assert!(diagnostic.contains(detail), "{diagnostic}");
     }
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(10));
 
-    let stream = fixture.run(&["listen", "--follow", "--all-sessions"]);
+    let stream = fixture.run(&["listen", "--next", "--all-sessions"]);
     assert_eq!(stream.status.code(), Some(1), "{stream:?}");
     let diagnostic = String::from_utf8(stream.stderr).unwrap();
     for detail in [
@@ -666,9 +661,8 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1]["rev"], 12);
-    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(12));
+    assert_eq!(rows, [json!({"kind":"caught_up","rev":10})]);
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(10));
     assert!(fixture.run(&["read", "--all-sessions"]).status.success());
     assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
 
@@ -680,7 +674,223 @@ fn internal_feed_error_pauses_without_reconnect_and_keeps_cursor() {
             .headers
             .contains(&("last-event-id".into(), "10".into()))
     );
-    assert!(requests[3].line.contains("after=12"));
+    assert!(requests[3].line.contains("after=10"));
+}
+
+#[test]
+fn follow_retries_bad_responses_from_its_last_good_position() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let batch = || FixtureResponse::json(json!({"rev":10,"changes":[],"more":false}));
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse {
+            status: "400 Bad Request",
+            headers: &[("Content-Type", "text/plain")],
+            body: "Bad Request".into(),
+            truncate: false,
+        },
+        internal_error_response(),
+        FixtureResponse {
+            headers: &[("Request-Id", "another-fault")],
+            ..internal_error_response()
+        },
+        batch(),
+        FixtureResponse {
+            status: "200 OK",
+            headers: &[("Content-Type", "text/event-stream")],
+            body: concat!(
+                "id: 12\nevent: entry\ndata: {\"entry_id\":\"one\",\"item_id\":\"item\",\"rev\":12}\n\n",
+                "id: 99\nevent: entry\ndata: {\"unexpected\":true}\n\n",
+            ).into(),
+            truncate: false,
+        },
+        FixtureResponse {
+            status: "401 Unauthorized",
+            headers: &[],
+            body: r#"{"error":"unauthorized","retryable":false,"request_id":"stop"}"#.into(),
+            truncate: false,
+        },
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+    journal.record_v2_feed("", None, 10, &[], false).unwrap();
+
+    let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    let diagnostic = String::from_utf8(result.stderr).unwrap();
+    for detail in [
+        "HTTP 400",
+        "internal_error",
+        "boundary-fault",
+        "live updates resumed",
+        "unauthorized",
+    ] {
+        assert_eq!(diagnostic.matches(detail).count(), 1, "{diagnostic}");
+    }
+    assert!(!diagnostic.contains("another-fault"), "{diagnostic}");
+    let rows: Vec<Value> = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["data"]["entry_id"], "one");
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(12));
+
+    let requests = server.requests();
+    assert!(
+        requests[..4]
+            .iter()
+            .all(|request| request.line.contains("after=10"))
+    );
+    assert!(
+        requests[4]
+            .headers
+            .contains(&("last-event-id".into(), "10".into()))
+    );
+    assert!(requests[5].line.contains("after=12"));
+}
+
+#[test]
+fn follow_prints_all_delivered_revisions_in_batch_and_stream() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let first = json!({
+        "entry_id":"one","item_id":"item","kind":"reply","text":"hello","rev":11,
+        "delivery":{"delivered":false,"acted":false},
+    });
+    let mut delivered = first.clone();
+    delivered["rev"] = 12.into();
+    delivered["delivery"]["delivered"] = true.into();
+    let mut acted = delivered.clone();
+    acted["rev"] = 13.into();
+    acted["delivery"]["acted"] = true.into();
+    for stream_receipt in [false, true] {
+        let mut batch = vec![json!({"rev":11,"kind":"entry","data":first})];
+        if !stream_receipt {
+            batch.push(json!({"rev":12,"kind":"entry","data":delivered}));
+        }
+        let batch_rev = if stream_receipt { 11 } else { 12 };
+        let stream = if stream_receipt {
+            format!("id: 12\nevent: entry\ndata: {delivered}\n\n")
+        } else {
+            String::new()
+        };
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+            FixtureResponse::json(json!({"rev":batch_rev,"changes":batch,"more":false})),
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[("Content-Type", "text/event-stream")],
+                body: format!(
+                    "{stream}id: 13\nevent: entry\ndata: {acted}\n\n\
+                     event: closing\ndata: {{\"reason\":\"revoked\"}}\n\n"
+                ),
+                truncate: false,
+            },
+        ]);
+        let fixture = CliFixture::new(&server, identity);
+        let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+        journal.record_v2_feed("", None, 10, &[], false).unwrap();
+
+        let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let rows: Vec<Value> = String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &Value| row["kind"] == "entry")
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                json!({"kind":"entry","rev":11,"data":first}),
+                json!({"kind":"entry","rev":12,"data":delivered}),
+                json!({"kind":"entry","rev":13,"data":acted}),
+            ]
+        );
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
+        let requests = server.requests();
+        assert!(
+            requests[1]
+                .headers
+                .contains(&("last-event-id".into(), batch_rev.to_string()))
+        );
+    }
+}
+
+#[test]
+fn follow_reconnects_after_an_unrecognized_closing_reason() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let batch = || FixtureResponse::json(json!({"rev":10,"changes":[],"more":false}));
+    let stream = |body: &str| FixtureResponse {
+        status: "200 OK",
+        headers: &[("Content-Type", "text/event-stream")],
+        body: body.into(),
+        truncate: false,
+    };
+    for terminal in ["revoked", "account_paused"] {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+            batch(),
+            stream("event: closing\ndata: {\"reason\":\"upstream_maintenance\"}\n\n"),
+            batch(),
+            stream(&format!(
+                "id: 11\nevent: entry\ndata: {{\"entry_id\":\"one\",\"rev\":11}}\n\n\
+                 event: closing\ndata: {{\"reason\":\"{terminal}\"}}\n\n"
+            )),
+        ]);
+        let fixture = CliFixture::new(&server, identity);
+        let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+        journal.record_v2_feed("", None, 10, &[], false).unwrap();
+
+        let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let diagnostic = String::from_utf8(result.stderr).unwrap();
+        for detail in ["upstream_maintenance", "live updates resumed", terminal] {
+            assert_eq!(diagnostic.matches(detail).count(), 1, "{diagnostic}");
+        }
+        assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(11));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        for request in requests.iter().step_by(2) {
+            assert!(request.line.contains("after=10"), "{}", request.line);
+        }
+        for request in requests.iter().skip(1).step_by(2) {
+            assert!(
+                request
+                    .headers
+                    .contains(&("last-event-id".into(), "10".into()))
+            );
+        }
+    }
+}
+
+#[test]
+fn follow_stops_on_definite_api_refusals() {
+    use test_tls::FixtureResponse;
+
+    for (status, token) in [
+        ("401 Unauthorized", "unauthorized"),
+        ("403 Forbidden", "forbidden"),
+        ("403 Forbidden", "account_paused"),
+        ("404 Not Found", "not_found"),
+    ] {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![FixtureResponse {
+            status,
+            headers: &[],
+            body: json!({"error":token,"retryable":false,"request_id":"refusal"}).to_string(),
+            truncate: false,
+        }]);
+        let fixture = CliFixture::new(&server, identity);
+        let session = Uuid::new_v4().to_string();
+        let result = fixture.run(&["listen", "--follow", "--session", &session, "--after", "10"]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains(token));
+        assert_eq!(server.requests().len(), 1);
+    }
 }
 
 #[test]

@@ -25,6 +25,7 @@ pub(super) fn delivery_baseline(
     session: Option<Uuid>,
     key: &str,
     reason: &str,
+    emitted_turns: &mut BTreeMap<String, Change>,
     output: &mut impl FnMut(&Value) -> io::Result<()>,
 ) -> Result<Option<DeliveredBaseline>, FeedError> {
     let attempt = match journal.delivery_attempt(key)? {
@@ -73,9 +74,8 @@ pub(super) fn delivery_baseline(
     };
     let rev = attempt.rev;
     emit_value(output, json!({"kind":"baseline","rev":rev,"reason":reason}))?;
-    // Stdout can succeed before the receiver loses the rest of the baseline.
-    // Deduplicate within this emission only until the full boundary succeeds.
-    let mut emitted_turns = BTreeMap::<String, Change>::new();
+    // Follow retains the emitted turns if fetching the rest of this
+    // baseline or its first catch-up batch fails and must be retried.
     let current = DeliveryPages {
         rev,
         first_page: attempt.first_page.clone(),
@@ -127,7 +127,7 @@ pub(super) fn delivery_baseline(
             }
         }
     }
-    let changes: Vec<_> = emitted_turns.into_values().collect();
+    let changes: Vec<_> = emitted_turns.values().cloned().collect();
     emit_value(output, json!({"kind":"baseline_complete","rev":rev}))?;
     Ok(Some(DeliveredBaseline {
         rev,
