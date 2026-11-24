@@ -136,7 +136,7 @@ pub(super) fn delivery_baseline(
     }))
 }
 
-fn next_delivery_page(response: &Value) -> Result<Option<&str>, FeedError> {
+pub(super) fn next_delivery_page(response: &Value) -> Result<Option<&str>, FeedError> {
     match &response["next_page"] {
         Value::Null => Ok(None),
         Value::String(token) if !token.is_empty() => Ok(Some(token)),
@@ -144,7 +144,7 @@ fn next_delivery_page(response: &Value) -> Result<Option<&str>, FeedError> {
     }
 }
 
-fn valid_pending_change(change: &Change, session: Option<Uuid>) -> bool {
+pub(super) fn valid_pending_change(change: &Change, session: Option<Uuid>) -> bool {
     if change.resource_key().is_err()
         || session.is_some_and(|session| {
             (change.kind == "message" || change.data.get("session").is_some())
@@ -166,7 +166,7 @@ fn valid_pending_change(change: &Change, session: Option<Uuid>) -> bool {
     }
 }
 
-fn settled_turn(change: &Change) -> bool {
+pub(super) fn settled_turn(change: &Change) -> bool {
     let delivery = if change.kind == "message" {
         &change.data["terminal"]["delivery"]
     } else {

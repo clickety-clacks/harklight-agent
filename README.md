@@ -130,6 +130,43 @@ Both explicit starts keep the Agent 0.2.0 snapshot and resume behavior on
 all Servers and leave the CLI's default checkpoint untouched. A supplied
 `--after REV` is a feed cursor.
 
+### Caller-owned pending work
+
+For a consumer with its own durable checkpoint, prepare a pending-only
+baseline with `read --session S --pending --prepare`. It returns one
+`baseline_prepared` JSON line containing `session`, `rev` and `token`
+without serving work or opening the Agent journal. Store the token and
+revision durably before requesting any pages.
+
+Use `read --session S --pending --resume TOKEN` to serve that attempt.
+Output starts with `baseline` and ends with `baseline_complete`. The
+rows use the feed's `kind`, `rev` and `data` shape and include retained
+pending person Chat and answer rows, including on closed items and
+migrated 0.1-era turns. An answer is a message with an answered terminal
+state. Apply a still-unapplied row even if it carries `pending:false`.
+The marker describes a receipt, action or updated representation.
+
+After interruption, run resume again with the original token and the
+same session and `--ack2` setting. Apply by stable entry ID or answer
+item ID and commit the pinned revision with the applied effects before
+forgetting the token. A rejected token results in `token_invalid` with
+the Server reason (exit 2). A Server without the route results in
+`unsupported` (exit 5). Both commands use only the pending route.
+This feature requires Agent 0.2.4 or later.
+
+Start `listen --follow --session S --after REV --on-expired exit` after
+committing the baseline. It prints a `cursor_expired` JSON line with the
+last position and exits 2 on a typed HTTP 410 or an SSE expiry notice.
+The caller owns the recovery decision and its checkpoint.
+
+Use one consumer per conversation. An entry another reader marked
+Delivered before the pin is excluded, and an update above the pinned
+revision is not guaranteed. Restoring the caller database to a point
+before the token was stored loses access to work already served under
+that token. Work that was never served remains pending.
+
+### Agent-owned baselines
+
 On first contact or cursor expiry, the CLI emits
 `baseline`, baseline rows and `baseline_complete`. With Server support,
 Agent-owned default reads and listeners recover pending Chat and answers,

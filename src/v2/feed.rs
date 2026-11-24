@@ -20,6 +20,7 @@ use crate::journal::{JournalError, JournalStore};
 use super::{AgentClient, V2Error, header};
 
 mod delivery;
+pub mod pending;
 use delivery::{baseline_replay, delivery_baseline};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -61,6 +62,7 @@ struct Batch {
 pub enum Start {
     Journal,
     After(u64),
+    AfterUntilExpired(u64),
     Snapshot,
 }
 
@@ -80,6 +82,8 @@ pub enum FeedError {
     Journal(#[from] JournalError),
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
+    #[error("cursor_expired at revision {rev}")]
+    CursorExpired { rev: u64 },
     #[error("invalid agent change or cursor")]
     InvalidChange,
     #[error("invalid agent snapshot")]
@@ -106,7 +110,8 @@ impl FeedError {
             Self::Api(V2Error::Http {
                 token: Some(token), ..
             }) if token == "unsupported" => 5,
-            Self::Closed(_)
+            Self::CursorExpired { .. }
+            | Self::Closed(_)
             | Self::Api(V2Error::Http {
                 status: 400..=499, ..
             }) => 2,
@@ -307,8 +312,9 @@ pub fn run(
     } else {
         None
     };
+    let stop_on_expired = matches!(start, Start::AfterUntilExpired(_));
     let mut cursor = match start {
-        Start::After(rev) => Some(rev),
+        Start::After(rev) | Start::AfterUntilExpired(rev) => Some(rev),
         _ => saved,
     };
     let mut baseline_reason = "first_contact";
@@ -420,6 +426,11 @@ pub fn run(
             let batch = match client.change_batch(session, start_position, feed_ack2) {
                 Ok(batch) => batch,
                 Err(error) if cursor_expired(&error) => {
+                    if stop_on_expired {
+                        return Err(FeedError::CursorExpired {
+                            rev: start_position,
+                        });
+                    }
                     if delivered_baseline.is_some() {
                         let mut attempt = journal
                             .delivery_attempt(&baseline_key)?
@@ -493,6 +504,11 @@ pub fn run(
             match client.open_changes(stream_client, session, start_position, feed_ack2) {
                 Ok(stream) => stream,
                 Err(error) if cursor_expired(&error) => {
+                    if stop_on_expired {
+                        return Err(FeedError::CursorExpired {
+                            rev: start_position,
+                        });
+                    }
                     cursor = if focus_only {
                         Some(first_snapshot_position(&client, session)?)
                     } else {
@@ -542,6 +558,11 @@ pub fn run(
                 Event::Heartbeat => {}
                 Event::Closing(reason) => match reason.as_str() {
                     "cursor_expired" => {
+                        if stop_on_expired {
+                            return Err(FeedError::CursorExpired {
+                                rev: start_position,
+                            });
+                        }
                         cursor = if focus_only {
                             Some(first_snapshot_position(&client, session)?)
                         } else {
