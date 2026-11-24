@@ -301,34 +301,16 @@ pub fn run(
         _ => saved,
     };
     let mut baseline_reason = "first_contact";
-    let reader = match start {
-        Start::Journal => "journal",
-        Start::After(_) | Start::Snapshot => "caller",
-    };
+    // Keep the namespace used by earlier Agent-owned attempts.
     let baseline_key = format!(
-        "delivery-baseline:{}:{scope}:{reader}",
+        "delivery-baseline:{}:{scope}:journal",
         client.server_binding()
     );
     let mut checkpoint = saved;
     let mut backoff_secs = 1u64;
     let focus_only = matches!(mode, Mode::Focus);
-    let caller_supplies_cursor = matches!(start, Start::After(_) | Start::Snapshot);
-    if !focus_only && journal.delivery_attempt(&baseline_key)?.is_some() {
-        let _lock = journal.lock_delivery_baseline(&baseline_key)?;
-        if let Some(mut attempt) = journal.delivery_attempt(&baseline_key)? {
-            if matches!(start, Start::After(after) if attempt.complete && after >= attempt.rev) {
-                journal.clear_delivery_attempt(&baseline_key)?;
-            } else {
-                if let Start::After(after) = start {
-                    let retained = attempt.prior.len();
-                    attempt.prior.retain(|pages| pages.rev > after);
-                    if attempt.prior.len() != retained {
-                        journal.save_delivery_attempt(&baseline_key, &attempt)?;
-                    }
-                }
-                cursor = None;
-            }
-        }
+    if uses_journal && journal.delivery_attempt(&baseline_key)?.is_some() {
+        cursor = None;
     }
     if focus_only {
         let focus = client.read(&["agent", "focus"], &[])?;
@@ -339,29 +321,34 @@ pub fn run(
     let mut output_changes = false;
     let mut feed_ack2 = client.ack2;
     'resume: loop {
+        if !uses_journal {
+            output_changes = false;
+        }
         let mut delivery_lock = None;
         let mut delivered_baseline = None;
         let mut start_position = match cursor {
             Some(rev) => rev,
             None => {
-                delivery_lock = Some(journal.lock_delivery_baseline(&baseline_key)?);
-                if uses_journal {
+                let delivery = if uses_journal {
+                    delivery_lock = Some(journal.lock_delivery_baseline(&baseline_key)?);
                     let current = journal.v2_feed_cursor(&scope)?;
                     if current != checkpoint {
                         checkpoint = current;
                         cursor = current;
                         continue 'resume;
                     }
-                }
-                match delivery_baseline(
-                    client,
-                    journal,
-                    session,
-                    &baseline_key,
-                    baseline_reason,
-                    caller_supplies_cursor,
-                    &mut output,
-                ) {
+                    delivery_baseline(
+                        client,
+                        journal,
+                        session,
+                        &baseline_key,
+                        baseline_reason,
+                        &mut output,
+                    )
+                } else {
+                    Ok(None)
+                };
+                match delivery {
                     Ok(Some(baseline)) => {
                         output_changes |= !baseline.changes.is_empty();
                         feed_ack2 = baseline.ack2;
@@ -448,22 +435,20 @@ pub fn run(
                 return Err(FeedError::InvalidChange);
             }
             if let Some(baseline) = delivered_baseline.take() {
-                if !caller_supplies_cursor {
-                    journal.finish_delivery_baseline(
-                        &baseline_key,
-                        &scope,
-                        checkpoint,
-                        start_position,
-                        &baseline.changes,
-                    )?;
-                    feed_ack2 = client.ack2;
-                    checkpoint = Some(start_position);
-                }
+                journal.finish_delivery_baseline(
+                    &baseline_key,
+                    &scope,
+                    checkpoint,
+                    start_position,
+                    &baseline.changes,
+                )?;
+                feed_ack2 = client.ack2;
+                checkpoint = Some(start_position);
                 drop(delivery_lock.take());
             }
             if !focus_only {
                 for change in &batch.changes {
-                    if !baseline_replay(journal, &baseline_key, change)? {
+                    if !uses_journal || !baseline_replay(journal, &baseline_key, change)? {
                         emit_change(&mut output, change)?;
                         output_changes = true;
                     }
@@ -521,7 +506,8 @@ pub fn run(
                     if change.rev <= start_position {
                         continue;
                     }
-                    let emitted = !focus_only && !baseline_replay(journal, &baseline_key, &change)?;
+                    let emitted = !focus_only
+                        && (!uses_journal || !baseline_replay(journal, &baseline_key, &change)?);
                     if emitted {
                         emit_change(&mut output, &change)?;
                     }
@@ -717,6 +703,7 @@ fn add_snapshot(
 
 #[cfg(test)]
 mod tests {
+    mod model;
     use std::path::PathBuf;
 
     use crate::{
@@ -979,119 +966,6 @@ mod tests {
     }
 
     #[test]
-    fn caller_checkpoint_can_resume_the_same_baseline_after_an_uncommitted_read() {
-        let (_root, journal) = open();
-        let session = Uuid::new_v4();
-        let (chat, _) = retained_turns(session);
-        let server = SlowServer::sequence(vec![
-            delivery_start(40, "same-attempt"),
-            delivery_page(40, vec![chat.clone()], None),
-            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
-            delivery_page(40, vec![chat.clone()], None),
-            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
-            FixtureResponse::json(json!({"rev":41,"changes":[],"more":false})),
-        ]);
-        let client = client(&server);
-        for start in [Start::Snapshot, Start::Snapshot, Start::After(40)] {
-            let mut output = Vec::new();
-            run(
-                &client,
-                &journal,
-                Some(session),
-                start,
-                Mode::Read,
-                |value| {
-                    output.push(value.clone());
-                    Ok(())
-                },
-            )
-            .unwrap();
-            assert_eq!(output.contains(&chat), matches!(start, Start::Snapshot));
-        }
-        assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
-        let requests = server.requests();
-        assert_eq!(requests[1].line, requests[3].line);
-        assert!(requests[5].line.contains("after=40"));
-    }
-
-    #[test]
-    fn caller_recovery_retains_an_unacknowledged_attempt_across_baseline_expiry() {
-        let (root, journal) = open();
-        let session = Uuid::new_v4();
-        let (chat, answer) = retained_turns(session);
-        let server = SlowServer::sequence(vec![
-            delivery_start(40, "old"),
-            delivery_page(40, vec![chat.clone()], None),
-            expired(),
-            delivery_start(50, "new"),
-            delivery_page(40, vec![chat.clone()], None),
-            baseline_unsupported(),
-            delivery_page(40, vec![chat.clone()], None),
-            delivery_page(50, vec![answer.clone()], None),
-            FixtureResponse::json(json!({"rev":50,"changes":[],"more":false})),
-            FixtureResponse::json(json!({"rev":51,"changes":[],"more":false})),
-        ]);
-        let client = client(&server);
-        let error = run(
-            &client,
-            &journal,
-            Some(session),
-            Start::Snapshot,
-            Mode::Read,
-            |_| Ok(()),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            FeedError::Api(V2Error::Http { status: 404, .. })
-        ));
-
-        drop(journal);
-        let journal = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
-        let mut output = Vec::new();
-        run(
-            &client,
-            &journal,
-            Some(session),
-            Start::Snapshot,
-            Mode::Read,
-            |value| {
-                output.push(value.clone());
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            output,
-            [
-                json!({"kind":"baseline","reason":"cursor_expired","rev":50}),
-                chat,
-                answer,
-                json!({"kind":"baseline_complete","rev":50}),
-                json!({"kind":"caught_up","rev":50}),
-            ]
-        );
-        run(
-            &client,
-            &journal,
-            Some(session),
-            Start::After(50),
-            Mode::Read,
-            |value| {
-                assert_eq!(*value, json!({"kind":"caught_up","rev":51}));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
-        let requests = server.requests();
-        assert_eq!(requests[1].line, requests[4].line);
-        assert_eq!(requests[4].line, requests[6].line);
-        assert_eq!(requests[5].line, requests[7].line);
-        assert!(requests[9].line.contains("after=50"));
-    }
-
-    #[test]
     fn interrupted_expired_cursor_baseline_resumes_after_restart_and_before_listening() {
         let (root, journal) = open();
         let session = Uuid::new_v4();
@@ -1163,7 +1037,6 @@ mod tests {
     fn rebuild(session: Uuid) -> Vec<FixtureResponse> {
         vec![
             expired(),
-            baseline_unsupported(),
             FixtureResponse::json(json!({"rev":40,"messages":[{
                 "item_id":"item","session":session,"rev":39,"sender":"app:fixture",
                 "revision":1,"message":{},"seen":false,"files":[],
@@ -1241,9 +1114,9 @@ mod tests {
         .unwrap();
         let requests = restarted.requests();
         assert!(requests[0].line.contains("after=2"));
-        assert!(requests[4].line.contains("before=entry-b"));
-        assert!(requests[5].line.contains("page=later"));
-        assert!(requests[6].line.contains("after=40"));
+        assert!(requests[3].line.contains("before=entry-b"));
+        assert!(requests[4].line.contains("page=later"));
+        assert!(requests[5].line.contains("after=40"));
         assert_eq!(
             output
                 .iter()
@@ -1425,93 +1298,6 @@ mod tests {
         assert!(
             retry.contains(&chat) && retry.contains(&answer),
             "incomplete capture became unrecoverable: {retry:?}"
-        );
-    }
-
-    #[test]
-    fn caller_retry_preserves_declaration_through_json_and_sse() {
-        for start in [Start::Snapshot, Start::After(3)] {
-            check_caller_declaration(start);
-        }
-    }
-
-    fn check_caller_declaration(start: Start) {
-        let (_root, journal) = open();
-        let session = Uuid::new_v4();
-        let (chat, _) = retained_turns(session);
-        let mut responses = vec![
-            delivery_start(40, "saved"),
-            delivery_page(40, vec![chat.clone()], None),
-            delivery_page(40, vec![chat], None),
-            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
-            FixtureResponse {
-                status: "200 OK",
-                headers: &[
-                    ("Content-Type", "text/event-stream"),
-                    ("Harklight-Ack2", "true"),
-                ],
-                body: "event: closing\ndata: {\"reason\":\"internal_error\"}\n\n".into(),
-                truncate: false,
-            },
-            FixtureResponse::json(json!({"rev":40,"changes":[],"more":false})),
-        ];
-        if matches!(start, Start::After(_)) {
-            responses.insert(0, expired());
-        }
-        let server = SlowServer::sequence(responses);
-        let first = client(&server).with_ack2(true);
-        assert!(
-            run(&first, &journal, Some(session), start, Mode::Read, |row| {
-                if row["kind"] == "entry" {
-                    return Err(io::ErrorKind::BrokenPipe.into());
-                }
-                Ok(())
-            })
-            .is_err()
-        );
-        let retry = client(&server);
-        let error = run(&retry, &journal, Some(session), start, Mode::Follow, |_| {
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(matches!(error, FeedError::InternalClosing { .. }));
-        run(
-            &retry,
-            &journal,
-            Some(session),
-            Start::After(40),
-            Mode::Read,
-            |_| Ok(()),
-        )
-        .unwrap();
-        let requests = server.requests();
-        assert_eq!(
-            requests.len(),
-            if matches!(start, Start::After(_)) {
-                7
-            } else {
-                6
-            }
-        );
-        let (covering, unacknowledged) = requests.split_last().unwrap();
-        assert!(
-            !covering
-                .headers
-                .iter()
-                .any(|(name, _)| name == "harklight-ack2")
-        );
-        let missing: Vec<_> = unacknowledged
-            .iter()
-            .filter(|request| {
-                !request
-                    .headers
-                    .contains(&("harklight-ack2".into(), "true".into()))
-            })
-            .map(|request| request.line.as_str())
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "missing persisted declaration on {missing:?}"
         );
     }
 }

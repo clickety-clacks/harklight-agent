@@ -2,7 +2,8 @@
 
 ## 0.2.1
 
-- On a Server with the delivery baseline, recover pending Chat and answers on first contact or cursor expiry, including Chat on answered items and turns retained from 0.1. Keep the attempt in the local journal so an interrupted read can resume. Server 0.2.4 and 0.2.5 keep their earlier snapshot behavior.
+- Agent-owned default `read` and `listen` recover pending Chat and answers on first contact or cursor expiry on a supporting Server. This includes Chat on answered items and turns retained from 0.1. The local journal retains the attempt across interruption.
+- Caller-owned `--snapshot` and `--after` keep Agent 0.2.0 snapshot and resume behavior, including on a supporting Server. Server 0.2.4 and 0.2.5 also keep the earlier snapshot behavior for default reads.
 - Known limit: the delivery baseline omits earlier cleared, expired, and superseded items that the 0.2.0 snapshot showed. A valid saved cursor still receives later close-outs as ordinary changes. Use `messages` or `message-get` to inspect terminal state.
 - Use `read --ack2` or `listen --ack2` for an integration that issues handoff receipts. The declaration applies only to the receiving scope of the read or listener.
 - Keep writes retryable and preserve staged uploads when an HTTP 4xx response does not carry a valid Harklight API error. Reads and listeners point to the configured address or device port when they receive such a response.

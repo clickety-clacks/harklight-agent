@@ -25,10 +25,9 @@ pub(super) fn delivery_baseline(
     session: Option<Uuid>,
     key: &str,
     reason: &str,
-    caller_supplies_cursor: bool,
     output: &mut impl FnMut(&Value) -> io::Result<()>,
 ) -> Result<Option<DeliveredBaseline>, FeedError> {
-    let mut attempt = match journal.delivery_attempt(key)? {
+    let attempt = match journal.delivery_attempt(key)? {
         Some(attempt) if !attempt.renew => attempt,
         previous => {
             let continued = previous.is_some();
@@ -60,7 +59,6 @@ pub(super) fn delivery_baseline(
                     .to_owned(),
                 ack2,
                 expired: continued || reason == "cursor_expired",
-                complete: false,
                 renew: false,
                 prior,
             };
@@ -131,10 +129,6 @@ pub(super) fn delivery_baseline(
     }
     let changes: Vec<_> = emitted_turns.into_values().collect();
     emit_value(output, json!({"kind":"baseline_complete","rev":rev}))?;
-    if caller_supplies_cursor {
-        attempt.complete = true;
-        journal.record_caller_baseline(key, &attempt, &changes)?;
-    }
     Ok(Some(DeliveredBaseline {
         rev,
         ack2: attempt.ack2,

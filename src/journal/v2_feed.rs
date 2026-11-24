@@ -16,8 +16,6 @@ pub(crate) struct DeliveryAttempt {
     pub ack2: bool,
     pub expired: bool,
     #[serde(default)]
-    pub complete: bool,
-    #[serde(default)]
     pub renew: bool,
     #[serde(default)]
     pub prior: Vec<DeliveryPages>,
@@ -153,13 +151,6 @@ impl JournalStore {
         })
     }
 
-    pub(crate) fn clear_delivery_attempt(&self, key: &str) -> Result<(), JournalError> {
-        self.with_transaction(|tx| {
-            tx.execute("DELETE FROM meta WHERE key=?1", [key])?;
-            Ok(())
-        })
-    }
-
     pub(crate) fn baseline_change(
         &self,
         key: &str,
@@ -179,24 +170,6 @@ impl JournalStore {
             value
                 .map(|value| serde_json::from_str(&value).map_err(JournalError::from))
                 .transpose()
-        })
-    }
-
-    pub(crate) fn record_caller_baseline(
-        &self,
-        key: &str,
-        attempt: &DeliveryAttempt,
-        changes: &[Change],
-    ) -> Result<(), JournalError> {
-        self.with_transaction(|tx| {
-            for change in changes {
-                store_change(tx, key, change)?;
-            }
-            tx.execute(
-                "UPDATE meta SET value=?2 WHERE key=?1",
-                params![key, serde_json::to_string(attempt)?],
-            )?;
-            Ok(())
         })
     }
 
