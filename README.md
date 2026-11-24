@@ -4,6 +4,17 @@ Harklight Agent sends messages, revises Progress and handles conversations
 from a host command line. The Agent 0.2 protocol requires a Harklight Server
 that serves the v2 Agent API.
 
+## Install
+
+> **Using hosted Harklight (app.harklight.net)?** It still needs
+> [Agent 0.1.16](https://github.com/clickety-clacks/harklight-agent/releases/tag/v0.1.16)
+> until it moves to protocol 0.2. Agent 0.2 cannot connect to it yet.
+
+For a Harklight Server 0.2, download the archive for your platform and
+`SHA256SUMS` from the
+[latest release](https://github.com/clickety-clacks/harklight-agent/releases/latest),
+verify the checksum and put the `harklight-agent` binary on your `PATH`.
+
 ## Build
 
 ```sh
