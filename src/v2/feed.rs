@@ -656,7 +656,7 @@ fn retry_delay(mode: &Mode, error: &FeedError) -> Option<u64> {
             V2Error::UnexpectedClientError { .. }
             | V2Error::InvalidResponse { .. }
             | V2Error::Http {
-                status: 300..=399 | 500..=599,
+                status: ..=399 | 500..,
                 ..
             },
         )
