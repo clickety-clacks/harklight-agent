@@ -6,6 +6,8 @@
   responses and feed `internal_error` failures. It backs off up to 25 seconds
   and resumes from its last completed position. Valid API refusals such as
   `unauthorized`, `forbidden`, `account_paused`, and `not_found` still stop the listener.
+  The listener saves receipt-only revisions of replies it has already printed
+  without printing the reply again.
 
 ## 0.2.2
 

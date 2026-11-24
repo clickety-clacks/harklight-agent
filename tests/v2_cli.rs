@@ -753,6 +753,64 @@ fn follow_retries_bad_responses_from_its_last_good_position() {
 }
 
 #[test]
+fn follow_saves_receipt_only_revisions_without_reprinting_the_reply() {
+    use harklight_agent::journal::JournalStore;
+    use test_tls::FixtureResponse;
+
+    let first = json!({
+        "entry_id":"one","item_id":"item","kind":"reply","text":"hello","rev":11,
+        "delivery":{"delivered":false,"acted":false},
+    });
+    let mut delivered = first.clone();
+    delivered["rev"] = 12.into();
+    delivered["delivery"]["delivered"] = true.into();
+    let mut acted = delivered.clone();
+    acted["rev"] = 13.into();
+    acted["delivery"]["acted"] = true.into();
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({
+            "rev":11,"changes":[{"rev":11,"kind":"entry","data":first}],"more":false,
+        })),
+        FixtureResponse {
+            status: "200 OK",
+            headers: &[("Content-Type", "text/event-stream")],
+            body: format!(
+                "id: 12\nevent: entry\ndata: {delivered}\n\n\
+                 id: 13\nevent: entry\ndata: {acted}\n\n\
+                 event: closing\ndata: {{\"reason\":\"session_closed\"}}\n\n"
+            ),
+            truncate: false,
+        },
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let journal = JournalStore::open(&fixture.0.join("state"), "fixture", Uuid::nil()).unwrap();
+    journal.record_v2_feed("", None, 10, &[], false).unwrap();
+
+    let result = fixture.run(&["listen", "--follow", "--all-sessions"]);
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    let rows: Vec<Value> = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|row: &Value| row["kind"] == "entry")
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            json!({"kind":"entry","rev":11,"data":first}),
+            json!({"kind":"entry","rev":13,"data":acted}),
+        ]
+    );
+    assert_eq!(journal.v2_feed_cursor("").unwrap(), Some(13));
+    let requests = server.requests();
+    assert!(
+        requests[1]
+            .headers
+            .contains(&("last-event-id".into(), "11".into()))
+    );
+}
+
+#[test]
 fn follow_stops_on_definite_api_refusals() {
     use test_tls::FixtureResponse;
 

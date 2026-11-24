@@ -20,7 +20,7 @@ use crate::journal::{JournalError, JournalStore};
 use super::{AgentClient, V2Error, header};
 
 mod delivery;
-use delivery::{baseline_replay, delivery_baseline};
+use delivery::{baseline_replay, delivery_baseline, same_ignoring_ack1};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Change {
@@ -333,6 +333,7 @@ pub fn run(
     let mut output_changes = false;
     let mut feed_ack2 = client.ack2;
     let mut emitted_baseline = BTreeMap::new();
+    let mut pending_receipts = BTreeMap::new();
     'resume: loop {
         if retry.reconnecting() {
             // Discard both pools so a proxy response can't pin the listener to
@@ -456,7 +457,9 @@ pub fn run(
             }
             if !focus_only {
                 for change in &batch.changes {
-                    if !uses_journal || !baseline_replay(journal, &baseline_key, change)? {
+                    if (!uses_journal || !baseline_replay(journal, &baseline_key, change)?)
+                        && (!retry.following() || new_entry_version(&mut pending_receipts, change))
+                    {
                         emit_change(&mut output, change)?;
                         output_changes = true;
                     }
@@ -519,7 +522,9 @@ pub fn run(
                         continue;
                     }
                     let emitted = !focus_only
-                        && (!uses_journal || !baseline_replay(journal, &baseline_key, &change)?);
+                        && (!uses_journal || !baseline_replay(journal, &baseline_key, &change)?)
+                        && (!retry.following()
+                            || new_entry_version(&mut pending_receipts, &change));
                     if emitted {
                         emit_change(&mut output, &change)?;
                     }
@@ -582,6 +587,29 @@ fn emit_change(
         output,
         json!({"kind":change.kind,"rev":change.rev,"data":change.data}),
     )
+}
+
+// The Server can publish the first-service receipt as another revision of
+// the same reply. Keep the cursor and journal update, but don't emit the
+// reply twice when the receipt is the only change.
+fn new_entry_version(pending: &mut BTreeMap<String, Change>, change: &Change) -> bool {
+    if change.kind != "entry" || change.data["kind"] != "reply" {
+        return true;
+    }
+    let id = change.data["entry_id"]
+        .as_str()
+        .expect("validated entry ID");
+    match change.data["delivery"]["delivered"].as_bool() {
+        Some(false) => {
+            pending.insert(id.to_owned(), change.clone());
+            true
+        }
+        delivered => {
+            let prior = pending.remove(id);
+            delivered != Some(true)
+                || !prior.is_some_and(|prior| same_ignoring_ack1(&prior, change))
+        }
+    }
 }
 
 const MAX_BACKOFF_SECS: u64 = 25;
