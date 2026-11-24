@@ -802,6 +802,10 @@ pub(super) fn record_failure(
             status,
             ref request_id,
             ..
+        }
+        | V2Error::UnexpectedClientError {
+            status,
+            ref request_id,
         } = error
             && let Some(output) = failure.output.as_mut()
         {

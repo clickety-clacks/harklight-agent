@@ -1,5 +1,9 @@
 # Release notes
 
+## 0.2.1
+
+- Keep writes retryable and preserve staged uploads when an HTTP 4xx response does not carry a valid Harklight API error. Reads and listeners point to the configured address or device port when they receive such a response.
+
 ## 0.2.0
 
 - Move enrolled Agent operations to the v2 API over mutual TLS. Agent requests and feeds use `/v2/agent`. Shared file operations use `/v2/files`. Use `--device-port` or `HARKLIGHT_DEVICE_PORT` to select the device API port for an existing identity.
