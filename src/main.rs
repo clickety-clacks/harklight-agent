@@ -166,13 +166,13 @@ enum Command {
     Listen(ListenArgs),
     Read(ReadArgs),
     /// Read an authoritative sent message and its file references.
-    #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "sender_id"])))]
+    #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "message_id"])))]
     MessageGet {
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long, requires = "message_id")]
         sender_id: Option<String>,
-        #[arg(long, requires = "sender_id")]
+        #[arg(long)]
         message_id: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         revision: Option<u64>,
@@ -184,10 +184,26 @@ enum Command {
         #[arg(long)]
         page: Option<String>,
     },
-    /// Read a page of entries for a sent message.
+    /// Search retained messages across the account, newest first.
+    Search {
+        #[arg(long)]
+        session: Option<Uuid>,
+        #[arg(long)]
+        sender: Option<String>,
+        #[arg(long)]
+        message_id: Option<String>,
+        #[arg(long, value_parser = ["open", "answered", "cleared", "expired", "superseded", "retracted"])]
+        state: Option<String>,
+        #[arg(long)]
+        page: Option<String>,
+    },
+    /// Read a page of entries, falling back to the account view for another sender.
+    #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "message_id"])))]
     MessageEntries {
         #[arg(long)]
-        item_id: String,
+        item_id: Option<String>,
+        #[arg(long)]
+        message_id: Option<String>,
         #[arg(long)]
         before: Option<String>,
         #[arg(long)]
@@ -313,9 +329,13 @@ enum Command {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
+    /// Retract an open message in this account.
+    #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "message_id"])))]
     Retract {
         #[arg(long)]
-        item_id: String,
+        item_id: Option<String>,
+        #[arg(long)]
+        message_id: Option<String>,
         #[arg(long)]
         in_reply_to: Option<String>,
         #[arg(long)]
@@ -595,6 +615,7 @@ fn main() {
         Command::Focus { follow: true } => run_device_feed(&cli, None, feed::Mode::Focus),
         Command::MessageGet { .. }
         | Command::Messages { .. }
+        | Command::Search { .. }
         | Command::MessageEntries { .. }
         | Command::FileGet { .. }
         | Command::Focus { follow: false } => run_device_read(&cli),
@@ -745,19 +766,64 @@ fn run_device_read(cli: &Cli) {
                         Some(revision) => client.message_revision(item_id, *revision),
                         None => Ok(message),
                     }
+                })
+                .or_else(|error| {
+                    if error.permits_account_fallback() {
+                        let item_id = client.account_item_id(id, Some(sender))?;
+                        client.account_message(&item_id, *revision)
+                    } else {
+                        Err(error)
+                    }
                 });
             ("message-get", result)
         }
+        Command::MessageGet {
+            message_id: Some(id),
+            revision,
+            ..
+        } => (
+            "message-get",
+            client
+                .account_item_id(id, None)
+                .and_then(|item_id| read_message_revision(&client, &item_id, *revision)),
+        ),
+        Command::Search {
+            session,
+            sender,
+            message_id,
+            state,
+            page,
+        } => (
+            "search",
+            client.account_search(
+                *session,
+                sender.as_deref(),
+                message_id.as_deref(),
+                state.as_deref(),
+                page.as_deref(),
+            ),
+        ),
         Command::Messages { session, page } => {
             ("messages", client.messages(*session, page.as_deref()))
         }
         Command::MessageEntries {
             item_id,
+            message_id,
             before,
             limit,
         } => (
             "message-entries",
-            client.message_entries(item_id, before.as_deref(), *limit),
+            resolve_item(&client, item_id, message_id).and_then(|id| {
+                client
+                    .message_entries(&id, before.as_deref(), *limit)
+                    .or_else(|error| {
+                        if error.permits_account_fallback() {
+                            client.account_entries(&id, before.as_deref(), *limit)
+                        } else {
+                            Err(error)
+                        }
+                    })
+            }),
         ),
         Command::FileGet { file_id, output } => (
             "file-get",
@@ -774,35 +840,57 @@ fn run_device_read(cli: &Cli) {
     };
     match result {
         Ok(response) => println!("{response}"),
-        Err(error @ V2Error::Http { status, .. }) if (400..500).contains(&status) => {
-            if let V2Error::Http {
-                ref token,
-                ref field,
-                ref request_id,
-                ..
-            } = error
-            {
-                let mut output = serde_json::json!({
-                    "kind":"refused", "operation":operation, "status":status, "error":token,
-                });
-                if let Some(field) = field {
-                    output["field"] = field.as_str().into();
-                }
-                if let Some(request_id) = request_id {
-                    output["request_id"] = request_id.as_str().into();
-                }
-                println!("{output}");
+        Err(error) => fail_read(operation, error, false),
+    }
+}
+
+fn fail_read(operation: &str, error: V2Error, report_read_failure: bool) -> ! {
+    let mut output = serde_json::json!({"kind":"refused", "operation":operation});
+    let exit = match &error {
+        V2Error::Http {
+            status,
+            token,
+            field,
+            request_id,
+            ..
+        } => {
+            output["status"] = (*status).into();
+            output["error"] = serde_json::json!(token);
+            if let Some(field) = field {
+                output["field"] = field.as_str().into();
             }
-            let exit = match &error {
-                V2Error::Http {
-                    token: Some(token), ..
-                } if token == "unsupported" => 5,
-                _ => commands::EXIT_REFUSED,
-            };
-            fail(error.to_string(), exit)
+            if let Some(request_id) = request_id {
+                output["request_id"] = request_id.as_str().into();
+            }
+            match status {
+                400 if token.as_deref() == Some("unsupported") => 5,
+                400..=499 => commands::EXIT_REFUSED,
+                _ => 1,
+            }
         }
-        Err(error) if error.is_internal_error() => fail(format!("{operation}: {error}"), 1),
-        Err(error) => fail(error.to_string(), 1),
+        V2Error::AccountSearchUnsupported => {
+            output["error"] = "unsupported".into();
+            5
+        }
+        V2Error::AmbiguousMessageId => {
+            output["error"] = "ambiguous_message_id".into();
+            commands::EXIT_REFUSED
+        }
+        _ => 1,
+    };
+
+    if exit != 1 || report_read_failure {
+        if exit == 1 {
+            output["kind"] = "read_failed".into();
+            output["detail"] = error.to_string().into();
+        }
+        println!("{output}");
+    }
+
+    if error.is_internal_error() {
+        fail(format!("{operation}: {error}"), exit)
+    } else {
+        fail(error.to_string(), exit)
     }
 }
 
@@ -811,10 +899,29 @@ fn read_message_revision(
     item_id: &str,
     revision: Option<u64>,
 ) -> Result<serde_json::Value, V2Error> {
-    revision.map_or_else(
-        || client.message(item_id),
-        |rev| client.message_revision(item_id, rev),
-    )
+    revision
+        .map_or_else(
+            || client.message(item_id),
+            |rev| client.message_revision(item_id, rev),
+        )
+        .or_else(|error| {
+            if error.permits_account_fallback() {
+                client.account_message(item_id, revision)
+            } else {
+                Err(error)
+            }
+        })
+}
+
+fn resolve_item(
+    client: &AgentClient,
+    item_id: &Option<String>,
+    message_id: &Option<String>,
+) -> Result<String, V2Error> {
+    match item_id {
+        Some(id) => Ok(id.clone()),
+        None => client.account_item_id(message_id.as_deref().expect("clap requires an ID"), None),
+    }
 }
 
 fn device_journal(cli: &Cli, device_id: &str) -> JournalStore {
@@ -1056,17 +1163,22 @@ fn run_device_write(cli: &Cli) {
         ),
         Command::Retract {
             item_id,
+            message_id,
             in_reply_to,
             op_id,
-        } => writes::control(
-            &client,
-            &mut journal,
-            *op_id,
-            ControlWrite::Retract {
-                item_id,
-                in_reply_to: in_reply_to.as_deref(),
-            },
-        ),
+        } => {
+            let item_id = resolve_item(&client, item_id, message_id)
+                .unwrap_or_else(|error| fail_read("retract", error, true));
+            writes::control(
+                &client,
+                &mut journal,
+                *op_id,
+                ControlWrite::Retract {
+                    item_id: &item_id,
+                    in_reply_to: in_reply_to.as_deref(),
+                },
+            )
+        }
         Command::Lifecycle {
             item_id,
             action,

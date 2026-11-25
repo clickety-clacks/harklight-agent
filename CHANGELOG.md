@@ -1,5 +1,14 @@
 # Release notes
 
+## Unreleased
+
+- Add account-wide `search` and senderless message-ID lookup. `messages`
+  keeps the own-sent list and adds optional retraction attribution when the
+  Server knows it. `message-get` and `message-entries` mark the account-view
+  fallback for messages from another sender.
+- Retract an open account message by item ID or unique message ID on a
+  supporting Server.
+
 ## 0.2.4
 
 - `read --session UUID --pending --prepare` prepares a pending-only baseline for a

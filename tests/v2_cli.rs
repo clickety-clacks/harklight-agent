@@ -86,6 +86,206 @@ fn binary_uses_the_device_listener_for_the_historical_message_selector() {
     );
 }
 
+fn account_search_response(body: Value) -> test_tls::FixtureResponse {
+    test_tls::FixtureResponse {
+        headers: &[("Harklight-Account-Search", "1")],
+        ..test_tls::FixtureResponse::json(body)
+    }
+}
+
+#[test]
+fn binary_searches_the_account_on_the_device_listener() {
+    let session = Uuid::new_v4().to_string();
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![account_search_response(
+        json!({"rev":3,"items":[],"next_page":"opaque-page"}),
+    )]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&[
+        "search",
+        "--session",
+        &session,
+        "--sender",
+        "app:second",
+        "--message-id",
+        "legacy-id",
+        "--state",
+        "retracted",
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["next_page"], "opaque-page");
+
+    let line = server.request_line();
+    assert!(line.starts_with("GET /v2/search?"), "{line}");
+    for filter in [
+        format!("session={session}"),
+        "sender=app%3Asecond".into(),
+        "message_id=legacy-id".into(),
+        "state=retracted".into(),
+    ] {
+        assert!(line.contains(&filter), "{line}");
+    }
+}
+
+#[test]
+fn binary_marks_foreign_message_get_as_an_account_view() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse {
+            status: "404 Not Found",
+            ..FixtureResponse::json(json!({
+                "error":"not_found", "retryable":false, "request_id":"fixture-404"
+            }))
+        },
+        FixtureResponse::json(json!({
+            "rev":4,
+            "item":{
+                "item_id":"i23", "rev":4, "sender":"app:second",
+                "request_revision":1, "message":{"title":"Other sender"},
+                "seen":false, "files":[], "terminal":null
+            }
+        })),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["message-get", "--item-id", "i23"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["view"], "account");
+    assert_eq!(result["item"]["item_id"], "i23");
+    let requests = server.requests();
+    assert_eq!(
+        requests[0].line.trim_end(),
+        "GET /v2/agent/messages/i23 HTTP/1.1"
+    );
+    assert_eq!(requests[1].line.trim_end(), "GET /v2/items/i23 HTTP/1.1");
+}
+
+#[test]
+fn binary_refuses_to_retract_an_id_with_matches_across_pages() {
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        account_search_response(json!({
+            "rev":4, "next_page":"another",
+            "items":[{"item_id":"i4", "rev":4, "message":{"message_id":"shared"}}]
+        })),
+        account_search_response(json!({
+            "rev":4,
+            "items":[{"item_id":"i2", "rev":2, "message":{"message_id":"shared"}}]
+        })),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["retract", "--message-id", "shared"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"], "ambiguous_message_id");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("matches multiple items"));
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]
+            .line
+            .starts_with("GET /v2/search?message_id=shared ")
+    );
+    assert!(
+        requests[1]
+            .line
+            .starts_with("GET /v2/search?message_id=shared&page=another ")
+    );
+}
+
+#[test]
+fn account_search_refuses_old_servers_instead_of_accepting_ignored_filters() {
+    use test_tls::FixtureResponse;
+
+    for command in [
+        &["search", "--message-id", "legacy"][..],
+        &["message-get", "--message-id", "legacy"][..],
+        &["message-entries", "--message-id", "legacy"][..],
+        &["retract", "--message-id", "legacy"][..],
+        &[
+            "search",
+            "--session",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ][..],
+    ] {
+        let response = if command[1] == "--session" {
+            FixtureResponse::json(json!({"rev":3,"items":[]}))
+        } else {
+            FixtureResponse {
+                status: "404 Not Found",
+                ..FixtureResponse::json(json!({
+                    "error":"not_found", "retryable":false, "request_id":"old-server"
+                }))
+            }
+        };
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![response]);
+        let fixture = CliFixture::new(&server, identity);
+        let output = fixture.run(command);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"], "unsupported");
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[test]
+fn retract_lookup_reports_read_failures_without_sending_a_write() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![FixtureResponse {
+        status: "503 Service Unavailable",
+        ..account_search_response(json!({
+            "error":"retry_later", "retryable":true, "request_id":"lookup-busy"
+        }))
+    }]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&["retract", "--message-id", "legacy"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["kind"], "read_failed");
+    assert_eq!(result["error"], "retry_later");
+    assert_eq!(result["status"], 503);
+    assert_eq!(result["request_id"], "lookup-busy");
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn granted_agent_reads_fall_back_on_a_forbidden_own_view() {
+    use test_tls::FixtureResponse;
+
+    for (command, suffix, body) in [
+        ("message-get", "", json!({"rev":4,"item":{"item_id":"i23"}})),
+        (
+            "message-entries",
+            "/entries",
+            json!({"rev":4,"entries":[],"older":false}),
+        ),
+    ] {
+        let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+            FixtureResponse {
+                status: "403 Forbidden",
+                ..FixtureResponse::json(json!({
+                    "error":"forbidden", "retryable":false, "request_id":"granted"
+                }))
+            },
+            FixtureResponse::json(body),
+        ]);
+        let fixture = CliFixture::new(&server, identity);
+        let output = fixture.run(&[command, "--item-id", "i23"]);
+        assert!(output.status.success(), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["view"], "account");
+        assert_eq!(
+            server.requests()[1].line.trim_end(),
+            format!("GET /v2/items/i23{suffix} HTTP/1.1")
+        );
+    }
+}
+
 #[test]
 fn feed_refuses_missing_or_conflicting_scope_before_io() {
     let root = std::env::temp_dir().join(Uuid::new_v4().to_string());

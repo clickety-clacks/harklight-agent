@@ -127,7 +127,10 @@ impl AgentClient {
     }
 
     fn send_checked(&self, request: RequestBuilder) -> Result<Response, V2Error> {
-        let response = self.send(request)?;
+        Self::checked_response(self.send(request)?)
+    }
+
+    fn checked_response(response: Response) -> Result<Response, V2Error> {
         if response.status().is_success() {
             return Ok(response);
         }
@@ -176,7 +179,10 @@ impl AgentClient {
         &self,
         request: RequestBuilder,
     ) -> Result<(Value, Option<String>), V2Error> {
-        let response = self.send_checked(request)?;
+        Self::decode_json(self.send_checked(request)?)
+    }
+
+    fn decode_json(response: Response) -> Result<(Value, Option<String>), V2Error> {
         let status = response.status().as_u16();
         let request_id = header(&response, "Request-Id").map(str::to_owned);
         let bytes = response.bytes().map_err(|source| V2Error::ResponseRead {
@@ -250,6 +256,10 @@ pub enum V2Error {
     InvalidPath,
     #[error("local file failed before the request: {0}")]
     LocalFile(#[source] std::io::Error),
+    #[error("message ID matches multiple items; use --item-id to choose one")]
+    AmbiguousMessageId,
+    #[error("the Server does not support account message search")]
+    AccountSearchUnsupported,
     #[error("server sent an unexpected response (request ID {request_id:?})")]
     InvalidResponse { request_id: Option<String> },
     #[error(
@@ -277,6 +287,15 @@ pub enum V2Error {
 }
 
 impl V2Error {
+    pub fn permits_account_fallback(&self) -> bool {
+        self.is_not_found()
+            || matches!(self, Self::Http { status: 403, token: Some(token), .. } if token == "forbidden")
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Http { status: 404, token: Some(token), .. } if token == "not_found")
+    }
+
     pub fn is_internal_error(&self) -> bool {
         matches!(self, Self::Http { status: 500, token: Some(token), .. } if token == "internal_error")
     }
@@ -288,7 +307,10 @@ impl V2Error {
             | Self::UnexpectedClientError { .. }
             | Self::ResponseRead { .. } => true,
             Self::Http { status, .. } => *status >= 500,
-            Self::InvalidPath | Self::LocalFile(_) => false,
+            Self::InvalidPath
+            | Self::LocalFile(_)
+            | Self::AmbiguousMessageId
+            | Self::AccountSearchUnsupported => false,
         }
     }
 }

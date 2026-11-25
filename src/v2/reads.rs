@@ -3,9 +3,128 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{AgentClient, V2Error};
+use super::{AgentClient, V2Error, header};
+use reqwest::header::ACCEPT;
 
 impl AgentClient {
+    pub fn account_search(
+        &self,
+        session: Option<Uuid>,
+        sender: Option<&str>,
+        message_id: Option<&str>,
+        state: Option<&str>,
+        page: Option<&str>,
+    ) -> Result<Value, V2Error> {
+        let session = session.map(|session| session.to_string());
+        let query: Vec<_> = [
+            ("session", session.as_deref()),
+            ("sender", sender),
+            ("message_id", message_id),
+            ("state", state),
+            ("page", page),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect();
+        let mut url = self.url(&["search"])?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&query);
+        }
+        let response = self.send(self.client.get(url).header(ACCEPT, "application/json"))?;
+        let account_capable = header(&response, "harklight-account-search") == Some("1");
+        let response = match Self::checked_response(response) {
+            Ok(response) if account_capable => response,
+            Ok(_) => return Err(V2Error::AccountSearchUnsupported),
+            Err(error) if !account_capable && error.is_not_found() => {
+                return Err(V2Error::AccountSearchUnsupported);
+            }
+            Err(error) => return Err(error),
+        };
+        let (response, request_id) = Self::decode_json(response)?;
+        let revision = response["rev"]
+            .as_u64()
+            .ok_or_else(|| invalid_response(&request_id))?;
+        let items = response["items"]
+            .as_array()
+            .ok_or_else(|| invalid_response(&request_id))?;
+        if items.iter().any(|item| {
+            !nonempty_string(&item["item_id"])
+                || !positive_at_most(&item["rev"], revision)
+                || sender.is_some_and(|sender| item["sender"] != sender)
+                || message_id.is_some_and(|id| item["message"]["message_id"] != id)
+        }) || response
+            .get("next_page")
+            .is_some_and(|next| !nonempty_string(next))
+        {
+            return Err(invalid_response(&request_id));
+        }
+        Ok(response)
+    }
+
+    pub fn account_item_id(
+        &self,
+        message_id: &str,
+        sender: Option<&str>,
+    ) -> Result<String, V2Error> {
+        let mut page = None;
+        let mut seen_pages = BTreeSet::new();
+        let mut item_id = None;
+        loop {
+            let response =
+                self.account_search(None, sender, Some(message_id), None, page.as_deref())?;
+            for item in response["items"]
+                .as_array()
+                .expect("validated search response")
+            {
+                let id = item["item_id"].as_str().expect("validated item ID");
+                match &item_id {
+                    Some(found) if found != id => return Err(V2Error::AmbiguousMessageId),
+                    Some(_) => {}
+                    None => item_id = Some(id.to_owned()),
+                }
+            }
+            match response["next_page"].as_str() {
+                Some(next) if seen_pages.insert(next.to_owned()) => page = Some(next.to_owned()),
+                Some(_) => return Err(invalid_response(&None)),
+                None => break,
+            }
+        }
+        item_id.ok_or_else(|| V2Error::Http {
+            status: 404,
+            token: Some("not_found".into()),
+            field: None,
+            request_id: None,
+            retry_after: None,
+        })
+    }
+
+    pub fn account_message(&self, item_id: &str, revision: Option<u64>) -> Result<Value, V2Error> {
+        let mut response = match revision {
+            Some(revision) => {
+                self.read(&["items", item_id, "revisions", &revision.to_string()], &[])?
+            }
+            None => self.read(&["items", item_id], &[])?,
+        };
+        response["view"] = json!("account");
+        Ok(response)
+    }
+
+    pub fn account_entries(
+        &self,
+        item_id: &str,
+        before: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<Value, V2Error> {
+        let limit = limit.map(|limit| limit.to_string());
+        let query: Vec<_> = [("before", before), ("limit", limit.as_deref())]
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect();
+        let mut response = self.read(&["items", item_id, "entries"], &query)?;
+        response["view"] = json!("account");
+        Ok(response)
+    }
+
     pub fn messages(&self, session: Option<Uuid>, page: Option<&str>) -> Result<Value, V2Error> {
         let session = session.map(|session| session.to_string());
         let query: Vec<_> = [("session", session.as_deref()), ("page", page)]
