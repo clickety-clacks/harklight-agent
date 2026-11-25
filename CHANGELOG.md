@@ -1,8 +1,9 @@
 # Release notes
 
-## Unreleased
+## 0.2.7
 
-- This release speaks only the Harklight 0.2 protocol.
+- This release speaks only the Harklight 0.2 protocol. It works with Harklight
+  Server 0.2.16 and later; its installed skill text comes from Server 0.2.21.
 - Resolve sender-qualified message IDs through account search. For Progress on
   an earlier message, pass its Server item ID to `--request`. Local supersession
   resolves recorded send operation IDs from the same journal.
