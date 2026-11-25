@@ -26,6 +26,7 @@ use crate::connect::{ConnectAddressResolver, resolve_configured_address};
 
 mod invitation;
 pub use invitation::start_invitation;
+pub use invitation::{resume_setup, start_setup};
 
 const EXIT_LOCAL: i32 = 1;
 const EXIT_REFUSED: i32 = 2;
@@ -342,12 +343,7 @@ fn make_context(
     tls_name: Option<&str>,
     port: Option<&str>,
 ) -> Result<EnrollmentContext, EnrollmentError> {
-    let identity_dir = identity_dir
-        .map(Path::to_path_buf)
-        .or_else(|| env_path("HARKLIGHT_IDENTITY_DIR"))
-        .ok_or_else(|| {
-            EnrollmentError::local("provide --identity-dir or HARKLIGHT_IDENTITY_DIR")
-        })?;
+    let identity_dir = identity_path(identity_dir)?;
     let ca_file = ca_file
         .map(Path::to_path_buf)
         .or_else(|| env_path("HARKLIGHT_CA_FILE"))
@@ -656,50 +652,54 @@ fn print_status_outcome(
     pending: &PendingFile,
     outcome: StatusOutcome,
 ) -> Result<(), EnrollmentError> {
-    match outcome {
+    let value = status_output(identity_dir, pending, outcome)?;
+    print_invitation_outcome(&value)
+}
+
+fn status_output(
+    identity_dir: &Path,
+    pending: &PendingFile,
+    outcome: StatusOutcome,
+) -> Result<Value, EnrollmentError> {
+    Ok(match outcome {
         StatusOutcome::Approved {
             person_id,
             device_id,
-        } => emit_json(&json!({
-            "state":"approved",
-            "person_id":person_id,
-            "device_id":device_id
-        })),
-        StatusOutcome::State(state) => {
-            emit_json(&json!({"state":state,"approval_code":pending.approval_code}))?;
-            match state {
-                "pending" => print_approval_guidance(),
-                "revoked" | "declined" | "cancelled" => eprintln!(
-                    "This enrollment request will not be approved; use a new identity directory to start another request."
-                ),
-                _ => {}
-            }
-            Ok(())
+        } => {
+            json!({"state":"approved","person_id":person_id,"device_id":device_id})
         }
-        StatusOutcome::Expired => {
-            emit_json(&json!({"state":"expired","approval_code":pending.approval_code}))?;
-            eprintln!(
-                "This enrollment request has expired; run `harklight-agent enroll retry` to submit the same key again."
-            );
-            Ok(())
-        }
+        StatusOutcome::State(state) => json!({"state":state,"approval_code":pending.approval_code}),
+        StatusOutcome::Expired => json!({"state":"expired","approval_code":pending.approval_code}),
         StatusOutcome::NotFound => {
-            let enrollment_path = identity_dir.join("enrollment.json");
-            if enrollment_path.exists() {
-                let enrollment = read_enrollment(identity_dir)?;
-                emit_json(&json!({
-                    "state":"approved",
-                    "person_id":enrollment.person_id,
-                    "device_id":enrollment.device_id,
-                    "readback":"ended"
-                }))
-            } else {
-                Err(EnrollmentError::refused(
+            if !identity_dir.join("enrollment.json").exists() {
+                return Err(EnrollmentError::refused(
                     "this enrollment request is unknown or past its readback deadline; run `harklight-agent enroll retry`",
-                ))
+                ));
             }
+            let enrollment = read_enrollment(identity_dir)?;
+            json!({
+                "state":"approved",
+                "person_id":enrollment.person_id,
+                "device_id":enrollment.device_id,
+                "readback":"ended"
+            })
         }
+    })
+}
+
+fn print_invitation_outcome(value: &Value) -> Result<(), EnrollmentError> {
+    emit_json(value)?;
+    match value["state"].as_str() {
+        Some("pending") => print_approval_guidance(),
+        Some("revoked" | "declined" | "cancelled") => eprintln!(
+            "This enrollment request will not be approved; use a new identity directory to start another request."
+        ),
+        Some("expired") => eprintln!(
+            "This enrollment request has expired; run `harklight-agent enroll retry` to submit the same key again."
+        ),
+        _ => {}
     }
+    Ok(())
 }
 
 fn print_pending(pending: &PendingFile) -> Result<(), EnrollmentError> {
@@ -920,6 +920,15 @@ fn valid_secret(secret: &str) -> bool {
         && secret
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn identity_path(identity_dir: Option<&Path>) -> Result<PathBuf, EnrollmentError> {
+    identity_dir
+        .map(Path::to_path_buf)
+        .or_else(|| env_path("HARKLIGHT_IDENTITY_DIR"))
+        .map(Ok)
+        .unwrap_or_else(crate::config::default_identity_dir)
+        .map_err(|error| EnrollmentError::local(error.to_string()))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

@@ -230,12 +230,36 @@ impl EnrolledIdentity {
     }
 }
 
+pub(crate) fn home_dir() -> Result<PathBuf, ConfigError> {
+    std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| ConfigError::Invalid("HOME is not set".into()))
+}
+
+pub fn default_identity_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(target_os = "macos")]
+    return Ok(default_state_root()?.join("identity"));
+
+    #[cfg(target_os = "linux")]
+    {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        return Ok(data
+            .map(Ok)
+            .unwrap_or_else(|| home_dir().map(|home| home.join(".local/share")))?
+            .join("harklight-agent/identity"));
+    }
+
+    #[allow(unreachable_code)]
+    Err(ConfigError::Invalid("unsupported host platform".into()))
+}
+
 pub fn default_state_root() -> Result<PathBuf, ConfigError> {
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| ConfigError::Invalid("HOME is not set".into()))?;
-        return Ok(PathBuf::from(home)
+        return Ok(home_dir()?
             .join("Library")
             .join("Application Support")
             .join("Harklight")
@@ -247,9 +271,7 @@ pub fn default_state_root() -> Result<PathBuf, ConfigError> {
         if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
             return Ok(PathBuf::from(state_home).join("harklight-agent"));
         }
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| ConfigError::Invalid("HOME is not set".into()))?;
-        return Ok(PathBuf::from(home)
+        return Ok(home_dir()?
             .join(".local")
             .join("state")
             .join("harklight-agent"));

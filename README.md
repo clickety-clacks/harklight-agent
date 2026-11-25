@@ -4,6 +4,66 @@ Harklight Agent sends messages, revises Progress and handles conversations
 from a host command line. The Agent 0.2 protocol requires a Harklight Server
 that serves the v2 Agent API.
 
+## Quick start
+
+Join your Harklight account in the iPhone app first. In **Devices**, create an invitation and
+choose **Copy full link**. On the computer that runs Claude Code or Codex:
+
+```sh
+brew install clickety-clacks/tap/harklight-agent
+harklight-agent setup 'harklight://join#…'
+```
+
+In **Devices**, choose **Review exact request**, match the displayed code and enter
+`app:agent/` in **Sender IDs** before approving. This prefix lets the tools on this
+computer share the enrollment. Answer the test question on your phone to finish.
+
+If you interrupt the approval wait, run `harklight-agent setup` to resume with the same code.
+Once connected, the same command shows the Server, account, device and sender grants and
+refreshes the installed skill. Setup also accepts an invitation file and an optional
+`--label "Name in Devices"`. If you approved without granting any sender IDs, remove that
+device in **Devices**, create a fresh invitation and run setup again.
+
+## Claude Code
+
+Setup installs the Harklight skill at `~/.claude/skills/harklight/SKILL.md` when
+`~/.claude` exists. In Claude Code, ask “Ask me through Harklight whether to proceed, then
+wait for my answer.” The default sender ID for Claude Code is `app:agent/claude-code`.
+
+### Optional waiting notices
+
+To have Claude Code send a Seen-only notice when you appear to be away, add this
+[Notification hook](https://code.claude.com/docs/en/hooks#notification) to
+`~/.claude/settings.json`. If you already have hooks, add the entry to your existing
+`Notification` array. The hook also fires when Claude Code has already asked a Harklight
+question and is idle waiting for your answer. Remove the entry to turn off notices.
+
+```json
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "idle_prompt|permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "harklight-agent send --sender-id app:agent/claude-code --type fyi --title 'Claude Code is waiting' >/dev/null",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## Codex
+
+Setup installs the Harklight skill at `~/.agents/skills/harklight/SKILL.md` when
+`~/.codex` or the directory in `CODEX_HOME` exists. In Codex, ask “Ask me through
+Harklight whether to proceed, then wait for my answer.” The default sender ID for Codex is
+`app:agent/codex`. Codex has no matching event for the waiting-notice recipe.
+
 ## Install
 
 Install with Homebrew on macOS or Linux:
@@ -26,8 +86,16 @@ cargo test --locked
 
 ## Enrollment
 
-Provide the identity directory, the public Server CA file and the Server
-addresses from your operator. Keep the private certificate key in the
+To start enrollment with an invitation file without running the setup checks, use
+`harklight-agent enroll start --invitation PATH`, then `harklight-agent enroll status`.
+The file may contain the invitation JSON or the full `harklight://join#…` link.
+
+For manual enrollment, provide the public Server CA file and the Server addresses from
+your operator. Use `--identity-dir` or `HARKLIGHT_IDENTITY_DIR` to select an identity
+directory. The default is `~/Library/Application Support/Harklight/Agent/identity` on
+macOS and `$XDG_DATA_HOME/harklight-agent/identity` on Linux (with
+`~/.local/share/harklight-agent/identity` as the fallback). The flag takes precedence
+over the environment variable. Keep the private certificate key in the
 identity directory. Enrollment and the mutually authenticated device API
 usually use different ports.
 

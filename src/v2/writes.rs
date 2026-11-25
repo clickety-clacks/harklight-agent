@@ -451,6 +451,36 @@ pub(super) fn deliver(
     client: &AgentClient,
     journal: &mut JournalStore,
     lock: &OperationLock,
+    operation: OperationRecord,
+) -> Result<Value, WriteFailure> {
+    let sender = operation
+        .prepared_send
+        .as_ref()
+        .and_then(|send| send.request["sender"].as_str())
+        .map(str::to_owned);
+    deliver_operation(client, journal, lock, operation).map_err(|mut error| {
+        if let Some(sender) = sender
+            && error
+                .output
+                .as_ref()
+                .is_some_and(|output| output["error"] == "forbidden")
+        {
+            let grants = match client.sender_grants() {
+                Ok(grants) if grants.is_empty() => "(none)".into(),
+                Ok(grants) => grants.join(", "),
+                Err(_) => "(unavailable from the Server)".into(),
+            };
+            error.detail =
+                format!("Sender ID {sender:?} was refused. Granted sender IDs: {grants}");
+        }
+        error
+    })
+}
+
+fn deliver_operation(
+    client: &AgentClient,
+    journal: &mut JournalStore,
+    lock: &OperationLock,
     mut operation: OperationRecord,
 ) -> Result<Value, WriteFailure> {
     let key = operation.op_id;
