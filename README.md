@@ -77,14 +77,15 @@ that already reached the Server can still have taken effect.
   retained sent messages with the existing response shape.
 - `search [--session UUID] [--sender NAME] [--message-id ID] [--state STATE]
   [--page TOKEN]` lists retained messages across the account, newest first.
-  Repeat the filters with the returned `next_page` token.
+  Repeat the filters with the returned `next_page` token. Servers that lack
+  account search support refuse with `unsupported` (exit 5).
 - `message-get --item-id ID` reads a message and its file references. Add
   `--revision N` for a historical revision. `--message-id ID` resolves a
   unique ID across the account. The existing `--sender-id NAME --message-id
   ID` selector still supports qualified legacy IDs.
 - `message-entries --item-id ID` or `--message-id ID` pages through entries.
   Both reads prefer the existing sent-message view. If the Server answers
-  `not_found` for that view, the CLI tries the account view and marks the
+  `not_found` or `forbidden` for that view, the CLI tries the account view and marks the
   response with `"view":"account"`. The account message uses the person's
   `item` shape, with no origin-only session, legacy ID alias, raw answer
   or advisories. Account entries omit the sender's delivery and file-use

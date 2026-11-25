@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{AgentClient, V2Error};
+use super::{AgentClient, V2Error, header};
+use reqwest::header::ACCEPT;
 
 impl AgentClient {
     pub fn account_search(
@@ -25,7 +26,21 @@ impl AgentClient {
         .into_iter()
         .filter_map(|(key, value)| value.map(|value| (key, value)))
         .collect();
-        let (response, request_id) = self.read_correlated(&["search"], &query)?;
+        let mut url = self.url(&["search"])?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&query);
+        }
+        let response = self.send(self.client.get(url).header(ACCEPT, "application/json"))?;
+        let account_capable = header(&response, "harklight-account-search") == Some("1");
+        let response = match Self::checked_response(response) {
+            Ok(response) if account_capable => response,
+            Ok(_) => return Err(V2Error::AccountSearchUnsupported),
+            Err(error) if !account_capable && error.is_not_found() => {
+                return Err(V2Error::AccountSearchUnsupported);
+            }
+            Err(error) => return Err(error),
+        };
+        let (response, request_id) = Self::decode_json(response)?;
         let revision = response["rev"]
             .as_u64()
             .ok_or_else(|| invalid_response(&request_id))?;

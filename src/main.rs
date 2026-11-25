@@ -768,7 +768,7 @@ fn run_device_read(cli: &Cli) {
                     }
                 })
                 .or_else(|error| {
-                    if error.is_not_found() {
+                    if error.permits_account_fallback() {
                         let item_id = client.account_item_id(id, Some(sender))?;
                         client.account_message(&item_id, *revision)
                     } else {
@@ -817,7 +817,7 @@ fn run_device_read(cli: &Cli) {
                 client
                     .message_entries(&id, before.as_deref(), *limit)
                     .or_else(|error| {
-                        if error.is_not_found() {
+                        if error.permits_account_fallback() {
                             client.account_entries(&id, before.as_deref(), *limit)
                         } else {
                             Err(error)
@@ -840,35 +840,57 @@ fn run_device_read(cli: &Cli) {
     };
     match result {
         Ok(response) => println!("{response}"),
-        Err(error @ V2Error::Http { status, .. }) if (400..500).contains(&status) => {
-            if let V2Error::Http {
-                ref token,
-                ref field,
-                ref request_id,
-                ..
-            } = error
-            {
-                let mut output = serde_json::json!({
-                    "kind":"refused", "operation":operation, "status":status, "error":token,
-                });
-                if let Some(field) = field {
-                    output["field"] = field.as_str().into();
-                }
-                if let Some(request_id) = request_id {
-                    output["request_id"] = request_id.as_str().into();
-                }
-                println!("{output}");
+        Err(error) => fail_read(operation, error, false),
+    }
+}
+
+fn fail_read(operation: &str, error: V2Error, report_read_failure: bool) -> ! {
+    let mut output = serde_json::json!({"kind":"refused", "operation":operation});
+    let exit = match &error {
+        V2Error::Http {
+            status,
+            token,
+            field,
+            request_id,
+            ..
+        } => {
+            output["status"] = (*status).into();
+            output["error"] = serde_json::json!(token);
+            if let Some(field) = field {
+                output["field"] = field.as_str().into();
             }
-            let exit = match &error {
-                V2Error::Http {
-                    token: Some(token), ..
-                } if token == "unsupported" => 5,
-                _ => commands::EXIT_REFUSED,
-            };
-            fail(error.to_string(), exit)
+            if let Some(request_id) = request_id {
+                output["request_id"] = request_id.as_str().into();
+            }
+            match status {
+                400 if token.as_deref() == Some("unsupported") => 5,
+                400..=499 => commands::EXIT_REFUSED,
+                _ => 1,
+            }
         }
-        Err(error) if error.is_internal_error() => fail(format!("{operation}: {error}"), 1),
-        Err(error) => fail(error.to_string(), 1),
+        V2Error::AccountSearchUnsupported => {
+            output["error"] = "unsupported".into();
+            5
+        }
+        V2Error::AmbiguousMessageId => {
+            output["error"] = "ambiguous_message_id".into();
+            commands::EXIT_REFUSED
+        }
+        _ => 1,
+    };
+
+    if exit != 1 || report_read_failure {
+        if exit == 1 {
+            output["kind"] = "read_failed".into();
+            output["detail"] = error.to_string().into();
+        }
+        println!("{output}");
+    }
+
+    if error.is_internal_error() {
+        fail(format!("{operation}: {error}"), exit)
+    } else {
+        fail(error.to_string(), exit)
     }
 }
 
@@ -883,7 +905,7 @@ fn read_message_revision(
             |rev| client.message_revision(item_id, rev),
         )
         .or_else(|error| {
-            if error.is_not_found() {
+            if error.permits_account_fallback() {
                 client.account_message(item_id, revision)
             } else {
                 Err(error)
@@ -1146,7 +1168,7 @@ fn run_device_write(cli: &Cli) {
             op_id,
         } => {
             let item_id = resolve_item(&client, item_id, message_id)
-                .unwrap_or_else(|error| fail(error.to_string(), commands::EXIT_REFUSED));
+                .unwrap_or_else(|error| fail_read("retract", error, true));
             writes::control(
                 &client,
                 &mut journal,
