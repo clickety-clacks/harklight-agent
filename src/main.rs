@@ -75,7 +75,7 @@ enum Command {
         message_kind: Option<String>,
         #[arg(
             long,
-            help = "Your importance estimate; Harklight decides the priority the recipient sees"
+            help = "Your importance estimate; Harklight decides the priority the recipient sees. On Servers with quiet-by-default alerts, requests and high/now messages alert the phone. Other messages arrive quietly unless the recipient wants all alerts."
         )]
         importance: Option<String>,
         #[arg(long, help = "Add a free-text Reply action to a request")]

@@ -1,5 +1,10 @@
 # Release notes
 
+## Unreleased
+
+- Explain in the README and `send --help` when a message alerts the phone on
+  a Server with quiet-by-default alerts.
+
 ## 0.2.5
 
 - Add account-wide `search` and senderless message-ID lookup. `messages`
