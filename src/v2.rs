@@ -198,10 +198,34 @@ impl AgentClient {
     }
 
     fn transport_error(&self, source: reqwest::Error) -> V2Error {
+        if !source.is_connect() && received_handshake_failure(&source) {
+            return V2Error::IdentityNotAccepted { source };
+        }
         V2Error::Transport {
             address: self.address.clone(),
             source,
         }
+    }
+}
+
+// The device client requires TLS 1.3. Published Server sends HandshakeFailure
+// for an unrecognized client key, after rustls has authenticated the Server
+// and returned the connection to HTTP. The same alert during connect is
+// ambiguous, so callers must exclude connector errors.
+fn received_handshake_failure(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if let Some(tls) = error.downcast_ref::<rustls::Error>() {
+            return matches!(
+                tls,
+                rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure)
+            );
+        }
+        let next = match error.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|cause| cause as &dyn std::error::Error),
+            None => error.source(),
+        };
+        let Some(next) = next else { return false };
+        error = next;
     }
 }
 
@@ -249,6 +273,11 @@ pub enum V2Error {
     #[error("server request via configured address {address} failed: {source}")]
     Transport {
         address: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("this identity is not accepted (revoked or never enrolled)")]
+    IdentityNotAccepted {
         #[source]
         source: reqwest::Error,
     },
@@ -303,6 +332,7 @@ impl V2Error {
     pub fn outcome_unknown(&self) -> bool {
         match self {
             Self::Transport { .. }
+            | Self::IdentityNotAccepted { .. }
             | Self::InvalidResponse { .. }
             | Self::UnexpectedClientError { .. }
             | Self::ResponseRead { .. } => true,
@@ -323,6 +353,25 @@ mod tests {
 
     use super::*;
     use crate::test_tls::{SlowServer, TLS_NAME};
+
+    #[test]
+    fn detects_only_the_typed_peer_handshake_failure() {
+        use rustls::{AlertDescription, CertificateError, Error};
+
+        assert!(received_handshake_failure(&std::io::Error::other(
+            Error::AlertReceived(AlertDescription::HandshakeFailure)
+        )));
+        for error in [
+            Error::InvalidCertificate(CertificateError::UnknownIssuer),
+            Error::InvalidCertificate(CertificateError::NotValidForName),
+            Error::AlertReceived(AlertDescription::DecodeError),
+        ] {
+            assert!(!received_handshake_failure(&std::io::Error::other(error)));
+        }
+        assert!(!received_handshake_failure(&std::io::Error::other(
+            "received fatal alert: HandshakeFailure"
+        )));
+    }
 
     #[test]
     fn reads_on_the_enrolled_device_port_with_encoded_ids_and_queries() {
