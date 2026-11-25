@@ -289,6 +289,8 @@ pub struct OperationRecord {
     pub prepared_send: Option<PreparedSend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_request: Option<PreparedRequest>,
+    // Earlier records can remain in an Agent 0.2 journal. The missing marker
+    // defaults to false so they cannot be retried against the current API.
     #[serde(default)]
     pub protocol_v2: bool,
 }
@@ -1109,27 +1111,6 @@ impl JournalStore {
         })
     }
 
-    pub fn prepare_operation(
-        &mut self,
-        op_id: Uuid,
-        session_handle: Uuid,
-        kind: String,
-        request: Value,
-    ) -> Result<OperationRecord, JournalError> {
-        self.prepare_operation_with_uploads(op_id, session_handle, kind, request, Vec::new())
-    }
-
-    pub fn prepare_operation_with_uploads(
-        &mut self,
-        op_id: Uuid,
-        session_handle: Uuid,
-        kind: String,
-        request: Value,
-        uploads: Vec<UploadSource>,
-    ) -> Result<OperationRecord, JournalError> {
-        self.prepare_operation_inner(op_id, session_handle, kind, request, uploads, false)
-    }
-
     pub fn prepare_v2_operation(
         &mut self,
         op_id: Uuid,
@@ -1138,30 +1119,18 @@ impl JournalStore {
         request: Value,
         uploads: Vec<UploadSource>,
     ) -> Result<OperationRecord, JournalError> {
-        self.prepare_operation_inner(op_id, session_handle, kind, request, uploads, true)
-    }
-
-    fn prepare_operation_inner(
-        &self,
-        op_id: Uuid,
-        session_handle: Uuid,
-        kind: String,
-        request: Value,
-        uploads: Vec<UploadSource>,
-        protocol_v2: bool,
-    ) -> Result<OperationRecord, JournalError> {
         self.with_transaction(|tx| {
             if let Some(existing) = read_operation(tx, op_id)? {
                 if existing.session_handle != session_handle
                     || existing.kind != kind
-                    || existing.protocol_v2 != protocol_v2
+                    || !existing.protocol_v2
                     || !operation_requests_equivalent(&existing.request, &request)
                 {
                     return Err(JournalError::OperationConflict(op_id));
                 }
                 return Ok(existing);
             }
-            if protocol_v2 && let Some(item_id) = request["revision_intent"].as_str() {
+            if let Some(item_id) = request["revision_intent"].as_str() {
                 let pending: Option<String> = tx
                     .query_row(
                         "SELECT op_id FROM operations
@@ -1191,7 +1160,7 @@ impl JournalStore {
                 uploads,
                 prepared_send: None,
                 prepared_request: None,
-                protocol_v2,
+                protocol_v2: true,
             };
             write_operation(tx, &operation)?;
             Ok(operation)
@@ -1243,57 +1212,6 @@ impl JournalStore {
 
     pub fn v2_item_id(&self, sender: &str, local_id: &str) -> Result<Option<String>, JournalError> {
         self.with_read(|connection| read_v2_item_id(connection, sender, local_id))
-    }
-
-    pub fn prepare_send_operation(
-        &mut self,
-        op_id: Uuid,
-        session_handle: Uuid,
-        request: Value,
-        uploads: Vec<UploadSource>,
-        prepared_send: PreparedSend,
-    ) -> Result<OperationRecord, JournalError> {
-        self.with_transaction(|tx| {
-            if let Some(existing) = read_operation(tx, op_id)? {
-                let conflicts = existing.kind != "send"
-                    || existing.prepared_send.as_ref().is_none_or(|saved| {
-                        let same_inputs = saved.inputs == prepared_send.inputs
-                            && saved.files == prepared_send.files;
-                        let same_session = saved.inputs["session"] == "new"
-                            || existing.session_handle == session_handle;
-                        !same_inputs || !same_session
-                    });
-                if conflicts {
-                    return Err(JournalError::OperationConflict(op_id));
-                }
-                return Ok(existing);
-            }
-
-            if prepared_send.request != request
-                || request["op_id"].as_str() != Some(op_id.to_string().as_str())
-                || request["session_handle"].as_str() != Some(session_handle.to_string().as_str())
-            {
-                return Err(JournalError::OperationConflict(op_id));
-            }
-
-            let now = now_ms();
-            let operation = OperationRecord {
-                op_id,
-                session_handle,
-                kind: "send".into(),
-                request,
-                state: OperationState::Prepared,
-                created_at_ms: now,
-                updated_at_ms: now,
-                response: None,
-                uploads,
-                prepared_send: Some(prepared_send),
-                prepared_request: None,
-                protocol_v2: false,
-            };
-            write_operation(tx, &operation)?;
-            Ok(operation)
-        })
     }
 
     pub(crate) fn record_v2_supersedes(
@@ -2533,39 +2451,38 @@ mod tests {
 
         let send_id = Uuid::new_v4();
         store
-            .prepare_operation(
+            .prepare_v2_operation(
                 send_id,
                 session,
                 "send".into(),
                 json!({
-                    "v":1,
-                    "type":"send",
-                    "op_id":send_id.to_string(),
-                    "session_handle":session.to_string(),
-                    "message":{"sender_id":"app:test","message_id":"request-1","title":"initial"}
+                    "sender":"app:test","session":session,
+                    "message":{"message_id":"request-1","title":"initial"}
                 }),
+                Vec::new(),
             )
             .unwrap();
         store
-            .settle_operation(send_id, json!({"type":"ok","revision":1}), None)
+            .settle_operation(
+                send_id,
+                json!({"message":{"item_id":"request-1","sender":"app:test","session":session,"revision":1}}),
+                None,
+            )
             .unwrap();
 
         for sequence in 0..128 {
             let op_id = Uuid::new_v4();
             store
-                .prepare_operation(
+                .prepare_v2_operation(
                     op_id,
                     session,
                     "reply".into(),
                     json!({
-                        "v":1,
-                        "type":"reply",
-                        "op_id":op_id.to_string(),
-                        "sender_id":"app:test",
                         "message_id":"request-1",
                         "in_reply_to":sequence.to_string(),
-                        "text":format!("committed action {sequence}")
+                        "body":format!("committed action {sequence}")
                     }),
+                    Vec::new(),
                 )
                 .unwrap();
             store
@@ -2575,19 +2492,16 @@ mod tests {
 
         let unresolved_id = Uuid::new_v4();
         store
-            .prepare_operation(
+            .prepare_v2_operation(
                 unresolved_id,
                 session,
                 "result".into(),
                 json!({
-                    "v":1,
-                    "type":"result",
-                    "op_id":unresolved_id.to_string(),
-                    "sender_id":"app:test",
                     "message_id":"request-1",
                     "in_reply_to":"201",
                     "status":"received"
                 }),
+                Vec::new(),
             )
             .unwrap();
         store.mark_operation_unknown(unresolved_id).unwrap();
@@ -2895,8 +2809,14 @@ mod tests {
         let session = Uuid::new_v4();
         let key = Uuid::new_v4();
         let mut store = open(&root, session);
+        // Restore a persisted operation as it was written before the v2 marker.
+        let operation: OperationRecord = serde_json::from_value(json!({
+            "op_id":key,"session_handle":session,"kind":"send","request":{"v":1},
+            "state":"prepared","created_at_ms":0,"updated_at_ms":0
+        }))
+        .unwrap();
         store
-            .prepare_operation(key, session, "send".into(), json!({"v":1}))
+            .with_transaction(|tx| write_operation(tx, &operation))
             .unwrap();
 
         let lock = store.lock_operation(key).unwrap();
@@ -2988,7 +2908,13 @@ mod tests {
         {
             let mut store = open(&root, session);
             store
-                .prepare_operation(op_id, session, "reply".into(), json!({"body": "one"}))
+                .prepare_v2_operation(
+                    op_id,
+                    session,
+                    "reply".into(),
+                    json!({"body": "one"}),
+                    Vec::new(),
+                )
                 .unwrap();
             store.mark_operation_unknown(op_id).unwrap();
         }
@@ -2998,80 +2924,21 @@ mod tests {
         assert_eq!(snapshot.unknown_operations_for(session).count(), 1);
         assert_eq!(
             reopened
-                .prepare_operation(op_id, session, "reply".into(), json!({"body": "one"}))
+                .prepare_v2_operation(
+                    op_id,
+                    session,
+                    "reply".into(),
+                    json!({"body": "one"}),
+                    Vec::new()
+                )
                 .unwrap()
                 .state,
             OperationState::Unknown
         );
         assert!(matches!(
-            reopened.prepare_operation(op_id, session, "reply".into(), json!({"body": "two"})),
+            reopened.prepare_v2_operation(op_id, session, "reply".into(), json!({"body": "two"}), Vec::new()),
             Err(JournalError::OperationConflict(id)) if id == op_id
         ));
-    }
-
-    #[test]
-    fn own_reply_replay_marks_source_acted_and_settles_one_unknown_operation() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let op_id = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store
-            .record_entry(entry(session, 1, "please check"))
-            .unwrap();
-        store.mark_delivered("1").unwrap();
-        store
-            .prepare_operation(
-                op_id,
-                session,
-                "reply".into(),
-                json!({
-                    "v":1,
-                    "type":"reply",
-                    "op_id":op_id,
-                    "sender_id":"app:test",
-                    "message_id":"request-1",
-                    "request_revision":1,
-                    "in_reply_to":"1",
-                    "text":"done"
-                }),
-            )
-            .unwrap();
-        store.mark_operation_unknown(op_id).unwrap();
-
-        store
-            .record_entry(JournalEntry::fetched(
-                2,
-                "2".into(),
-                session,
-                "reply".into(),
-                "origin".into(),
-                false,
-                Some("app:test".into()),
-                Some("request-1".into()),
-                Some(1),
-                json!({
-                    "event_id":"2",
-                    "session_handle":session.to_string(),
-                    "kind":"reply",
-                    "author":"origin",
-                    "sender_id":"app:test",
-                    "message_id":"request-1",
-                    "request_revision":1,
-                    "in_reply_to":"1",
-                    "text":"done"
-                }),
-            ))
-            .unwrap();
-
-        let snapshot = store.snapshot().unwrap();
-        assert!(snapshot.entry_by_event("1").unwrap().acted_at_ms.is_some());
-        let operation = snapshot.operations.get(&op_id).unwrap();
-        assert_eq!(operation.state, OperationState::Committed);
-        assert_eq!(
-            operation.response.as_ref().unwrap()["recovered_from_feed"],
-            true
-        );
-        assert!(snapshot.pending_for(session).is_empty());
     }
 
     #[test]
@@ -3170,24 +3037,31 @@ mod tests {
         let root = Scratch::new();
         let session = Uuid::new_v4();
         let op_id = Uuid::new_v4();
-        let request = json!({"v":1,"type":"ack","event_id":"1"});
+        let request = json!({"entry_id":"1"});
         let mut first = open(&root, session);
         let mut second = open(&root, session);
         let recorded = first
-            .prepare_operation(op_id, session, "ack".into(), request.clone())
+            .prepare_v2_operation(
+                op_id,
+                session,
+                "receipt".into(),
+                request.clone(),
+                Vec::new(),
+            )
             .unwrap();
         let again = second
-            .prepare_operation(op_id, session, "ack".into(), request)
+            .prepare_v2_operation(op_id, session, "receipt".into(), request, Vec::new())
             .unwrap();
         assert_eq!(recorded.created_at_ms, again.created_at_ms);
         assert_eq!(first.operations_for_session(session).unwrap().len(), 1);
         assert!(
             second
-                .prepare_operation(
+                .prepare_v2_operation(
                     op_id,
                     session,
-                    "ack".into(),
-                    json!({"v":1,"type":"ack","event_id":"2"})
+                    "receipt".into(),
+                    json!({"entry_id":"2"}),
+                    Vec::new(),
                 )
                 .is_err()
         );
@@ -3201,7 +3075,13 @@ mod tests {
         let mut store = open(&root, session);
         store.record_entry(entry(session, 1, "hello")).unwrap();
         store
-            .prepare_operation(op_id, session, "reply".into(), json!({"body": "done"}))
+            .prepare_v2_operation(
+                op_id,
+                session,
+                "reply".into(),
+                json!({"body": "done"}),
+                Vec::new(),
+            )
             .unwrap();
         store
             .settle_operation(op_id, json!({"event_id": "2"}), Some("1"))
@@ -3389,94 +3269,6 @@ mod tests {
         assert!(!retraction.actionable);
         assert!(retraction.emitted_at_ms.is_none());
         assert!(snapshot.pending_for(session).is_empty());
-    }
-
-    #[test]
-    fn withdrawal_recovery_matches_retracted_but_not_ordinary_cleared_terminal() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let op_id = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store
-            .prepare_operation(
-                op_id,
-                session,
-                "withdraw".into(),
-                json!({
-                    "v":1,
-                    "type":"withdraw",
-                    "op_id":op_id,
-                    "sender_id":"app:test",
-                    "message_id":"request-1"
-                }),
-            )
-            .unwrap();
-        let snapshot = store.snapshot().unwrap();
-        let operation = snapshot.operations.get(&op_id).unwrap();
-
-        assert!(operation_matches_entry(
-            operation,
-            &origin_terminal(session, 1, "retracted", Some(op_id))
-        ));
-        assert!(operation_matches_entry(
-            operation,
-            &origin_terminal(session, 1, "retracted", None)
-        ));
-        assert!(!operation_matches_entry(
-            operation,
-            &origin_terminal(session, 1, "cleared", Some(op_id))
-        ));
-    }
-
-    #[test]
-    fn committed_file_operation_keeps_fingerprint_but_drops_inline_bytes() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let op_id = Uuid::new_v4();
-        let data = STANDARD.encode([1, 2, 3, 4]);
-        let request = serde_json::json!({
-            "v":1,
-            "type":"send",
-            "op_id":op_id,
-            "session_handle":session,
-            "message":{"sender_id":"app:test","message_id":"request-1","title":"file"},
-            "files":[{"name":"input.bin","data_base64":data}]
-        });
-        let mut store = open(&root, session);
-        store
-            .prepare_operation(op_id, session, "send".into(), request.clone())
-            .unwrap();
-        store.mark_operation_unknown(op_id).unwrap();
-        store
-            .settle_operation(op_id, serde_json::json!({"type":"ok"}), None)
-            .unwrap();
-
-        let saved = store.snapshot().unwrap();
-        let saved_request = &saved.operations.get(&op_id).unwrap().request;
-        assert!(saved_request["files"][0].get("data_base64").is_none());
-        assert_eq!(saved_request["files"][0]["size"], 4);
-        assert_eq!(
-            saved_request["files"][0]["sha256"],
-            hex::encode(Sha256::digest([1, 2, 3, 4]))
-        );
-        assert!(
-            store
-                .prepare_operation(op_id, session, "send".into(), request.clone())
-                .is_ok()
-        );
-
-        let changed = serde_json::json!({
-            "v":1,
-            "type":"send",
-            "op_id":op_id,
-            "session_handle":session,
-            "message":{"sender_id":"app:test","message_id":"request-1","title":"file"},
-            "files":[{"name":"input.bin","data_base64":STANDARD.encode([9, 8, 7, 6])}]
-        });
-        assert!(matches!(
-            store.prepare_operation(op_id, session, "send".into(), changed),
-            Err(JournalError::OperationConflict(_))
-        ));
     }
 
     #[test]

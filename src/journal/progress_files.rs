@@ -239,11 +239,11 @@ mod tests {
             upload_id: Some(Uuid::new_v4().to_string()),
             upload_key: None,
         };
-        let original = json!({"type":"send","session_handle":session,"op_id":first,
+        let original = json!({"sender":"app:test","session":session,
             "message":{"sender_id":"app:test","message_id":"progress","message_type":"fyi","progress":{}},
             "files":[{"name":"input.bin","upload_id":source.upload_id,"size":4,"sha256":hash}]});
         store
-            .prepare_operation_with_uploads(
+            .prepare_v2_operation(
                 first,
                 session,
                 "send".into(),
@@ -251,26 +251,38 @@ mod tests {
                 vec![source.clone()],
             )
             .unwrap();
-        store
-            .settle_operation(first, json!({"type":"ok","revision":1}), None)
-            .unwrap();
+        let sent = json!({"message":{"item_id":"progress","sender":"app:test","session":session,"revision":1}});
+        store.settle_operation(first, sent.clone(), None).unwrap();
         assert!(path.exists());
         let pending = Uuid::new_v4();
         store
-            .prepare_operation_with_uploads(
+            .prepare_v2_operation(
                 pending,
                 session,
                 "reply".into(),
-                json!({"type":"reply","op_id":pending,
-            "sender_id":"app:other","message_id":"different","request_revision":1}),
+                json!({"message_id":"different"}),
                 vec![source],
             )
             .unwrap();
         store.mark_operation_unknown(pending).unwrap();
         let next = Uuid::new_v4();
-        store.prepare_operation(next,session,"revise".into(),json!({"type":"revise","op_id":next,"base_revision":1,
-            "sender_id":"app:test","message_id":"progress","message":{"sender_id":"app:test","message_id":"progress",
-                "message_type":"fyi","progress":{}},"files":[]})).unwrap();
+        store
+            .prepare_v2_operation(
+                next,
+                session,
+                "revise".into(),
+                json!({
+                    "base_revision":1,
+                    "sender_id":"app:test",
+                    "message_id":"progress",
+                    "message":{
+                        "sender_id":"app:test","message_id":"progress","message_type":"fyi","progress":{}
+                    },
+                    "files":[]
+                }),
+                Vec::new(),
+            )
+            .unwrap();
         store
             .settle_operation(next, json!({"type":"ok","revision":2}), None)
             .unwrap();
@@ -299,11 +311,11 @@ mod tests {
         assert!(!path.exists());
         let old = store.operation(first).unwrap().unwrap();
         assert!(old.uploads[0].staged_path.is_none());
-        assert_eq!(old.response, Some(json!({"type":"ok","revision":1})));
+        assert_eq!(old.response, Some(sent));
         // Releasing local source bytes does not change committed replay identity.
         assert!(
             store
-                .prepare_operation(first, session, "send".into(), original)
+                .prepare_v2_operation(first, session, "send".into(), original, Vec::new())
                 .is_ok()
         );
         drop(store);
