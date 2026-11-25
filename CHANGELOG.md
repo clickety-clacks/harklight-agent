@@ -1,6 +1,6 @@
 # Release notes
 
-## Unreleased
+## 0.2.5
 
 - Add account-wide `search` and senderless message-ID lookup. `messages`
   keeps the own-sent list and adds optional retraction attribution when the
