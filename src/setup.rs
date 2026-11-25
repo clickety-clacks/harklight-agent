@@ -1,7 +1,9 @@
 use std::{
+    env,
     ffi::OsStr,
     fs,
     io::{self, Write},
+    path::PathBuf,
     process::Command,
     thread,
     time::Duration,
@@ -161,7 +163,53 @@ fn setup_sender(grants: &[String]) -> Option<String> {
 }
 
 fn install_skill() {
-    println!("The Harklight skill is pending its Server release.");
+    const SKILL: &str = include_str!("../vendor/harklight/SKILL.md");
+
+    let home = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            fail(
+                "HOME is not set. Set it and run setup again to install the skill.".into(),
+                1,
+            )
+        });
+    let claude_home = home.join(".claude");
+    let has_codex = home.join(".codex").is_dir()
+        || env::var_os("CODEX_HOME").is_some_and(|path| PathBuf::from(path).is_dir());
+    let destinations = [
+        (claude_home.is_dir(), claude_home.join("skills/harklight")),
+        (has_codex, home.join(".agents/skills/harklight")),
+    ];
+    if !destinations.iter().any(|(present, _)| *present) {
+        println!(
+            "Claude Code and Codex directories were not found. Run setup again after installing either tool. Skill paths:"
+        );
+        for (_, directory) in destinations {
+            println!("  {}", directory.join("SKILL.md").display());
+        }
+        return;
+    }
+    for (present, directory) in destinations {
+        if present {
+            let path = directory.join("SKILL.md");
+            let temporary = directory.join(format!(".SKILL-{}.tmp", Uuid::new_v4()));
+            if let Err(error) = fs::create_dir_all(&directory)
+                .and_then(|()| fs::write(&temporary, SKILL))
+                .and_then(|()| fs::rename(&temporary, &path))
+            {
+                let _ = fs::remove_file(&temporary);
+                fail(
+                    format!(
+                        "Could not install Harklight skill at {}: {error}",
+                        path.display()
+                    ),
+                    1,
+                );
+            }
+            println!("Installed Harklight skill at {}", path.display());
+        }
+    }
 }
 
 fn test_connection(client: &AgentClient, journal: &mut JournalStore, sender: &str) {

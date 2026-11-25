@@ -46,17 +46,22 @@ impl CliFixture {
         Self(root)
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_harklight-agent"))
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harklight-agent"));
+        command
+            .env("HOME", &self.0)
+            .env_remove("CODEX_HOME")
             .arg("--identity-dir")
             .arg(self.0.join("identity"))
             .arg("--ca-file")
             .arg(self.0.join("ca.pem"))
             .arg("--state-dir")
-            .arg(self.0.join("state"))
-            .args(args)
-            .output()
-            .unwrap()
+            .arg(self.0.join("state"));
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
     }
 }
 
@@ -1324,6 +1329,8 @@ fn invitation_ca_der(pem: &str) -> Vec<u8> {
 
 fn enroll_invitation_cli(identity: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_harklight-agent"))
+        .env("HOME", identity.parent().unwrap())
+        .env_remove("CODEX_HOME")
         .env_remove("HARKLIGHT_CA_FILE")
         .env_remove("HARKLIGHT_DEVICE_PORT")
         .arg("--identity-dir")
@@ -1655,6 +1662,12 @@ fn setup_resumes_approval_and_records_the_test_answer() {
         Some(FixtureResponse::json(response))
     });
     let (fixture, link) = setup_fixture(&server);
+    let claude_home = fixture.0.join(".claude");
+    let codex_home = fixture.0.join("custom-codex-home");
+    fs::create_dir(&claude_home).unwrap();
+    fs::create_dir(&codex_home).unwrap();
+    let claude_skill = claude_home.join("skills/harklight/SKILL.md");
+    let codex_skill = fixture.0.join(".agents/skills/harklight/SKILL.md");
     let identity = fixture.0.join("identity");
     let invitation = fixture.0.join("invitation");
     fs::write(&invitation, link).unwrap();
@@ -1663,15 +1676,31 @@ fn setup_resumes_approval_and_records_the_test_answer() {
         &["start", "--invitation", invitation.to_str().unwrap()],
     );
     assert!(start.status.success(), "{start:?}");
-    let output = setup_cli(&fixture).output().unwrap();
+    assert!(!claude_skill.exists());
+    assert!(!codex_skill.exists());
+    let setup = || {
+        let mut command = setup_cli(&fixture);
+        command.env("CODEX_HOME", &codex_home);
+        command
+    };
+    let output = setup().output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("ABCDEFG234"), "{stdout}");
     assert!(stdout.contains("Sender IDs:      app:agent/"), "{stdout}");
     assert!(stdout.contains("Answer: Ready\nConnected."), "{stdout}");
 
-    let refresh = setup_cli(&fixture).output().unwrap();
+    let vendored = include_str!("../vendor/harklight/SKILL.md");
+    for skill in [&claude_skill, &codex_skill] {
+        assert!(stdout.contains(skill.to_str().unwrap()), "{stdout}");
+        assert_eq!(fs::read_to_string(skill).unwrap(), vendored);
+        fs::write(skill, "earlier skill version").unwrap();
+    }
+    let refresh = setup().output().unwrap();
     assert!(refresh.status.success(), "{refresh:?}");
+    for skill in [&claude_skill, &codex_skill] {
+        assert_eq!(fs::read_to_string(skill).unwrap(), vendored);
+    }
     let stdout = String::from_utf8(refresh.stdout).unwrap();
     assert!(stdout.contains("Account: person"), "{stdout}");
     assert!(!stdout.contains("Sent a test question"), "{stdout}");
@@ -1819,7 +1848,48 @@ fn identity_defaults_yield_to_the_existing_environment_and_flag() {
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("Device: {device}")));
     }
+    assert!(!fixture.0.join(".claude").exists());
+    assert!(!fixture.0.join(".agents").exists());
     assert_eq!(server.requests().len(), 3);
+}
+
+#[test]
+fn commands_other_than_setup_leave_skill_directories_untouched() {
+    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":1,"messages":[]}"#);
+    let fixture = CliFixture::new(&server, identity);
+    fs::create_dir(fixture.0.join(".codex")).unwrap();
+    let existing = fixture.0.join(".claude/skills/harklight/SKILL.md");
+    fs::create_dir_all(existing.parent().unwrap()).unwrap();
+    fs::write(&existing, "existing user skill").unwrap();
+
+    let op_id = Uuid::new_v4().to_string();
+    let prepare = [
+        "send",
+        "--prepare",
+        "--op-id",
+        &op_id,
+        "--sender-id",
+        "app:agent/test",
+        "--type",
+        "fyi",
+        "--title",
+        "Test",
+    ];
+    for args in [
+        &["journal-id"][..],
+        &["messages"][..],
+        &["--version"][..],
+        &prepare,
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert_eq!(
+            fs::read_to_string(&existing).unwrap(),
+            "existing user skill"
+        );
+        assert!(!fixture.0.join(".agents").exists());
+    }
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[test]

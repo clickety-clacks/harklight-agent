@@ -20,7 +20,8 @@ computer share the enrollment. Answer the test question on your phone to finish.
 
 If you interrupt the approval wait, run `harklight-agent setup` to resume with the same code.
 Once connected, the same command shows the Server, account, device and sender grants and
-refreshes the installed skill. Setup also accepts an invitation file and an optional
+refreshes the installed skill. Run setup yourself when you want to install or refresh the
+skill. Setup also accepts an invitation file and an optional
 `--label "Name in Devices"`. If you approved without granting any sender IDs, remove that
 device in **Devices**, create a fresh invitation and run setup again.
 
