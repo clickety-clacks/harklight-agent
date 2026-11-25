@@ -3,7 +3,6 @@
 ## Unreleased
 
 - This release speaks only the Harklight 0.2 protocol.
-
 - Resolve sender-qualified message IDs through account search. For Progress on
   an earlier message, pass its Server item ID to `--request`. Local supersession
   resolves recorded send operation IDs from the same journal.

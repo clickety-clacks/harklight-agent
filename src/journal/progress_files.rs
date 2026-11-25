@@ -33,7 +33,7 @@ impl JournalStore {
         let guard = open_lock_file(&self.journal_lock_path)?;
         guard.lock_exclusive()?;
         let mut db = self.open_connection()?;
-        let mut operations: Vec<OperationRecord> = {
+        let operations: Vec<OperationRecord> = {
             let mut q = db.prepare(
                 "SELECT payload FROM operations WHERE session_handle=?1 AND message_id=?2",
             )?;
@@ -114,8 +114,7 @@ impl JournalStore {
             paths
         };
         let mut obsolete = Vec::new();
-        let tx = db.transaction()?;
-        for op in &mut operations {
+        for op in &operations {
             if !is_progress(&op.request["message"])
                 || matches!(op.state, OperationState::Prepared | OperationState::Unknown)
             {
@@ -126,19 +125,6 @@ impl JournalStore {
                     .and_then(|n| u64::try_from(n).ok())
                     .is_some_and(|n| keep_revision(operation_sender(op), n));
             if !keep {
-                let request = redact_file_payloads(&op.request);
-                let prepared = op
-                    .prepared_send
-                    .as_ref()
-                    .map(|p| redact_file_payloads(&p.request));
-                // Rewrite only rows that still hold material; released rows
-                // stay untouched so a pass costs nothing for old history.
-                let changed = request != op.request
-                    || prepared.as_ref() != op.prepared_send.as_ref().map(|p| &p.request);
-                if changed {
-                    op.request = request;
-                    redact_prepared_send(op);
-                }
                 for (index, upload) in op.uploads.iter().enumerate() {
                     if let Some(path) = &upload.staged_path {
                         if !protected.contains(path) {
@@ -146,12 +132,8 @@ impl JournalStore {
                         }
                     }
                 }
-                if changed {
-                    write_operation(&tx, op)?;
-                }
             }
         }
-        tx.commit()?;
         // Path metadata stays durable until deletion succeeds. A crash or
         // filesystem error is retried on the next ordinary journal operation.
         for (op_id, index, path) in obsolete {

@@ -8,7 +8,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -307,7 +306,7 @@ impl JournalStore {
                 if existing.session_handle != session_handle
                     || existing.kind != kind
                     || !existing.protocol_v2
-                    || !operation_requests_equivalent(&existing.request, &request)
+                    || existing.request != request
                 {
                     return Err(JournalError::OperationConflict(op_id));
                 }
@@ -529,13 +528,11 @@ impl JournalStore {
             operation.state = OperationState::Committed;
             operation.updated_at_ms = now_ms();
             if !is_progress(&operation.request["message"]) {
-                operation.request = redact_file_payloads(&operation.request);
-                redact_prepared_send(&mut operation);
                 for upload in &mut operation.uploads {
                     upload.staged_path = None;
                 }
             }
-            operation.response = Some(redact_file_payloads(&response));
+            operation.response = Some(response);
             write_operation(tx, &operation)?;
             Ok(())
         });
@@ -547,7 +544,7 @@ impl JournalStore {
 
     pub fn reject_operation(&mut self, op_id: Uuid, response: Value) -> Result<(), JournalError> {
         let result = self.update_operation(op_id, |operation| {
-            mark_rejected(operation, &response, false);
+            mark_rejected(operation, response, false);
             Ok(true)
         });
         if result.is_ok() {
@@ -577,7 +574,7 @@ impl JournalStore {
             }
             mark_rejected(
                 operation,
-                &serde_json::json!({"kind":"abandoned","reason":"abandoned by explicit command"}),
+                serde_json::json!({"kind":"abandoned","reason":"abandoned by explicit command"}),
                 true,
             );
             Ok(true)
@@ -621,12 +618,10 @@ pub(crate) fn operation_request_revision(operation: &OperationRecord) -> Option<
     i64::try_from(revision).ok()
 }
 
-fn mark_rejected(operation: &mut OperationRecord, response: &Value, remove_staged: bool) {
+fn mark_rejected(operation: &mut OperationRecord, response: Value, remove_staged: bool) {
     operation.state = OperationState::Rejected;
     operation.updated_at_ms = now_ms();
-    operation.request = redact_file_payloads(&operation.request);
-    redact_prepared_send(operation);
-    operation.response = Some(redact_file_payloads(response));
+    operation.response = Some(response);
     if !is_progress(&operation.request["message"]) {
         for upload in &mut operation.uploads {
             if remove_staged {
@@ -733,55 +728,6 @@ fn read_operation(
     payload
         .map(|payload| serde_json::from_str(&payload).map_err(JournalError::from))
         .transpose()
-}
-
-fn strip_file_payloads(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if let Some(Value::Array(files)) = object.get_mut("files") {
-                for file in files {
-                    if let Some(file) = file.as_object_mut() {
-                        if let Some(data) = file.remove("data_base64") {
-                            if let Some(encoded) = data.as_str() {
-                                if let Ok(bytes) = STANDARD.decode(encoded) {
-                                    file.entry("size")
-                                        .or_insert(Value::from(bytes.len() as u64));
-                                    file.entry("sha256").or_insert_with(|| {
-                                        Value::String(hex::encode(Sha256::digest(bytes)))
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for child in object.values_mut() {
-                strip_file_payloads(child);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                strip_file_payloads(child);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn redact_file_payloads(value: &Value) -> Value {
-    let mut redacted = value.clone();
-    strip_file_payloads(&mut redacted);
-    redacted
-}
-
-fn redact_prepared_send(operation: &mut OperationRecord) {
-    if let Some(prepared_send) = operation.prepared_send.as_mut() {
-        prepared_send.request = redact_file_payloads(&prepared_send.request);
-    }
-}
-
-fn operation_requests_equivalent(left: &Value, right: &Value) -> bool {
-    redact_file_payloads(left) == redact_file_payloads(right)
 }
 
 // Keep waiting while another program holds the journal database.

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -235,16 +234,6 @@ pub fn inspect(paths: &[PathBuf]) -> Result<Vec<FileSelection>, String> {
         });
     }
     Ok(selections)
-}
-
-pub fn strip_file_payloads(raw: &mut Value) {
-    if let Some(files) = raw.get_mut("files").and_then(Value::as_array_mut) {
-        for file in files {
-            if let Some(object) = file.as_object_mut() {
-                object.remove("data_base64");
-            }
-        }
-    }
 }
 
 fn safe_basename(path: &Path) -> Result<String, String> {
