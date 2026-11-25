@@ -11,7 +11,8 @@
   the skill files.
 - Without `--identity-dir` or `HARKLIGHT_IDENTITY_DIR`, the Agent uses a default
   per-user identity directory. A flag or the environment variable still wins.
-- A `forbidden` refusal now lists the sender IDs this identity may use.
+- When a send is refused `forbidden`, the error now lists the sender IDs this
+  identity may use.
 - The README has a quick start and Claude Code and Codex sections, including an
   optional Claude Code notification hook.
 - Explain in the README and `send --help` when a message alerts the phone on
