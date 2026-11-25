@@ -1,6 +1,6 @@
 ---
 name: harklight
-version: "0.2.14"
+version: "0.2.16"
 description: >-
   Send the person a question, a decision with choices or a notice through
   Harklight, and read their answer, with the harklight-agent command.
