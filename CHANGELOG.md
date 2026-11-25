@@ -1,5 +1,13 @@
 # Release notes
 
+## Unreleased
+
+- Diagnose the Server's client certificate refusal. `listen --follow`
+  repeats the diagnosis while reconnecting and still stops on an explicit
+  revoked feed close. Reads and one-shot listens exit with the diagnosis.
+  A write interrupted by the late TLS alert keeps its unknown outcome and
+  saved operation key.
+
 ## 0.2.5
 
 - Add account-wide `search` and senderless message-ID lookup. `messages`

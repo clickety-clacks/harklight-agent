@@ -644,7 +644,11 @@ impl FeedRetry {
         let mut seconds = self.backoff_secs.max(retry_after);
         if self.following() {
             let (condition, detail) = retry_diagnostic(error.as_ref());
-            if self.conditions.insert(condition) {
+            let identity_refusal = matches!(
+                &error,
+                Some(FeedError::Api(V2Error::IdentityNotAccepted { .. }))
+            );
+            if self.conditions.insert(condition) || identity_refusal {
                 eprintln!("listen: {detail}; reconnecting");
             }
             seconds = seconds.min(MAX_BACKOFF_SECS);
@@ -668,6 +672,9 @@ fn retry_delay(mode: &Mode, error: &FeedError) -> Option<u64> {
         return None;
     }
     match error {
+        FeedError::Api(V2Error::IdentityNotAccepted { .. }) if matches!(mode, Mode::Follow) => {
+            Some(0)
+        }
         FeedError::Api(V2Error::Http {
             status: 503,
             retry_after,
