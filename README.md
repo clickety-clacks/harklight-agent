@@ -109,7 +109,8 @@ harklight-agent --identity-dir ./identity --ca-file ./server-ca.pem \
 Give the approval code to the operator, then use `enroll status` with the
 same connection inputs. Use `enroll retry` to recover an interrupted start
 with the same generated key. An already enrolled identity can use
-`--device-port` or `HARKLIGHT_DEVICE_PORT` to select the v2 device endpoint.
+`--device-port` or `HARKLIGHT_DEVICE_PORT` to override the saved device port.
+Set one of them if the identity has no saved device port.
 
 The CLI accepts `HARKLIGHT_IDENTITY_DIR`, `HARKLIGHT_CA_FILE` and
 `HARKLIGHT_AGENT_STATE_DIR`. Use the same state directory across invocations
@@ -129,8 +130,8 @@ alerts.
 
 Use an existing session UUID to keep the conversation, or omit the session
 for a message without a conversation. Use `--file` to attach a file.
-`--supersedes` takes a Server item ID. `--supersedes-local` resolves a local
-reference for the same sender before delivery.
+`--supersedes` takes a Server item ID. `--supersedes-local` takes a committed
+send operation ID from the same journal and sender.
 
 For two-phase delivery, add `--prepare --op-id UUID`. The CLI stages the
 files and writes the immutable intent locally. Run
@@ -155,15 +156,14 @@ that already reached the Server can still have taken effect.
   account search support refuse with `unsupported` (exit 5).
 - `message-get --item-id ID` reads a message and its file references. Add
   `--revision N` for a historical revision. `--message-id ID` resolves a
-  unique ID across the account. The existing `--sender-id NAME --message-id
-  ID` selector still supports qualified legacy IDs.
+  unique ID across the account. Add `--sender-id NAME` to restrict the lookup
+  to that sender and read the account view.
 - `message-entries --item-id ID` or `--message-id ID` pages through entries.
   Both reads prefer the existing sent-message view. If the Server answers
   `not_found` or `forbidden` for that view, the CLI tries the account view and marks the
   response with `"view":"account"`. The account message uses the person's
-  `item` shape, with no origin-only session, legacy ID alias, raw answer
-  or advisories. Account entries omit the sender's delivery and file-use
-  receipts. Use `file-get` to download a referenced attachment.
+  `item` shape and omits the sender-view session, raw answer and advisories.
+  Account entries omit the sender's delivery and file-use receipts. Use `file-get` to download a referenced attachment.
 - `reply --item-id ID --body TEXT` sends a chat turn. Add
   `--in-reply-to ENTRY` to correlate a person entry. A reply can carry files
   with no text.
@@ -236,9 +236,8 @@ revision durably before requesting any pages.
 Use `read --session S --pending --resume TOKEN` to serve that attempt.
 Output starts with `baseline` and ends with `baseline_complete`. The
 rows use the feed's `kind`, `rev` and `data` shape and include retained
-pending person Chat and answer rows, including on closed items and
-migrated 0.1-era turns. An answer is a message with an answered terminal
-state. Apply a still-unapplied row even if it carries `pending:false`.
+pending person Chat and answer rows, including on closed items.
+An answer is a message with an answered terminal state. Apply a still-unapplied row even if it carries `pending:false`.
 The marker describes a receipt, action or updated representation.
 
 After interruption, run resume again with the original token and the

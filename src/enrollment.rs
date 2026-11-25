@@ -1004,7 +1004,7 @@ mod tests {
     #[test]
     fn enrollment_request_waits_for_a_server_answer_slower_than_the_old_limits() {
         let delay = Duration::from_secs(35);
-        let server = crate::test_tls::SlowServer::answer_after(delay, r#"{"v":1}"#);
+        let server = crate::test_tls::SlowServer::answer_after(delay, r#"{"status":200}"#);
         let transport = HttpsTransport::new(
             Endpoint {
                 address: "127.0.0.1".into(),
@@ -1017,16 +1017,15 @@ mod tests {
 
         let started = std::time::Instant::now();
         let response = transport
-            .post("/enroll/v1/request", &serde_json::json!({"v":1}))
+            .post(
+                "/enroll",
+                &json!({"public_certificate":"fixture","label":"test device"}),
+            )
             .unwrap();
         assert!(started.elapsed() >= delay);
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, br#"{"v":1}"#);
-        assert!(
-            server
-                .request_line()
-                .starts_with("POST /enroll/v1/request ")
-        );
+        assert_eq!(response.body, br#"{"status":200}"#);
+        assert!(server.request_line().starts_with("POST /enroll "));
     }
 
     #[derive(Default)]

@@ -197,27 +197,10 @@ pub(super) fn freeze_send(
                 let local = local
                     .as_str()
                     .ok_or_else(|| WriteFailure::local("invalid local supersedes reference"))?;
-                if let Some(id) = journal.v2_item_id(sender, local)? {
-                    targets.push(id.into());
-                } else {
-                    let matched = match client.legacy_message(sender, local) {
-                        Ok(matched) => matched,
-                        Err(error) if error.is_internal_error() => {
-                            return Err(writes::record_failure(journal, &operation, error)?);
-                        }
-                        Err(error) => {
-                            return Err(writes::unknown(&operation, &error.to_string(), None));
-                        }
-                    };
-                    let found = matched
-                        .as_ref()
-                        .and_then(|found| found["message"]["item_id"].as_str())
-                        .ok_or_else(|| {
-                            WriteFailure::local("local supersedes reference could not be resolved")
-                        })?;
-                    journal.remember_v2_item(sender, local, found)?;
-                    targets.push(found.into());
-                }
+                let item_id = journal.v2_item_id(sender, local)?.ok_or_else(|| {
+                    WriteFailure::local("local supersedes reference could not be resolved")
+                })?;
+                targets.push(item_id.into());
             }
             body["supersedes"] = Value::Array(targets);
             journal.record_v2_supersedes(operation.op_id, body["supersedes"].clone())?;

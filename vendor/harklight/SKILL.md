@@ -1,6 +1,6 @@
 ---
 name: harklight
-version: "0.2.16"
+version: "0.2.21"
 description: >-
   Send the person a question, a decision with choices or a notice through
   Harklight, and read their answer, with the harklight-agent command.
@@ -53,9 +53,9 @@ listener. It reads the person's full view even with empty grants; answering
 needs current read and respond grants for the item's sender. It cannot send a
 new message. A device enrollment and sender grant do not substitute for agent
 registration or those scopes; an agent key does not substitute for
-the enrolled origin identity used by `harklight-agent`.
+the enrolled device identity used by `harklight-agent`.
 
-Sender patterns use the same rule for origin-session sends from an enrolled
+Sender patterns use the same rule for sends from an enrolled
 device and registered-agent read/respond grants: a pattern ending in `/`
 matches every sender ID beginning with that literal prefix; every other
 pattern matches exactly. For example,
@@ -93,10 +93,7 @@ Preserve the private journal and staged files across restarts. Its default is
 `~/.local/state/harklight-agent`. It keeps one feed cursor per scope (each
 session filter, plus a separate unfiltered scope), entries and operation
 recovery state for the enrolled device in SQLite. The first read of a scope
-prints the waiting messages and answers it has not delivered yet; a protocol 0.1
-feed cursor is not converted. Finish or
-abandon unresolved 0.1 operations with the 0.1 CLI before switching; old cursors
-are not used; pending enrollments survive.
+prints the waiting messages and answers for that scope.
 History has no retention limit; keep adequate disk space. Resetting this state
 is not a reply-retrieval or uncertain-send recovery procedure.
 
@@ -266,7 +263,7 @@ last completed output. Read again when the originating work resumes; do not
 send again or add a polling timer. `result` reports what happened to a
 retrieved answer; it does not retrieve one or subscribe to future replies.
 
-## Read an origin message by ID
+## Read a sent message by item ID
 
 Agent 0.2.0 can read one sent message by its item ID:
 
@@ -287,7 +284,7 @@ and identify each entry by `entry_id` and its `rev`. Inspect the record `kind`
 and, for an entry, its `kind`, `author` and `delivery`; do not classify by body
 text. One cursor carries `message`, `entry` and `advisory` records: a `message`
 record carries the item, with an answer or close-out in `data.terminal`; an
-`entry` record carries person and origin replies, retractions, revisions and
+`entry` record carries replies from the person and the sending agent, retractions, revisions and
 results. An answer or No comment ends the request but leaves chat open.
 
 The server records a person turn or answer as Delivered when it serves it in a
@@ -341,7 +338,7 @@ receipt without claiming an applied answer; do not invent a payload. Native
 clients must submit the displayed request revision for No comment;
 missing/stale revisions are refused. The CLI does not update the app.
 For cleared, expired or superseded terminals, stop the obsolete request work;
-do not report an applied answer. An origin-authored retraction is
+do not report an applied answer. A retraction by the sending agent is
 retained history, not an actionable prompt or a request to reopen. Closed
 messages remain readable; preserve useful drafts and pending answers while
 respecting the actual terminal state.

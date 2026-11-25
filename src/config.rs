@@ -45,7 +45,6 @@ pub enum ConfigError {
 struct ServerFile {
     address: String,
     name: String,
-    port: u16,
     device_port: Option<u16>,
     device_url: Option<String>,
     ca_sha256: String,
@@ -75,10 +74,24 @@ pub struct EnrolledIdentity {
 
 impl EnrolledIdentity {
     pub fn load(directory: &Path, ca_file: &Path) -> Result<Self, ConfigError> {
+        Self::load_with_device_port(directory, ca_file, None)
+    }
+
+    pub fn load_with_device_port(
+        directory: &Path,
+        ca_file: &Path,
+        device_port: Option<u16>,
+    ) -> Result<Self, ConfigError> {
         ensure_private_directory(directory)?;
 
         let server_path = directory.join("server.json");
         let server: ServerFile = read_json(&server_path)?;
+        let port = device_port
+            .or(server.device_port)
+            .filter(|port| *port != 0)
+            .ok_or_else(|| {
+                ConfigError::Invalid("provide --device-port or HARKLIGHT_DEVICE_PORT".into())
+            })?;
         let enrollment_path = directory.join("enrollment.json");
         let enrollment: EnrollmentFile = read_json(&enrollment_path)?;
 
@@ -127,7 +140,7 @@ impl EnrolledIdentity {
             directory: directory.to_path_buf(),
             address,
             name,
-            port: server.device_port.unwrap_or(server.port),
+            port,
             person_id: enrollment.person_id,
             device_id: enrollment.device_id,
             ca_file: ca_file.to_path_buf(),
@@ -327,7 +340,7 @@ mod tests {
         fs::write(
             identity.join("server.json"),
             format!(
-                r#"{{"address":"127.0.0.1","name":"example.test","port":18444,"ca_sha256":"{ca_hash}"}}"#
+                r#"{{"address":"127.0.0.1","name":"example.test","device_port":18443,"ca_sha256":"{ca_hash}"}}"#
             ),
         )
         .unwrap();

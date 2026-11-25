@@ -92,7 +92,7 @@ enum Command {
         reply: bool,
         #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
         supersedes: Vec<String>,
-        /// Resolve a same-sender local reference before sending.
+        /// Supersede a committed send operation from the same journal and sender.
         #[arg(long = "supersedes-local")]
         supersedes_local: Vec<String>,
         #[arg(long, help = "RFC 3339 time by which this matters")]
@@ -167,9 +167,6 @@ enum Command {
         stage: String,
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
-        /// Resolve the request as a pre-cut-over message belonging to this sender.
-        #[arg(long)]
-        sender_id: Option<String>,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
@@ -741,17 +738,12 @@ fn device_identity(cli: &Cli) -> EnrolledIdentity {
         .as_deref()
         .or_else(|| invitation_ca.is_file().then_some(invitation_ca.as_path()))
         .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
-    let mut identity = EnrolledIdentity::load(&identity_dir, ca_file)
-        .unwrap_or_else(|error| fail(error.to_string(), 1));
-    if let Some(device_port) = cli.device_port {
-        identity.port = device_port;
-    }
-    identity
+    EnrolledIdentity::load_with_device_port(&identity_dir, ca_file, cli.device_port)
+        .unwrap_or_else(|error| fail(error.to_string(), 1))
 }
 
 fn run_device_read(cli: &Cli) {
     let identity = device_identity(cli);
-    let device_id = identity.device_id.clone();
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
     let (operation, result) = match &cli.command {
         Command::MessageGet {
@@ -760,50 +752,18 @@ fn run_device_read(cli: &Cli) {
             ..
         } => ("message-get", read_message_revision(&client, id, *revision)),
         Command::MessageGet {
-            sender_id: Some(sender),
             message_id: Some(id),
-            revision,
-            ..
-        } => {
-            let journal = device_journal(cli, &device_id);
-            let cached = journal
-                .v2_item_id(sender, id)
-                .unwrap_or_else(|error| fail(error.to_string(), 1));
-            let result = client
-                .resolve_legacy_message(sender, id, cached.as_deref())
-                .and_then(|message| {
-                    let item_id = message["message"]["item_id"]
-                        .as_str()
-                        .ok_or(V2Error::InvalidResponse { request_id: None })?;
-                    if cached.is_none() {
-                        journal
-                            .remember_v2_item(sender, id, item_id)
-                            .unwrap_or_else(|error| fail(error.to_string(), 1));
-                    }
-                    match revision {
-                        Some(revision) => client.message_revision(item_id, *revision),
-                        None => Ok(message),
-                    }
-                })
-                .or_else(|error| {
-                    if error.permits_account_fallback() {
-                        let item_id = client.account_item_id(id, Some(sender))?;
-                        client.account_message(&item_id, *revision)
-                    } else {
-                        Err(error)
-                    }
-                });
-            ("message-get", result)
-        }
-        Command::MessageGet {
-            message_id: Some(id),
+            sender_id,
             revision,
             ..
         } => (
             "message-get",
             client
-                .account_item_id(id, None)
-                .and_then(|item_id| read_message_revision(&client, &item_id, *revision)),
+                .account_item_id(id, sender_id.as_deref())
+                .and_then(|item_id| match sender_id {
+                    Some(_) => client.account_message(&item_id, *revision),
+                    None => read_message_revision(&client, &item_id, *revision),
+                }),
         ),
         Command::Search {
             session,
@@ -1164,7 +1124,6 @@ fn run_device_write(cli: &Cli) {
             percent,
             stage,
             note,
-            sender_id,
             op_id,
         } => mutations::progress(
             &client,
@@ -1176,7 +1135,6 @@ fn run_device_write(cli: &Cli) {
                 stage: stage.clone(),
                 note: note.clone(),
             },
-            sender_id.as_deref(),
             *op_id,
         ),
         Command::Retract {

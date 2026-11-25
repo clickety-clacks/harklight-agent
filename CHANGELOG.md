@@ -1,5 +1,18 @@
 # Release notes
 
+## Unreleased
+
+- This release speaks only the Harklight 0.2 protocol.
+- Resolve sender-qualified message IDs through account search. For Progress on
+  an earlier message, pass its Server item ID to `--request`. Local supersession
+  resolves recorded send operation IDs from the same journal.
+- Use `journal.sqlite3` for new state directories. Existing Agent 0.2 journals
+  retain their database and lock paths and reopen with their saved state.
+  Remove the retired origin-feed and advisory writers and leave their stored
+  history in place.
+- Use the saved device port or an explicit `--device-port` or
+  `HARKLIGHT_DEVICE_PORT`. The enrollment port is used only for enrollment.
+
 ## 0.2.6
 
 - `harklight-agent setup <invitation>` connects an agent in one step: it enrolls
@@ -81,7 +94,8 @@
 - Exit 0 means success, 1 a local input, configuration, journal, or read failure, 2 a definite refusal, 5 an unsupported operation, and 7 an unknown write outcome or retryable write.
 - A batch `500 internal_error` or an SSE close with reason `internal_error` pauses the feed at its last completed position and reports the Request-Id. Resume with a new invocation. A journaled write that receives this error remains unresolved under its original operation key and reports `retryable: false`. Replay requires an explicit retry.
 
-**Upgrading from 0.1.** Finish unresolved 0.1 sends with the 0.1 CLI before switching, or use Agent 0.1.16 to abandon them with `abandon --op-id KEY`. Abandon only changes local state and cannot undo an applied send. Agent 0.2 retains prepared and unknown 0.1 journal rows without migrating or sending them, and `retry --op-id` on those rows exits 1 before any HTTP request with “operation belongs to the earlier protocol.” If the Server still retains a manual pending enrollment, its `pending.json` remains readable, including numeric deadlines, so use `enroll status` or `enroll retry` with the same directory, CA, and original enrollment endpoint, also supplying the original label for retry, then configure the device port separately. Reissue unused v1 invitations and start the feed with a fresh baseline, because Agent 0.2 ignores old feed cursors and you should never pass a 0.1 cursor to `--after`.
+**Protocol cutover.** Agent 0.2.0 retained unresolved 0.1 journal rows and
+pending enrollments. Its v2 feed began with a fresh cursor.
 
 Compatibility: protocol 0.2 (new, supersedes 0.1). Requires a Server that serves the v2 Agent API.
 

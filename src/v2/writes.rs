@@ -545,7 +545,7 @@ fn deliver_operation(
                     && response["sha256"] == upload.sha256 =>
             {
                 journal
-                    .settle_operation(key, response.clone(), None)
+                    .settle_operation(key, response.clone())
                     .map_err(|error| unknown(&operation, &error.to_string(), None))?;
                 files::cleanup_staged_uploads(&operation.uploads);
                 Ok(committed(&operation, response))
@@ -612,7 +612,7 @@ fn deliver_operation(
     match response {
         Ok((response, request_id)) if valid_write_response(&operation.kind, request, &response) => {
             journal
-                .settle_operation(key, response.clone(), None)
+                .settle_operation(key, response.clone())
                 .map_err(|error| {
                     correlated_unknown(&operation, &error.to_string(), request_id.as_deref())
                 })?;
