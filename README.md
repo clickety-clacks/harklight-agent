@@ -129,7 +129,8 @@ position, waits up to 25 seconds between attempts, and reports failures and
 recovery on stderr. Valid API refusals and local configuration errors still
 exit. When the Server refuses the client certificate, follow mode repeats
 `this identity is not accepted (revoked or never enrolled)` on each failed
-attempt. It still exits on an explicit `revoked` feed close. Reads and one-shot
+attempt. `focus --follow` also reports the refusal and retries when
+reconnecting. An explicit `revoked` feed close still ends the listener. Reads and one-shot
 listens exit 1 on the certificate refusal. The late TLS alert does not
 establish that a write was unprocessed, so the CLI keeps exit 7 and the
 saved operation key for retry.

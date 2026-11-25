@@ -642,16 +642,20 @@ impl FeedRetry {
             None => (0, None),
         };
         let mut seconds = self.backoff_secs.max(retry_after);
+        let identity_refusal = matches!(
+            &error,
+            Some(FeedError::Api(V2Error::IdentityNotAccepted { .. }))
+        );
         if self.following() {
             let (condition, detail) = retry_diagnostic(error.as_ref());
-            let identity_refusal = matches!(
-                &error,
-                Some(FeedError::Api(V2Error::IdentityNotAccepted { .. }))
-            );
             if self.conditions.insert(condition) || identity_refusal {
                 eprintln!("listen: {detail}; reconnecting");
             }
             seconds = seconds.min(MAX_BACKOFF_SECS);
+        } else if let (Mode::Focus, Some(error)) = (&self.mode, &error)
+            && identity_refusal
+        {
+            eprintln!("focus: {error}; reconnecting");
         }
         thread::sleep(Duration::from_secs(seconds));
         self.backoff_secs = (self.backoff_secs * 2).min(MAX_BACKOFF_SECS);
@@ -672,7 +676,9 @@ fn retry_delay(mode: &Mode, error: &FeedError) -> Option<u64> {
         return None;
     }
     match error {
-        FeedError::Api(V2Error::IdentityNotAccepted { .. }) if matches!(mode, Mode::Follow) => {
+        FeedError::Api(V2Error::IdentityNotAccepted { .. })
+            if matches!(mode, Mode::Follow | Mode::Focus) =>
+        {
             Some(0)
         }
         FeedError::Api(V2Error::Http {
@@ -872,6 +878,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn focus_retries_an_identity_refusal_during_reconnect() {
+        let source = reqwest::blocking::Client::new()
+            .get("not a URL")
+            .build()
+            .unwrap_err();
+        let error = FeedError::Api(V2Error::IdentityNotAccepted { source });
+        assert_eq!(retry_delay(&Mode::Read, &error), None);
+        assert_eq!(retry_delay(&Mode::Next, &error), None);
+        assert_eq!(retry_delay(&Mode::Follow, &error), Some(0));
+        let mut retry = FeedRetry::new(Mode::Focus);
+        retry.backoff_secs = 0;
+        assert!(retry.wait(Some(error)).is_ok());
+    }
 
     struct Scratch(PathBuf);
 
