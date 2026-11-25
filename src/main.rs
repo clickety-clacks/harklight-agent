@@ -5,11 +5,13 @@ use uuid::Uuid;
 
 use harklight_agent::{
     commands::{self, MessageFieldOptions, ProgressReport},
-    config::{EnrolledIdentity, default_state_root},
+    config::{EnrolledIdentity, default_identity_dir, default_state_root},
     enrollment,
     journal::JournalStore,
     v2::{AgentClient, V2Error, feed, mutations, sends, writes},
 };
+
+mod setup;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +35,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Connect this computer to Harklight or refresh an existing setup.
+    Setup {
+        /// Full Harklight join link, or a file containing the link or invitation JSON.
+        invitation: Option<std::ffi::OsString>,
+        /// Name shown for this computer in Devices (defaults to its host name).
+        #[arg(long)]
+        label: Option<String>,
+    },
     Enroll {
         #[command(subcommand)]
         action: EnrollCommand,
@@ -601,6 +611,9 @@ fn main() {
     }
 
     match &cli.command {
+        Command::Setup { invitation, label } => {
+            setup::run(&cli, invitation.as_deref(), label.as_deref())
+        }
         Command::Read(args) if args.pending => run_pending_read(&cli, args),
         Command::Read(args) => run_device_feed(&cli, Some(&args.feed), feed::Mode::Read),
         Command::Listen(args) => run_device_feed(
@@ -712,18 +725,23 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     }
 }
 
+fn identity_dir(cli: &Cli) -> PathBuf {
+    cli.identity_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(default_identity_dir)
+        .unwrap_or_else(|error| fail(error.to_string(), 1))
+}
+
 fn device_identity(cli: &Cli) -> EnrolledIdentity {
-    let identity_dir = cli
-        .identity_dir
-        .as_deref()
-        .unwrap_or_else(|| fail("provide --identity-dir or HARKLIGHT_IDENTITY_DIR".into(), 1));
+    let identity_dir = identity_dir(cli);
     let invitation_ca = identity_dir.join("invitation-ca.pem");
     let ca_file = cli
         .ca_file
         .as_deref()
         .or_else(|| invitation_ca.is_file().then_some(invitation_ca.as_path()))
         .unwrap_or_else(|| fail("provide --ca-file or HARKLIGHT_CA_FILE".into(), 1));
-    let mut identity = EnrolledIdentity::load(identity_dir, ca_file)
+    let mut identity = EnrolledIdentity::load(&identity_dir, ca_file)
         .unwrap_or_else(|error| fail(error.to_string(), 1));
     if let Some(device_port) = cli.device_port {
         identity.port = device_port;

@@ -35,11 +35,54 @@ pub fn start_invitation(
     path: &Path,
     label: Option<&str>,
 ) -> Result<(), EnrollmentError> {
+    let input = read_invitation(path)?;
+    print_invitation_outcome(&start_with_input(identity_dir, &input, label)?)
+}
+
+pub fn start_setup(
+    directory: &Path,
+    input: &std::ffi::OsStr,
+    label: Option<&str>,
+) -> Result<Value, EnrollmentError> {
+    let input = match input.to_str() {
+        Some(link) if link.starts_with("harklight://") || link.starts_with("https://") => {
+            link.to_owned()
+        }
+        _ => read_invitation(Path::new(input))?,
+    };
+    start_with_input(Some(directory), &input, label)
+}
+
+pub fn resume_setup(
+    directory: &Path,
+    waiting: impl FnOnce(&str),
+) -> Result<Option<Value>, EnrollmentError> {
+    let Some(saved) = saved(Some(directory))? else {
+        return Ok(None);
+    };
+    if let Some(pending) = read_optional_pending(directory)? {
+        waiting(&pending.approval_code);
+    }
+    saved.outcome(true).map(Some)
+}
+
+fn read_invitation(path: &Path) -> Result<String, EnrollmentError> {
+    fs::read_to_string(path)
+        .map_err(|error| EnrollmentError::local(format!("could not read invitation file: {error}")))
+}
+
+fn start_with_input(
+    identity_dir: Option<&Path>,
+    input: &str,
+    label: Option<&str>,
+) -> Result<Value, EnrollmentError> {
     let invalid = || EnrollmentError::local("invalid Harklight join invitation");
-    let input = fs::read_to_string(path).map_err(|error| {
-        EnrollmentError::local(format!("could not read invitation file: {error}"))
-    })?;
     let input = input.trim();
+    if input.starts_with("https://") {
+        return Err(EnrollmentError::local(
+            "This is a short invitation link. Use Copy full link in Devices and run setup again.",
+        ));
+    }
     let document: Value = if let Some(fragment) = input.strip_prefix("harklight://join#") {
         let decoded = URL_SAFE_NO_PAD.decode(fragment).map_err(|_| invalid())?;
         serde_json::from_slice(&decoded).map_err(|_| invalid())?
@@ -155,13 +198,6 @@ fn verify_ca_pin(pem: &[u8], pin: &str) -> Result<(), EnrollmentError> {
     Ok(())
 }
 
-fn identity_path(identity_dir: Option<&Path>) -> Result<PathBuf, EnrollmentError> {
-    identity_dir
-        .map(Path::to_path_buf)
-        .or_else(|| env_path("HARKLIGHT_IDENTITY_DIR"))
-        .ok_or_else(|| EnrollmentError::local("provide --identity-dir or HARKLIGHT_IDENTITY_DIR"))
-}
-
 pub(super) fn saved(
     identity_dir: Option<&Path>,
 ) -> Result<Option<SavedInvitation>, EnrollmentError> {
@@ -183,6 +219,10 @@ pub(super) fn saved(
 
 impl SavedInvitation {
     pub(super) fn finish(self, retry: bool) -> Result<(), EnrollmentError> {
+        print_invitation_outcome(&self.outcome(retry)?)
+    }
+
+    fn outcome(self, retry: bool) -> Result<Value, EnrollmentError> {
         ensure_private_directory(&self.directory)?;
         let server_bytes = fs::read(self.directory.join("server.json")).map_err(|error| {
             EnrollmentError::local(format!("cannot read saved server: {error}"))
@@ -212,7 +252,7 @@ impl SavedInvitation {
                     &endpoint,
                     Some(&self.state.person_id),
                 )?;
-                print_status_outcome(&self.directory, &pending, state)
+                status_output(&self.directory, &pending, state)
             }
             None if self.directory.join("enrollment.json").exists() => {
                 match query_bound_status(
@@ -225,9 +265,9 @@ impl SavedInvitation {
                     StatusOutcome::Approved {
                         person_id,
                         device_id,
-                    } => emit_json(
-                        &json!({"state":"approved","person_id":person_id,"device_id":device_id}),
-                    ),
+                    } => {
+                        Ok(json!({"state":"approved","person_id":person_id,"device_id":device_id}))
+                    }
                     _ => Err(EnrollmentError::refused(
                         "the Server could not confirm this enrollment",
                     )),
@@ -244,7 +284,7 @@ impl SavedInvitation {
         self,
         transport: &impl EnrollmentTransport,
         endpoint: &Endpoint,
-    ) -> Result<(), EnrollmentError> {
+    ) -> Result<Value, EnrollmentError> {
         let directory = self.directory.clone();
         let result = self.submit(transport, endpoint);
         if let Err(error) = &result
@@ -279,7 +319,7 @@ impl SavedInvitation {
         mut self,
         transport: &impl EnrollmentTransport,
         endpoint: &Endpoint,
-    ) -> Result<(), EnrollmentError> {
+    ) -> Result<Value, EnrollmentError> {
         let token = self.state.invite_token.as_ref().ok_or_else(|| {
             EnrollmentError::local("no invitation remains to redeem; ask for a new one")
         })?;
@@ -332,9 +372,7 @@ impl SavedInvitation {
                 } => {
                     self.state.invite_token = None;
                     write_json_private(&self.directory, INVITATION_STATE, &self.state)?;
-                    emit_json(
-                        &json!({"state":"approved","person_id":person_id,"device_id":device_id}),
-                    )
+                    Ok(json!({"state":"approved","person_id":person_id,"device_id":device_id}))
                 }
                 _ => Err(EnrollmentError::refused(
                     "this invitation can no longer enroll this device; ask for a new one",
@@ -356,6 +394,6 @@ impl SavedInvitation {
         write_json_private(&self.directory, "pending.json", &pending)?;
         self.state.invite_token = None;
         write_json_private(&self.directory, INVITATION_STATE, &self.state)?;
-        print_pending(&pending)
+        Ok(pending_output(&pending))
     }
 }

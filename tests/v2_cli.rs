@@ -46,17 +46,22 @@ impl CliFixture {
         Self(root)
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_harklight-agent"))
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harklight-agent"));
+        command
+            .env("HOME", &self.0)
+            .env_remove("CODEX_HOME")
             .arg("--identity-dir")
             .arg(self.0.join("identity"))
             .arg("--ca-file")
             .arg(self.0.join("ca.pem"))
             .arg("--state-dir")
-            .arg(self.0.join("state"))
-            .args(args)
-            .output()
-            .unwrap()
+            .arg(self.0.join("state"));
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
     }
 }
 
@@ -1324,6 +1329,8 @@ fn invitation_ca_der(pem: &str) -> Vec<u8> {
 
 fn enroll_invitation_cli(identity: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_harklight-agent"))
+        .env("HOME", identity.parent().unwrap())
+        .env_remove("CODEX_HOME")
         .env_remove("HARKLIGHT_CA_FILE")
         .env_remove("HARKLIGHT_DEVICE_PORT")
         .arg("--identity-dir")
@@ -1592,4 +1599,332 @@ fn caller_pending_prepare_preserves_only_a_string_answer_capability() {
         assert!(!fixture.0.join("state").exists());
         assert!(!server.request_line().contains("page="));
     }
+}
+
+#[test]
+fn setup_resumes_approval_and_records_the_test_answer() {
+    use std::sync::Mutex;
+    use test_tls::FixtureResponse;
+
+    let message = Mutex::new(Value::Null);
+    let server = SlowServer::respond_to(move |request| {
+        let resource = request.line.split_whitespace().nth(1).unwrap();
+        let (path, _) = resource.split_once('?').unwrap_or((resource, ""));
+        let mut message = message.lock().unwrap();
+        let body = || serde_json::from_slice::<Value>(&request.body).unwrap();
+        let response = match path {
+            "/enroll" => json!({"state":"pending","approval_code":"ABCDEFG234"}),
+            "/enroll/status" => {
+                assert!(body()["status_secret"].is_string());
+                json!({"state":"approved","person_id":"person","device_id":"device"})
+            }
+            "/v2/me" => json!({"sender_names":["app:agent/"]}),
+            "/v2/agent/messages" => {
+                let sent = body();
+                assert_eq!(sent["sender"], "app:agent/setup");
+                assert_eq!(sent["message"]["title"], "Harklight is connected");
+                assert_eq!(sent["message"]["answer_ui"]["actions"][0]["id"], "reply");
+                *message = json!({
+                    "rev":1,"item_id":"test-item","sender":sent["sender"],
+                    "session":sent["session"],"revision":1,"message":sent["message"],
+                    "seen":false,"files":[],"terminal":null
+                });
+                json!({"rev":1,"message":*message})
+            }
+            "/v2/agent/changes" => {
+                assert!(resource.contains("after=1"));
+                assert!(resource.contains(message["session"].as_str().unwrap()));
+                assert!(
+                    request
+                        .headers
+                        .iter()
+                        .any(|(name, value)| { name == "harklight-ack2" && value == "true" })
+                );
+                message["rev"] = 2.into();
+                message["terminal"] = json!({"state":"answered","answer":"Ready"});
+                json!({"rev":2,"more":false,
+                    "changes":[{"kind":"message","rev":2,"data":*message}]})
+            }
+            "/v2/agent/messages/test-item/receipt" => {
+                assert_eq!(body()["outcome"], "handed");
+                json!({"rev":3,"status":"recorded","stage_outcome":"handed","message":*message})
+            }
+            "/v2/agent/messages/test-item/result" => {
+                assert_eq!(body()["status"], "applied");
+                json!({"rev":4,"message":*message,"entry":{
+                    "entry_id":"result","item_id":"test-item","rev":4,"position":1,
+                    "request_revision":1,"kind":"result","author":"origin"
+                }})
+            }
+            "/stop-test" => return None,
+            _ => panic!("unexpected request to {resource}"),
+        };
+        Some(FixtureResponse::json(response))
+    });
+    let (fixture, link) = setup_fixture(&server);
+    let claude_home = fixture.0.join(".claude");
+    let codex_home = fixture.0.join("custom-codex-home");
+    fs::create_dir(&claude_home).unwrap();
+    fs::create_dir(&codex_home).unwrap();
+    let claude_skill = claude_home.join("skills/harklight/SKILL.md");
+    let codex_skill = fixture.0.join(".agents/skills/harklight/SKILL.md");
+    let identity = fixture.0.join("identity");
+    let invitation = fixture.0.join("invitation");
+    fs::write(&invitation, link).unwrap();
+    let start = enroll_invitation_cli(
+        &identity,
+        &["start", "--invitation", invitation.to_str().unwrap()],
+    );
+    assert!(start.status.success(), "{start:?}");
+    assert!(!claude_skill.exists());
+    assert!(!codex_skill.exists());
+    let setup = || {
+        let mut command = setup_cli(&fixture);
+        command.env("CODEX_HOME", &codex_home);
+        command
+    };
+    let output = setup().output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("ABCDEFG234"), "{stdout}");
+    assert!(stdout.contains("Sender IDs:      app:agent/"), "{stdout}");
+    assert!(stdout.contains("Answer: Ready\nConnected."), "{stdout}");
+
+    let vendored = include_str!("../vendor/harklight/SKILL.md");
+    for skill in [&claude_skill, &codex_skill] {
+        assert!(stdout.contains(skill.to_str().unwrap()), "{stdout}");
+        assert_eq!(fs::read_to_string(skill).unwrap(), vendored);
+        fs::write(skill, "earlier skill version").unwrap();
+    }
+    let refresh = setup().output().unwrap();
+    assert!(refresh.status.success(), "{refresh:?}");
+    for skill in [&claude_skill, &codex_skill] {
+        assert_eq!(fs::read_to_string(skill).unwrap(), vendored);
+    }
+    let stdout = String::from_utf8(refresh.stdout).unwrap();
+    assert!(stdout.contains("Account: person"), "{stdout}");
+    assert!(!stdout.contains("Sent a test question"), "{stdout}");
+
+    let ca = reqwest::Certificate::from_pem(server.ca_pem.as_bytes()).unwrap();
+    let _ = reqwest::blocking::Client::builder()
+        .tls_certs_only([ca])
+        .build()
+        .unwrap()
+        .get(format!("https://localhost:{}/stop-test", server.port))
+        .send();
+    let requests = server.requests();
+    assert_eq!(requests.len(), 8);
+}
+
+#[test]
+fn setup_explains_short_links_and_sets_aside_an_identity_without_grants() {
+    use test_tls::FixtureResponse;
+
+    let server = SlowServer::sequence(vec![
+        FixtureResponse::json(json!({
+            "state":"approved","person_id":"person","device_id":"device"
+        })),
+        FixtureResponse::json(json!({"sender_names":[]})),
+    ]);
+    let (fixture, link) = setup_fixture(&server);
+    let short = setup_cli(&fixture)
+        .arg("https://example.test/join#short")
+        .output()
+        .unwrap();
+    assert!(!short.status.success(), "{short:?}");
+    assert!(String::from_utf8_lossy(&short.stderr).contains("Copy full link"));
+    let identity = fixture.0.join("identity");
+    assert!(!identity.exists());
+
+    let declined = setup_cli(&fixture)
+        .args([link.as_str(), "--label", "Work computer"])
+        .output()
+        .unwrap();
+    assert_eq!(declined.status.code(), Some(2), "{declined:?}");
+    assert!(String::from_utf8_lossy(&declined.stderr).contains("Remove it in Devices"));
+    assert!(!identity.exists());
+    assert!(fs::read_dir(&fixture.0).unwrap().any(|entry| {
+        let entry = entry.unwrap();
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("identity.no-sender-grant-")
+            && entry.path().join("enrollment.json").is_file()
+    }));
+    let requests = server.requests();
+    let enrollment: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(enrollment["label"], "Work computer");
+}
+
+fn setup_fixture(server: &SlowServer) -> (CliFixture, String) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let root = std::env::temp_dir().join(format!("harklight-setup-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let mut invitation = join_fixture(
+        server.port,
+        2,
+        &format!("https://localhost:{}", server.port),
+    );
+    invitation["ca_sha256"] = hex::encode(Sha256::digest(invitation_ca_der(&server.ca_pem))).into();
+    invitation["ca_pem"] = server.ca_pem.clone().into();
+    let link = format!(
+        "harklight://join#{}",
+        URL_SAFE_NO_PAD.encode(invitation.to_string())
+    );
+    (CliFixture(root), link)
+}
+
+fn setup_cli(fixture: &CliFixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_harklight-agent"));
+    command
+        .env("HOME", &fixture.0)
+        .env_remove("CODEX_HOME")
+        .env_remove("HARKLIGHT_CA_FILE")
+        .env_remove("HARKLIGHT_DEVICE_PORT")
+        .env("HARKLIGHT_IDENTITY_DIR", fixture.0.join("identity"))
+        .env("HARKLIGHT_AGENT_STATE_DIR", fixture.0.join("state"))
+        .arg("setup");
+    command
+}
+
+#[test]
+fn identity_defaults_yield_to_the_existing_environment_and_flag() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(
+        (0..3)
+            .map(|_| FixtureResponse::json(json!({"sender_names":["app:agent/"]})))
+            .collect(),
+    );
+    let fixture = CliFixture::new(&server, identity);
+    let explicit = fixture.0.join("explicit");
+    let env = fixture.0.join("identity");
+    let home_data = fixture.0.join("data");
+    #[cfg(target_os = "macos")]
+    let default = fixture
+        .0
+        .join("Library/Application Support/Harklight/Agent/identity");
+    #[cfg(target_os = "linux")]
+    let default = home_data.join("harklight-agent/identity");
+
+    fs::create_dir_all(default.parent().unwrap()).unwrap();
+    for (directory, device) in [(&explicit, "explicit"), (&default, "default")] {
+        fs::create_dir(directory).unwrap();
+        for file in ["identity.key", "identity.pem", "server.json"] {
+            fs::copy(env.join(file), directory.join(file)).unwrap();
+        }
+        fs::write(
+            directory.join("enrollment.json"),
+            json!({"device_id":device}).to_string(),
+        )
+        .unwrap();
+    }
+    let env_setup = || {
+        let mut command = setup_cli(&fixture);
+        command
+            .env("HARKLIGHT_CA_FILE", fixture.0.join("ca.pem"))
+            .env("XDG_DATA_HOME", &home_data);
+        command
+    };
+    for (output, device) in [
+        (env_setup().output().unwrap(), "fixture"),
+        (
+            env_setup()
+                .arg("--identity-dir")
+                .arg(explicit)
+                .output()
+                .unwrap(),
+            "explicit",
+        ),
+        (
+            env_setup()
+                .env_remove("HARKLIGHT_IDENTITY_DIR")
+                .output()
+                .unwrap(),
+            "default",
+        ),
+    ] {
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("Device: {device}")));
+    }
+    assert!(!fixture.0.join(".claude").exists());
+    assert!(!fixture.0.join(".agents").exists());
+    assert_eq!(server.requests().len(), 3);
+}
+
+#[test]
+fn commands_other_than_setup_leave_skill_directories_untouched() {
+    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":1,"messages":[]}"#);
+    let fixture = CliFixture::new(&server, identity);
+    fs::create_dir(fixture.0.join(".codex")).unwrap();
+    let existing = fixture.0.join(".claude/skills/harklight/SKILL.md");
+    fs::create_dir_all(existing.parent().unwrap()).unwrap();
+    fs::write(&existing, "existing user skill").unwrap();
+
+    let op_id = Uuid::new_v4().to_string();
+    let prepare = [
+        "send",
+        "--prepare",
+        "--op-id",
+        &op_id,
+        "--sender-id",
+        "app:agent/test",
+        "--type",
+        "fyi",
+        "--title",
+        "Test",
+    ];
+    for args in [
+        &["journal-id"][..],
+        &["messages"][..],
+        &["--version"][..],
+        &prepare,
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert_eq!(
+            fs::read_to_string(&existing).unwrap(),
+            "existing user skill"
+        );
+        assert!(!fixture.0.join(".agents").exists());
+    }
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn forbidden_send_reports_current_grants_without_changing_machine_output() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse {
+            status: "403 Forbidden",
+            headers: &[],
+            body: r#"{"error":"forbidden","retryable":false,"request_id":"send"}"#.into(),
+            truncate: false,
+        },
+        FixtureResponse::json(json!({"sender_names":["app:agent/","app:build"]})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let refused = fixture.run(&[
+        "send",
+        "--sender-id",
+        "app:other",
+        "--type",
+        "fyi",
+        "--title",
+        "Notice",
+    ]);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert!(stderr.contains("app:other"), "{stderr}");
+    assert!(
+        stderr.contains("Granted sender IDs: app:agent/, app:build"),
+        "{stderr}"
+    );
+    let output: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(output["error"], "forbidden");
+    assert!(output.get("sender_names").is_none());
+    let requests = server.requests();
+    assert_eq!(requests[1].line.trim_end(), "GET /v2/me HTTP/1.1");
 }

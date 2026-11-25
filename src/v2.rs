@@ -44,6 +44,13 @@ impl AgentClient {
         self.read_correlated(path, query).map(|(value, _)| value)
     }
 
+    /// Read the authenticated device's current sender ID grants.
+    pub fn sender_grants(&self) -> Result<Vec<String>, V2Error> {
+        let (value, request_id) = self.read_correlated(&["me"], &[])?;
+        serde_json::from_value(value["sender_names"].clone())
+            .map_err(|_| V2Error::InvalidResponse { request_id })
+    }
+
     fn read_correlated(
         &self,
         path: &[&str],

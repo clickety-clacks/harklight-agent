@@ -17,6 +17,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Read Server skill pin
+        id: skill
+        run: printf 'ref=%s\n' "$(cat vendor/harklight/server-ref)" >> "$GITHUB_OUTPUT"
+      - name: Check out pinned Harklight Server source
+        uses: actions/checkout@v4
+        with:
+          repository: clickety-clacks/harklight-server
+          ref: ${{ steps.skill.outputs.ref }}
+          path: server-skill-source
+          persist-credentials: false
+      - name: Verify vendored Harklight skill
+        run: |
+          bash server-skill-source/scripts/build-skills.sh "$RUNNER_TEMP/server-skills"
+          cmp vendor/harklight/SKILL.md "$RUNNER_TEMP/server-skills/harklight/SKILL.md"
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --locked
