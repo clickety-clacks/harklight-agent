@@ -1,13 +1,5 @@
 # Release notes
 
-## Unreleased
-
-- Diagnose the Server's client certificate refusal. `listen --follow`
-  repeats the diagnosis while reconnecting and still stops on an explicit
-  revoked feed close. Reads and one-shot listens exit with the diagnosis.
-  A write interrupted by the late TLS alert keeps its unknown outcome and
-  saved operation key.
-
 ## 0.2.5
 
 - Add account-wide `search` and senderless message-ID lookup. `messages`
@@ -16,6 +8,16 @@
   fallback for messages from another sender.
 - Retract an open account message by item ID or unique message ID on a
   supporting Server.
+
+- Diagnose the Server's client certificate refusal. `listen --follow`
+  repeats the diagnosis while reconnecting and still stops on an explicit
+  revoked feed close. Reads and one-shot listens exit with the diagnosis.
+  A write interrupted by the late TLS alert keeps its unknown outcome and
+  saved operation key.
+- `read --pending --prepare` copies the Server's `answers` mark into the
+  `baseline_prepared` line when the Server sends it as a string. A Server that
+  serves answers entered by a granted agent and default answers sends
+  `"answers": "all"`; without the mark, treat the pending read as person answers only.
 
 ## 0.2.4
 
