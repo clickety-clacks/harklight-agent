@@ -92,7 +92,7 @@ enum Command {
         reply: bool,
         #[arg(long = "supersedes", action = clap::ArgAction::Append, value_name = "MESSAGE_ID")]
         supersedes: Vec<String>,
-        /// Resolve a same-sender local reference before sending.
+        /// Supersede a committed send operation from the same journal and sender.
         #[arg(long = "supersedes-local")]
         supersedes_local: Vec<String>,
         #[arg(long, help = "RFC 3339 time by which this matters")]

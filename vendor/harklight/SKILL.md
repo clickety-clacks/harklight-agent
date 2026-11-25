@@ -43,9 +43,8 @@ agent change feed (`/v2/agent`) for messages sent by that enrolled key. It can
 also read its person's device inbox through the separate device interface.
 Enrollment does not grant ownership or every sender ID. The **sender ID**
 identifies the source of a message; a message's identity is its server-issued
-`item_id`. A sender ID plus message ID only looks up a message accepted before
-the cutover to protocol 0.2. Neither a self-stated source label nor a session
-handle grants access.
+`item_id`. Account search can resolve a message ID scoped to a sender.
+The Server checks the enrolled device's sender grants for sends.
 
 A separately registered **agent identity** supports search, get and deliberate
 answer through separately scoped person routes on the same mutual-TLS device
@@ -53,9 +52,9 @@ listener. It reads the person's full view even with empty grants; answering
 needs current read and respond grants for the item's sender. It cannot send a
 new message. A device enrollment and sender grant do not substitute for agent
 registration or those scopes; an agent key does not substitute for
-the enrolled origin identity used by `harklight-agent`.
+the enrolled device identity used by `harklight-agent`.
 
-Sender patterns use the same rule for origin-session sends from an enrolled
+Sender patterns use the same rule for sends from an enrolled
 device and registered-agent read/respond grants: a pattern ending in `/`
 matches every sender ID beginning with that literal prefix; every other
 pattern matches exactly. For example,
@@ -85,7 +84,8 @@ The private identity directory contains `server.json`, `enrollment.json`,
 and authenticates with the device certificate. The device port, which serves
 client API v2, is distinct from the enrollment, owner and dashboard ports;
 registered agents use the same device port. A new enrollment saves it in
-`server.json` as `device_port`.
+`server.json` as `device_port`. If the identity has no saved device port, set
+`--device-port` or `HARKLIGHT_DEVICE_PORT`.
 
 Preserve the private journal and staged files across restarts. Its default is
 `~/Library/Application Support/Harklight/Agent` on macOS,
@@ -93,10 +93,7 @@ Preserve the private journal and staged files across restarts. Its default is
 `~/.local/state/harklight-agent`. It keeps one feed cursor per scope (each
 session filter, plus a separate unfiltered scope), entries and operation
 recovery state for the enrolled device in SQLite. The first read of a scope
-prints the waiting messages and answers it has not delivered yet; a protocol 0.1
-feed cursor is not converted. Finish or
-abandon unresolved 0.1 operations with the 0.1 CLI before switching; old cursors
-are not used; pending enrollments survive.
+prints the waiting messages and answers it has not delivered yet.
 History has no retention limit; keep adequate disk space. Resetting this state
 is not a reply-retrieval or uncertain-send recovery procedure.
 
@@ -266,9 +263,9 @@ last completed output. Read again when the originating work resumes; do not
 send again or add a polling timer. `result` reports what happened to a
 retrieved answer; it does not retrieve one or subscribe to future replies.
 
-## Read an origin message by ID
+## Read a sent message by item ID
 
-Agent 0.2.0 can read one sent message by its item ID:
+Read a sent message by its item ID:
 
 ```sh
 harklight-agent message-get --item-id "$HARKLIGHT_ITEM"
@@ -287,7 +284,7 @@ and identify each entry by `entry_id` and its `rev`. Inspect the record `kind`
 and, for an entry, its `kind`, `author` and `delivery`; do not classify by body
 text. One cursor carries `message`, `entry` and `advisory` records: a `message`
 record carries the item, with an answer or close-out in `data.terminal`; an
-`entry` record carries person and origin replies, retractions, revisions and
+`entry` record carries person and agent replies, retractions, revisions and
 results. An answer or No comment ends the request but leaves chat open.
 
 The server records a person turn or answer as Delivered when it serves it in a
@@ -341,7 +338,7 @@ receipt without claiming an applied answer; do not invent a payload. Native
 clients must submit the displayed request revision for No comment;
 missing/stale revisions are refused. The CLI does not update the app.
 For cleared, expired or superseded terminals, stop the obsolete request work;
-do not report an applied answer. An origin-authored retraction is
+do not report an applied answer. A sender-authored retraction is
 retained history, not an actionable prompt or a request to reopen. Closed
 messages remain readable; preserve useful drafts and pending answers while
 respecting the actual terminal state.
@@ -391,11 +388,11 @@ harklight-agent send --session "$HARKLIGHT_SESSION" --sender-id app:example \
   --supersedes "$EARLIER_ITEM_1" --supersedes "$EARLIER_ITEM_2"
 ```
 
-Use exact earlier item IDs, not handles. `--supersedes-local` instead resolves a
-local reference for the same sender before delivery. Invalid, unknown or already
-closed targets produce informational `supersedes_warnings`; the new message and
-other valid supersessions still post. Superseding is distinct from revising in
-place.
+Use earlier item IDs with `--supersedes`. Use `--supersedes-local` with a
+committed send operation ID from the same journal and sender. If the journal
+cannot resolve it, the CLI stops before posting. Invalid, unknown or closed
+item IDs produce `supersedes_warnings` in the Server response. The new message
+and valid supersessions still post.
 
 ## Files and transfer reports
 

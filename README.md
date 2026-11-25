@@ -162,7 +162,7 @@ that already reached the Server can still have taken effect.
   Both reads prefer the existing sent-message view. If the Server answers
   `not_found` or `forbidden` for that view, the CLI tries the account view and marks the
   response with `"view":"account"`. The account message uses the person's
-  `item` shape and omits the origin-only session, raw answer and advisories.
+  `item` shape and omits the sender-view session, raw answer and advisories.
   Account entries omit the sender's delivery and file-use receipts. Use `file-get` to download a referenced attachment.
 - `reply --item-id ID --body TEXT` sends a chat turn. Add
   `--in-reply-to ENTRY` to correlate a person entry. A reply can carry files
@@ -236,9 +236,8 @@ revision durably before requesting any pages.
 Use `read --session S --pending --resume TOKEN` to serve that attempt.
 Output starts with `baseline` and ends with `baseline_complete`. The
 rows use the feed's `kind`, `rev` and `data` shape and include retained
-pending person Chat and answer rows, including on closed items and
-migrated 0.1-era turns. An answer is a message with an answered terminal
-state. Apply a still-unapplied row even if it carries `pending:false`.
+pending person Chat and answer rows, including on closed items.
+An answer is a message with an answered terminal state. Apply a still-unapplied row even if it carries `pending:false`.
 The marker describes a receipt, action or updated representation.
 
 After interruption, run resume again with the original token and the

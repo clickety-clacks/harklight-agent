@@ -30,6 +30,7 @@ jobs:
       - name: Verify vendored Harklight skill
         run: |
           bash server-skill-source/scripts/build-skills.sh "$RUNNER_TEMP/server-skills"
+          patch -s -F 0 "$RUNNER_TEMP/server-skills/harklight/SKILL.md" vendor/harklight/agent.patch
           cmp vendor/harklight/SKILL.md "$RUNNER_TEMP/server-skills/harklight/SKILL.md"
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
