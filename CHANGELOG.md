@@ -1,5 +1,15 @@
 # Release notes
 
+## Unreleased
+
+- Resolve sender-qualified message IDs through account search. For Progress on
+  an earlier message, pass its Server item ID to `--request`. Local supersession
+  resolves recorded send operation IDs from the same journal.
+- Use `journal.sqlite3` for new state directories. Existing Agent 0.2 journals
+  retain their database and lock paths and reopen with their saved state.
+- Use the saved device port or an explicit `--device-port` or
+  `HARKLIGHT_DEVICE_PORT`. The enrollment port is used only for enrollment.
+
 ## 0.2.6
 
 - `harklight-agent setup <invitation>` connects an agent in one step: it enrolls

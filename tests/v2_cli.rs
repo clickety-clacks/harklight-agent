@@ -51,6 +51,7 @@ impl CliFixture {
         command
             .env("HOME", &self.0)
             .env_remove("CODEX_HOME")
+            .env_remove("HARKLIGHT_DEVICE_PORT")
             .arg("--identity-dir")
             .arg(self.0.join("identity"))
             .arg("--ca-file")
@@ -131,6 +132,39 @@ fn binary_searches_the_account_on_the_device_listener() {
     ] {
         assert!(line.contains(&filter), "{line}");
     }
+}
+
+#[test]
+fn sender_qualified_message_get_uses_account_search_and_reads_the_item() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        account_search_response(json!({
+            "rev":4,
+            "items":[{"item_id":"i23","rev":4,"sender":"app:second",
+                      "message":{"message_id":"reference"}}]
+        })),
+        FixtureResponse::json(json!({"rev":4,"item":{"item_id":"i23"}})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let output = fixture.run(&[
+        "message-get",
+        "--sender-id",
+        "app:second",
+        "--message-id",
+        "reference",
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["view"], "account");
+    assert_eq!(result["item"]["item_id"], "i23");
+    let requests = server.requests();
+    assert_eq!(
+        requests[0].line.trim_end(),
+        "GET /v2/search?sender=app%3Asecond&message_id=reference HTTP/1.1"
+    );
+    assert_eq!(requests[1].line.trim_end(), "GET /v2/items/i23 HTTP/1.1");
 }
 
 #[test]
@@ -506,7 +540,7 @@ fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
 }
 
 #[test]
-fn binary_device_port_overrides_an_existing_enrollment_port() {
+fn binary_requires_an_explicit_device_port_when_only_the_enrollment_port_is_saved() {
     let (server, identity) = SlowServer::mutual_tls(r#"{"rev":0,"messages":[]}"#);
     let fixture = CliFixture::new(&server, identity);
     let path = fixture.0.join("identity/server.json");
@@ -514,7 +548,16 @@ fn binary_device_port_overrides_an_existing_enrollment_port() {
     server_config.as_object_mut().unwrap().remove("device_port");
     fs::write(path, server_config.to_string()).unwrap();
 
-    let output = fixture.run(&["--device-port", &server.port.to_string(), "messages"]);
+    let missing_port = fixture.run(&["messages"]);
+    assert_eq!(missing_port.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing_port.stderr).contains("provide --device-port"));
+
+    let output = fixture
+        .command()
+        .env("HARKLIGHT_DEVICE_PORT", server.port.to_string())
+        .arg("messages")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -562,81 +605,6 @@ fn general_progress_revision_does_not_prevent_journal_reopen() {
         String::from_utf8_lossy(&second.stderr)
     );
     assert_eq!(server.requests().len(), 1);
-}
-
-#[test]
-fn explicit_legacy_progress_miss_does_not_fall_through_to_current_id() {
-    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":2,"messages":[]}"#);
-    let fixture = CliFixture::new(&server, identity);
-    let session = Uuid::new_v4().to_string();
-    let output = fixture.run(&[
-        "progress",
-        "--session",
-        &session,
-        "--request",
-        "opaque",
-        "--sender-id",
-        "app:other",
-        "--percent",
-        "25",
-        "--stage",
-        "Verify",
-    ]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["error"], "not_found");
-    assert_eq!(
-        server.request_line().trim_end(),
-        "GET /v2/agent/messages?sender=app%3Aother&legacy_message_id=opaque HTTP/1.1"
-    );
-}
-
-#[test]
-fn journal_known_legacy_progress_miss_does_not_fall_through_to_current_id() {
-    use harklight_agent::journal::{JournalEntry, JournalStore};
-
-    let session = Uuid::new_v4();
-    let (server, identity) = SlowServer::mutual_tls(r#"{"rev":2,"messages":[]}"#);
-    let fixture = CliFixture::new(&server, identity);
-    let mut journal = JournalStore::open(&fixture.0.join("state"), "fixture", session).unwrap();
-    journal
-        .record_entry(JournalEntry::fetched(
-            1,
-            "old-event".into(),
-            session,
-            "reply".into(),
-            "person".into(),
-            true,
-            Some("app:test".into()),
-            Some("opaque".into()),
-            Some(1),
-            json!({}),
-        ))
-        .unwrap();
-
-    let output = fixture.run(&[
-        "progress",
-        "--session",
-        &session.to_string(),
-        "--request",
-        "opaque",
-        "--percent",
-        "25",
-        "--stage",
-        "Verify",
-    ]);
-    assert_eq!(output.status.code(), Some(2), "{:?}", output);
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["error"], "not_found");
-    assert_eq!(
-        server.request_line().trim_end(),
-        "GET /v2/agent/messages?sender=app%3Atest&legacy_message_id=opaque HTTP/1.1"
-    );
 }
 
 #[test]

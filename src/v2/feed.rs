@@ -998,7 +998,7 @@ mod tests {
         let answer = json!({
             "rev":38,"kind":"message","data":{
                 "item_id":"answered","session":session,"rev":38,"sender":"app:fixture",
-                "legacy_message_id":"old-request","revision":1,"message":{},"seen":false,"files":[],
+                "revision":1,"message":{},"seen":false,"files":[],
                 "terminal":{"state":"answered","at_ms":100,"answer":null,
                     "delivery":{"delivered":false}}
             }

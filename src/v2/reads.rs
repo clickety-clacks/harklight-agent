@@ -214,74 +214,6 @@ impl AgentClient {
         }
         Ok(response)
     }
-
-    /// The journal also stores modern operation aliases, so a cached item
-    /// can satisfy a legacy selector only if the Server confirms both fields.
-    pub fn resolve_legacy_message(
-        &self,
-        sender: &str,
-        legacy_message_id: &str,
-        cached_item_id: Option<&str>,
-    ) -> Result<Value, V2Error> {
-        if let Some(item_id) = cached_item_id {
-            match self.message(item_id) {
-                Ok(response) if matches_legacy(&response["message"], sender, legacy_message_id) => {
-                    return Ok(response);
-                }
-                Ok(_) | Err(V2Error::Http { status: 404, .. }) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        self.legacy_message(sender, legacy_message_id)?
-            .ok_or_else(|| V2Error::Http {
-                status: 404,
-                token: Some("not_found".into()),
-                field: None,
-                request_id: None,
-                retry_after: None,
-            })
-    }
-
-    pub fn legacy_message(
-        &self,
-        sender: &str,
-        legacy_message_id: &str,
-    ) -> Result<Option<Value>, V2Error> {
-        let mut token = None;
-        let mut seen_tokens = BTreeSet::new();
-        let mut matched: Option<Value> = None;
-        loop {
-            let mut query = vec![("sender", sender), ("legacy_message_id", legacy_message_id)];
-            if let Some(page) = token.as_deref() {
-                query.push(("page", page));
-            }
-            let (response, request_id) = self.read_correlated(&["agent", "messages"], &query)?;
-            let (position, messages) = message_page(&response, token.as_deref(), &request_id)?;
-            for message in messages {
-                if !matches_legacy(message, sender, legacy_message_id) {
-                    return Err(invalid_response(&request_id));
-                }
-                if let Some(prior) = &matched {
-                    if prior["message"]["item_id"] != message["item_id"] {
-                        return Err(invalid_response(&request_id));
-                    }
-                    if prior["message"]["rev"].as_u64() >= message["rev"].as_u64() {
-                        continue;
-                    }
-                }
-                matched = Some(json!({"rev":position,"message":message}));
-            }
-            match response["next_page"].as_str() {
-                Some(next) if seen_tokens.insert(next.to_owned()) => token = Some(next.to_owned()),
-                None => return Ok(matched),
-                _ => return Err(invalid_response(&request_id)),
-            }
-        }
-    }
-}
-
-fn matches_legacy(message: &Value, sender: &str, legacy_message_id: &str) -> bool {
-    message["sender"] == sender && message["legacy_message_id"] == legacy_message_id
 }
 
 fn invalid_response(request_id: &Option<String>) -> V2Error {
@@ -361,69 +293,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_reference_is_resolved_with_the_exact_filtered_read() {
-        let server = SlowServer::answer_after(
-            Duration::ZERO,
-            r#"{"rev":24,"messages":[{"item_id":"server/opaque","sender":"app:build",
-            "legacy_message_id":"progress +","rev":22,"revision":4,
-            "message":{"title":"Build"},"seen":false,"files":[]}]}"#,
-        );
-        let client = client_for(&server);
-        let result = client
-            .legacy_message("app:build", "progress +")
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result["rev"], 24);
-        assert_eq!(result["message"]["item_id"], "server/opaque");
-        assert_eq!(result["message"]["revision"], 4);
-        assert_eq!(result["message"]["files"], json!([]));
-        assert_eq!(
-            server.request_line().trim_end(),
-            "GET /v2/agent/messages?sender=app%3Abuild&legacy_message_id=progress+%2B HTTP/1.1",
-        );
-    }
-
-    #[test]
-    fn legacy_lookup_refuses_an_unrelated_item() {
-        let server = SlowServer::answer_after(
-            Duration::ZERO,
-            r#"{"rev":24,"messages":[{"item_id":"opaque","sender":"app:other","legacy_message_id":"old"}]}"#,
-        );
-        let result = client_for(&server).legacy_message("app:build", "old");
-        assert!(matches!(result, Err(V2Error::InvalidResponse { .. })));
-        server.request();
-    }
-
-    #[test]
-    fn legacy_resolution_checks_a_cached_alias_against_the_server() {
-        use crate::test_tls::FixtureResponse;
-
-        let mut message = json!({"item_id":"cached","sender":"app:test",
-            "rev":4,"revision":1,"message":{},"seen":false,"files":[]});
-        let modern = FixtureResponse::json(json!({"rev":4,"message":message}));
-        message["item_id"] = "retained".into();
-        message["legacy_message_id"] = "local".into();
-        let server = SlowServer::sequence(vec![
-            modern,
-            FixtureResponse::json(json!({"rev":4,"messages":[message]})),
-        ]);
-        let result = client_for(&server)
-            .resolve_legacy_message("app:test", "local", Some("cached"))
-            .unwrap();
-        assert_eq!(result["message"]["item_id"], "retained");
-        let requests = server.requests();
-        assert_eq!(
-            requests[0].line.trim_end(),
-            "GET /v2/agent/messages/cached HTTP/1.1"
-        );
-        assert_eq!(
-            requests[1].line.trim_end(),
-            "GET /v2/agent/messages?sender=app%3Atest&legacy_message_id=local HTTP/1.1",
-        );
-    }
-
-    #[test]
     fn message_pages_preserve_the_opaque_page_and_session_filter() {
         let server = SlowServer::answer_after(
             Duration::ZERO,
@@ -456,21 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_lookup_paginates_before_answering_and_rejects_repeated_tokens() {
-        use crate::test_tls::FixtureResponse;
-        let message = json!({"item_id":"item-1","sender":"app:test","legacy_message_id":"ref",
-            "rev":4,"revision":1,"message":{},"seen":false,"files":[]});
-        let server = SlowServer::sequence(vec![
-            FixtureResponse::json(json!({"rev":4,"messages":[],"next_page":"go"})),
-            FixtureResponse::json(json!({"rev":4,"messages":[message]})),
-        ]);
-        let found = client_for(&server)
-            .legacy_message("app:test", "ref")
-            .unwrap()
-            .unwrap();
-        assert_eq!(found["message"]["item_id"], "item-1");
-        assert!(server.requests()[1].line.contains("page=go"));
-
+    fn message_pages_reject_a_repeated_token() {
         let repeat = SlowServer::answer_after(
             Duration::ZERO,
             r#"{"rev":4,"messages":[],"next_page":"go"}"#,

@@ -258,7 +258,6 @@ pub fn progress(
     session: Uuid,
     request: &str,
     report: &ProgressReport,
-    legacy_sender: Option<&str>,
     op_id: Option<Uuid>,
 ) -> Result<Value, WriteFailure> {
     if let Some(key) = op_id
@@ -285,34 +284,9 @@ pub fn progress(
     {
         item_id = remote.to_owned();
     }
-    let legacy_sender = match legacy_sender {
-        Some(sender) => Some(sender.to_owned()),
-        None if item_id == request => journal.legacy_sender(session, request)?,
-        None => None,
-    };
-    let snapshot = if let Some(sender) = legacy_sender {
-        let cached = journal.v2_item_id(&sender, request)?;
-        let found = client
-            .resolve_legacy_message(&sender, request, cached.as_deref())
-            .map_err(|error| read_failure("progress", error))?;
-        item_id = found["message"]["item_id"]
-            .as_str()
-            .ok_or_else(|| WriteFailure::local("legacy lookup lacked the item ID"))?
-            .to_owned();
-        if found["message"]["session"] != session.to_string() {
-            return Err(WriteFailure::local_refusal(
-                "the message is outside this session",
-            ));
-        }
-        if cached.is_none() {
-            journal.remember_v2_item(&sender, request, &item_id)?;
-        }
-        found
-    } else {
-        client
-            .message(&item_id)
-            .map_err(|error| read_failure("progress", error))?
-    };
+    let snapshot = client
+        .message(&item_id)
+        .map_err(|error| read_failure("progress", error))?;
     let item = &snapshot["message"];
     if item["item_id"] != item_id || item["session"] != session.to_string() {
         return Err(WriteFailure::local_refusal(

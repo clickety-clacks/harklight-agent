@@ -31,6 +31,8 @@ pub enum JournalError {
     Json(#[from] serde_json::Error),
     #[error("journal database failed: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("journal database uses an unsupported schema; Agent requires schema 2")]
+    UnsupportedSchema,
     #[error("journal database is missing its cursor")]
     MissingCursor,
     #[error("journal database cursor is invalid")]
@@ -62,8 +64,6 @@ pub enum JournalError {
     OperationConflict(Uuid),
     #[error("local message reference already has a different server item ID")]
     ItemBindingConflict,
-    #[error("legacy message reference has multiple senders; specify --sender-id")]
-    AmbiguousLegacySender,
     #[error("a revision is unresolved for this item; retry operation {0}")]
     PendingRevision(Uuid),
     #[error("journal has no operation with key {0}")]
@@ -370,9 +370,19 @@ impl JournalStore {
         let identity_scope = hex::encode(Sha256::digest(device_id.as_bytes()));
         let directory = state_root.join(identity_scope);
         create_private_directory(&directory)?;
-        let store = Self {
-            journal_path: directory.join("origin-feed.sqlite3"),
-            journal_lock_path: directory.join("origin-feed.lock"),
+        // Keep the original database and lock paired for existing 0.2 state.
+        // An older process may still use both names during an upgrade.
+        let existing_path = directory.join("origin-feed.sqlite3");
+        let store = if existing_path.try_exists()? {
+            Self {
+                journal_path: existing_path,
+                journal_lock_path: directory.join("origin-feed.lock"),
+            }
+        } else {
+            Self {
+                journal_path: directory.join("journal.sqlite3"),
+                journal_lock_path: directory.join("journal.lock"),
+            }
         };
         store.initialize()?;
         store.maintain_progress_material(session_handle)?;
@@ -437,11 +447,6 @@ impl JournalStore {
                 WHERE state IN ('prepared', 'unknown');",
         )?;
 
-        ensure_column(&connection, "entries", "in_reply_to", "TEXT")?;
-        ensure_column(&connection, "entries", "result_status", "TEXT")?;
-        ensure_column(&connection, "operations", "request_revision", "INTEGER")?;
-        ensure_column(&connection, "operations", "in_reply_to", "TEXT")?;
-
         let initialized: Option<String> = connection
             .query_row("SELECT value FROM meta WHERE key='cursor'", [], |row| {
                 row.get(0)
@@ -465,13 +470,8 @@ impl JournalStore {
                     row.get(0)
                 })
                 .optional()?;
-            if schema
-                .as_deref()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(1)
-                < 2
-            {
-                migrate_request_indexes(&mut connection)?;
+            if schema.as_deref() != Some("2") {
+                return Err(JournalError::UnsupportedSchema);
             }
         }
 
@@ -1241,43 +1241,8 @@ impl JournalStore {
         })
     }
 
-    /// Recover only the old local sender reference, never a pending write.
-    pub fn legacy_sender(
-        &self,
-        session: Uuid,
-        local_id: &str,
-    ) -> Result<Option<String>, JournalError> {
-        self.with_read(|connection| {
-            let mut query = connection.prepare(
-                "SELECT sender_id FROM entries WHERE session_handle=?1 AND request_id=?2 AND sender_id IS NOT NULL
-                 UNION
-                 SELECT json_extract(payload,'$.request.message.sender_id') FROM operations
-                 WHERE session_handle=?1 AND message_id=?2 AND kind='send' AND state='committed'
-                   AND coalesce(json_extract(payload,'$.protocol_v2'),0)=0
-                   AND json_extract(payload,'$.request.message.sender_id') IS NOT NULL
-                 LIMIT 2",
-            )?;
-            let senders = query.query_map(params![session.to_string(),local_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            match senders.as_slice() {
-                [sender] => Ok(Some(sender.clone())),
-                [] => Ok(None),
-                _ => Err(JournalError::AmbiguousLegacySender),
-            }
-        })
-    }
-
     pub fn v2_item_id(&self, sender: &str, local_id: &str) -> Result<Option<String>, JournalError> {
         self.with_read(|connection| read_v2_item_id(connection, sender, local_id))
-    }
-
-    pub fn remember_v2_item(
-        &self,
-        sender: &str,
-        local_id: &str,
-        item_id: &str,
-    ) -> Result<(), JournalError> {
-        self.with_transaction(|tx| write_v2_item_id(tx, sender, local_id, item_id))
     }
 
     pub fn prepare_send_operation(
@@ -1601,78 +1566,6 @@ impl JournalStore {
 
 fn encode_sequence(sequence: u64) -> String {
     format!("{sequence:020}")
-}
-
-fn ensure_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-    declaration: &str,
-) -> Result<(), JournalError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|existing| existing == column) {
-        connection.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-        ))?;
-    }
-    Ok(())
-}
-
-/// Populate the columns used by targeted request queries when opening a
-/// journal created before schema 2. This full scan happens once per database;
-/// ordinary request operations use the resulting indexes and bounded reads.
-fn migrate_request_indexes(connection: &mut Connection) -> Result<(), JournalError> {
-    let tx = connection.transaction()?;
-    let entries = {
-        let mut statement = tx.prepare("SELECT feed_seq, payload FROM entries")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for (sequence, payload) in entries {
-        let entry: JournalEntry = serde_json::from_str(&payload)?;
-        tx.execute(
-            "UPDATE entries SET in_reply_to=?1, result_status=?2 WHERE feed_seq=?3",
-            params![
-                entry.raw["in_reply_to"].as_str(),
-                entry.raw["status"].as_str(),
-                sequence
-            ],
-        )?;
-    }
-
-    let operations = {
-        let mut statement = tx.prepare("SELECT op_id, payload FROM operations")?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for (op_id, payload) in operations {
-        let operation: OperationRecord = serde_json::from_str(&payload)?;
-        tx.execute(
-            "UPDATE operations SET request_revision=?1, in_reply_to=?2 WHERE op_id=?3",
-            params![
-                operation_request_revision(&operation),
-                operation.request["in_reply_to"].as_str(),
-                op_id
-            ],
-        )?;
-    }
-
-    tx.execute(
-        "INSERT INTO meta(key,value) VALUES('schema','2')
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [],
-    )?;
-    tx.commit()?;
-    Ok(())
 }
 
 pub(crate) fn operation_request_revision(operation: &OperationRecord) -> Option<i64> {
@@ -2831,6 +2724,36 @@ mod tests {
                 .is_some()
         );
         assert_eq!(after_action.pending_for(session).len(), 0);
+    }
+
+    #[test]
+    fn agent_02_state_reopens_with_its_journal_and_lock() {
+        let root = Scratch::new();
+        let session = Uuid::new_v4();
+        let store = open(&root, session);
+        assert_eq!(store.journal_path.file_name().unwrap(), "journal.sqlite3");
+        assert_eq!(store.journal_lock_path.file_name().unwrap(), "journal.lock");
+
+        // Agent 0.2 wrote the same schema under the original filename pair.
+        let mut existing = JournalStore {
+            journal_path: store.journal_path.with_file_name("origin-feed.sqlite3"),
+            journal_lock_path: store.journal_lock_path.with_file_name("origin-feed.lock"),
+        };
+        fs::rename(&store.journal_path, &existing.journal_path).unwrap();
+        fs::rename(&store.journal_lock_path, &existing.journal_lock_path).unwrap();
+        existing
+            .record_entry(entry(session, 1, "preserved"))
+            .unwrap();
+        let journal_id = existing.journal_id().unwrap();
+
+        let mut reopened = open(&root, session);
+        assert_eq!(reopened.journal_path, existing.journal_path);
+        assert_eq!(reopened.journal_lock_path, existing.journal_lock_path);
+        assert_eq!(reopened.journal_id().unwrap(), journal_id);
+        assert_eq!(reopened.cursor().unwrap(), 1);
+        reopened.record_entry(entry(session, 2, "new")).unwrap();
+        assert_eq!(existing.cursor().unwrap(), 2);
+        assert!(!store.journal_path.exists());
     }
 
     #[test]
