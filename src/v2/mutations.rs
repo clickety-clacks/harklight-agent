@@ -445,7 +445,6 @@ mod tests {
             session,
             "opaque/item",
             &report,
-            None,
             Some(key),
         )
         .unwrap_err();
@@ -505,7 +504,6 @@ mod tests {
             session,
             "opaque/item",
             &report,
-            None,
             None,
         )
         .unwrap_err();
