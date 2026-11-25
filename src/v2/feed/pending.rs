@@ -58,12 +58,13 @@ pub fn run(
     let rev = response["rev"].as_u64().ok_or(FeedError::InvalidSnapshot)?;
     let Some(token) = token else {
         let token = next_delivery_page(&response)?.ok_or(FeedError::InvalidSnapshot)?;
-        return Ok(emit_value(
-            &mut output,
-            json!({
-                "kind":"baseline_prepared", "session":session, "rev":rev, "token":token,
-            }),
-        )?);
+        let mut prepared = json!({
+            "kind":"baseline_prepared", "session":session, "rev":rev, "token":token,
+        });
+        if let Some(answers) = response["answers"].as_str() {
+            prepared["answers"] = json!(answers);
+        }
+        return Ok(emit_value(&mut output, prepared)?);
     };
 
     let mut visited = BTreeSet::from([token.to_owned()]);
