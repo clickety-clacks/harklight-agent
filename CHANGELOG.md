@@ -8,7 +8,6 @@
   fallback for messages from another sender.
 - Retract an open account message by item ID or unique message ID on a
   supporting Server.
-
 - Diagnose the Server's client certificate refusal. `listen --follow`
   repeats the diagnosis while reconnecting and still stops on an explicit
   revoked feed close. Reads and one-shot listens exit with the diagnosis.
