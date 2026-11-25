@@ -1,4 +1,6 @@
 //! Current editable Progress material, not a second history or recovery store.
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::*;
 
 pub(crate) fn is_progress(message: &Value) -> bool {
@@ -12,10 +14,7 @@ impl JournalStore {
         let ids = self.with_read(|db| {
             let mut query = db.prepare("SELECT DISTINCT message_id FROM operations WHERE session_handle=?1 AND message_id IS NOT NULL
                 AND json_extract(payload,'$.request.message.message_type')='fyi'
-                AND json_type(payload,'$.request.message.progress') IS NOT NULL
-                UNION SELECT request_id FROM entries WHERE session_handle=?1 AND request_id IS NOT NULL AND kind='revision' AND author='origin'
-                AND json_extract(payload,'$.raw.message.message_type')='fyi'
-                AND json_type(payload,'$.raw.message.progress') IS NOT NULL")?;
+                AND json_type(payload,'$.request.message.progress') IS NOT NULL")?;
             Ok(query.query_map([session.to_string()], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?)
         })?;
@@ -47,29 +46,13 @@ impl JournalStore {
                 .map(|s| serde_json::from_str(s).map_err(JournalError::from))
                 .collect::<Result<_, _>>()?
         };
-        let mut entries: Vec<JournalEntry> = {
-            let mut q = db.prepare(
-                "SELECT payload FROM entries WHERE session_handle=?1 AND request_id=?2
-                AND kind IN ('revision','terminal') ORDER BY feed_seq",
-            )?;
-            let rows = q
-                .query_map(params![session.to_string(), message_id], |r| {
-                    r.get::<_, String>(0)
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows.iter()
-                .map(|s| serde_json::from_str(s).map_err(JournalError::from))
-                .collect::<Result<_, _>>()?
-        };
         if !operations
             .iter()
             .any(|op| is_progress(&op.request["message"]))
-            && !entries
-                .iter()
-                .any(|entry| entry.author == "origin" && is_progress(&entry.raw["message"]))
         {
             return Ok(());
         }
+        let entries = retained_progress_entries(&db, session, message_id)?;
         let mut current: BTreeMap<String, (u64, Value)> = BTreeMap::new();
         let mut closed = BTreeSet::new();
         let mut referenced = BTreeSet::new();
@@ -168,21 +151,6 @@ impl JournalStore {
                 }
             }
         }
-        for entry in &mut entries {
-            if entry.author == "origin"
-                && entry.kind == "revision"
-                && is_progress(&entry.raw["message"])
-                && !entry
-                    .request_revision
-                    .is_some_and(|n| keep_revision(entry.sender_id.as_deref().unwrap_or(""), n))
-            {
-                let before = entry.raw.clone();
-                strip_file_payloads(&mut entry.raw);
-                if entry.raw != before {
-                    write_entry(&tx, entry)?;
-                }
-            }
-        }
         tx.commit()?;
         // Path metadata stays durable until deletion succeeds. A crash or
         // filesystem error is retried on the next ordinary journal operation.
@@ -205,6 +173,44 @@ impl JournalStore {
     }
 }
 
+#[derive(Deserialize)]
+struct RetainedProgressEntry {
+    kind: String,
+    author: String,
+    sender_id: Option<String>,
+    request_revision: Option<u64>,
+    raw: Value,
+}
+
+fn retained_progress_entries(
+    db: &Connection,
+    session: Uuid,
+    message_id: &str,
+) -> Result<Vec<RetainedProgressEntry>, JournalError> {
+    // Existing journals can still contain history that governs which Progress
+    // attachments stay available. Consult that data without modifying it.
+    let has_entries: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='entries')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_entries {
+        return Ok(Vec::new());
+    }
+    let mut query = db.prepare(
+        "SELECT payload FROM entries WHERE session_handle=?1 AND request_id=?2
+         AND kind IN ('revision','terminal') ORDER BY feed_seq",
+    )?;
+    let rows = query
+        .query_map(params![session.to_string(), message_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.iter()
+        .map(|payload| serde_json::from_str(payload).map_err(JournalError::from))
+        .collect()
+}
+
 fn operation_sender(op: &OperationRecord) -> &str {
     op.request["message"]["sender_id"]
         .as_str()
@@ -214,6 +220,8 @@ fn operation_sender(op: &OperationRecord) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
     use serde_json::json;
 
@@ -252,7 +260,7 @@ mod tests {
             )
             .unwrap();
         let sent = json!({"message":{"item_id":"progress","sender":"app:test","session":session,"revision":1}});
-        store.settle_operation(first, sent.clone(), None).unwrap();
+        store.settle_operation(first, sent.clone()).unwrap();
         assert!(path.exists());
         let pending = Uuid::new_v4();
         store
@@ -284,7 +292,7 @@ mod tests {
             )
             .unwrap();
         store
-            .settle_operation(next, json!({"type":"ok","revision":2}), None)
+            .settle_operation(next, json!({"type":"ok","revision":2}))
             .unwrap();
         assert!(
             path.exists(),

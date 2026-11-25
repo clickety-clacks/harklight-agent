@@ -2,7 +2,6 @@
 use std::process;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     thread,
@@ -33,33 +32,8 @@ pub enum JournalError {
     Database(#[from] rusqlite::Error),
     #[error("journal database uses an unsupported schema; Agent requires schema 2")]
     UnsupportedSchema,
-    #[error("journal database is missing its cursor")]
-    MissingCursor,
     #[error("journal database cursor is invalid")]
     InvalidCursor,
-    #[error("feed sequence {sequence} does not follow cursor {cursor}")]
-    FeedGap { cursor: u64, sequence: u64 },
-    #[error("feed sequence {sequence} was replayed with different content")]
-    FeedConflict { sequence: u64 },
-    #[error(
-        "advisory sequence {sequence} does not follow cursor {cursor} for session {session_handle}"
-    )]
-    AdvisoryGap {
-        session_handle: Uuid,
-        cursor: u64,
-        sequence: u64,
-    },
-    #[error(
-        "advisory sequence {sequence} was replayed with different content for session {session_handle}"
-    )]
-    AdvisoryConflict { session_handle: Uuid, sequence: u64 },
-    #[error("advisory {advisory_id} is not in the durable journal for session {session_handle}")]
-    MissingAdvisory {
-        session_handle: Uuid,
-        advisory_id: Uuid,
-    },
-    #[error("advisory journal contains invalid id {0}")]
-    InvalidAdvisoryId(String),
     #[error("operation key {0} was already used with different content")]
     OperationConflict(Uuid),
     #[error("local message reference already has a different server item ID")]
@@ -70,207 +44,6 @@ pub enum JournalError {
     MissingOperation(Uuid),
     #[error("operation {op_id} is {state}; only an unresolved operation can be abandoned")]
     NotUnresolved { op_id: Uuid, state: &'static str },
-    #[error("journal has no entry for event {0}")]
-    MissingEvent(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Journal {
-    schema: u32,
-    pub cursor: u64,
-    pub entries: BTreeMap<u64, JournalEntry>,
-    pub operations: BTreeMap<Uuid, OperationRecord>,
-}
-
-impl Journal {
-    pub fn pending_for(&self, session_handle: Uuid) -> Vec<&JournalEntry> {
-        let closed_requests: std::collections::BTreeSet<_> = self
-            .entries
-            .values()
-            .filter(|entry| entry.kind == "terminal")
-            .filter_map(JournalEntry::request_key)
-            .collect();
-        let answered_requests: std::collections::BTreeSet<_> = self
-            .entries
-            .values()
-            .filter(|entry| entry.kind == "terminal" && entry.raw["terminal_state"] == "answered")
-            .filter_map(JournalEntry::request_key)
-            .collect();
-
-        self.entries
-            .values()
-            .filter(|entry| entry.session_handle == session_handle)
-            .filter(|entry| entry.actionable && entry.acted_at_ms.is_none())
-            .filter(|entry| match entry.kind.as_str() {
-                "discussion" => entry.request_key().is_none_or(|key| {
-                    !closed_requests.contains(&key)
-                        || (entry.raw["channel"] == "chat" && answered_requests.contains(&key))
-                }),
-                "terminal" if entry.raw["terminal_state"] != "answered" => {
-                    entry.delivered_at_ms.is_none()
-                }
-                "terminal" => true,
-                _ => false,
-            })
-            .collect()
-    }
-
-    pub fn entry_by_event(&self, event_id: &str) -> Option<&JournalEntry> {
-        self.entries
-            .values()
-            .find(|entry| entry.event_id == event_id)
-    }
-
-    pub fn unknown_operations(&self) -> impl Iterator<Item = &OperationRecord> {
-        self.operations.values().filter(|operation| {
-            matches!(
-                operation.state,
-                OperationState::Prepared | OperationState::Unknown
-            )
-        })
-    }
-
-    pub fn unknown_operations_for(
-        &self,
-        session_handle: Uuid,
-    ) -> impl Iterator<Item = &OperationRecord> {
-        self.unknown_operations()
-            .filter(move |operation| operation.session_handle == session_handle)
-    }
-
-    pub fn pending_acknowledgements_for(
-        &self,
-        session_handle: Uuid,
-    ) -> impl Iterator<Item = &JournalEntry> {
-        self.entries.values().filter(move |entry| {
-            entry.session_handle == session_handle
-                && entry.ack_pending_at_ms.is_some()
-                && entry.delivered_at_ms.is_none()
-        })
-    }
-
-    pub fn latest_request(
-        &self,
-        session_handle: Uuid,
-        sender_id: &str,
-        message_id: &str,
-    ) -> Option<&JournalEntry> {
-        self.entries.values().rev().find(|entry| {
-            entry.session_handle == session_handle
-                && entry.sender_id.as_deref() == Some(sender_id)
-                && entry.request_id.as_deref() == Some(message_id)
-                && entry.kind == "revision"
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalEntry {
-    pub feed_seq: u64,
-    pub event_id: String,
-    pub session_handle: Uuid,
-    pub kind: String,
-    pub author: String,
-    pub actionable: bool,
-    pub sender_id: Option<String>,
-    pub request_id: Option<String>,
-    pub request_revision: Option<u64>,
-    pub raw: Value,
-    pub journaled_at_ms: u64,
-    pub emitted_at_ms: Option<u64>,
-    pub ack_pending_at_ms: Option<u64>,
-    pub delivered_at_ms: Option<u64>,
-    pub acted_at_ms: Option<u64>,
-    pub file_transfers: BTreeMap<String, FileTransfer>,
-}
-
-impl JournalEntry {
-    pub fn fetched(
-        feed_seq: u64,
-        event_id: String,
-        session_handle: Uuid,
-        kind: String,
-        author: String,
-        actionable: bool,
-        sender_id: Option<String>,
-        request_id: Option<String>,
-        request_revision: Option<u64>,
-        raw: Value,
-    ) -> Self {
-        Self {
-            feed_seq,
-            event_id,
-            session_handle,
-            kind,
-            actionable: actionable && author != "origin",
-            author,
-            sender_id,
-            request_id,
-            request_revision,
-            raw,
-            journaled_at_ms: now_ms(),
-            emitted_at_ms: None,
-            ack_pending_at_ms: None,
-            delivered_at_ms: None,
-            acted_at_ms: None,
-            file_transfers: BTreeMap::new(),
-        }
-    }
-
-    pub fn own_entry(&self) -> bool {
-        self.author == "origin"
-    }
-
-    fn request_key(&self) -> Option<(Uuid, String, String)> {
-        Some((
-            self.session_handle,
-            self.sender_id.clone()?,
-            self.request_id.clone()?,
-        ))
-    }
-}
-
-/// One immutable advisory payload plus local delivery bookkeeping. Advisory
-/// sequence and receipt state are stored separately from ordinary feed rows.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdvisoryEntry {
-    pub session_handle: Uuid,
-    pub advisory_seq: u64,
-    pub advisory_id: Uuid,
-    pub origin_cursor_at_decision: u64,
-    pub raw: Value,
-    pub journaled_at_ms: u64,
-    pub emitted_at_ms: Option<u64>,
-    pub delivered: bool,
-}
-
-impl AdvisoryEntry {
-    pub fn fetched(
-        session_handle: Uuid,
-        advisory_seq: u64,
-        advisory_id: Uuid,
-        origin_cursor_at_decision: u64,
-        raw: Value,
-        delivered: bool,
-    ) -> Self {
-        Self {
-            session_handle,
-            advisory_seq,
-            advisory_id,
-            origin_cursor_at_decision,
-            raw,
-            journaled_at_ms: now_ms(),
-            emitted_at_ms: None,
-            delivered,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileTransfer {
-    pub path: Option<PathBuf>,
-    pub transferred: bool,
-    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,27 +167,9 @@ impl JournalStore {
     fn initialize(&self) -> Result<(), JournalError> {
         let _guard = open_lock_file(&self.journal_lock_path)?;
         _guard.lock_exclusive()?;
-        let mut connection = self.open_connection()?;
+        let connection = self.open_connection()?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS entries (
-                feed_seq TEXT PRIMARY KEY NOT NULL, event_id TEXT NOT NULL UNIQUE,
-                session_handle TEXT NOT NULL, kind TEXT NOT NULL, author TEXT NOT NULL,
-                actionable INTEGER NOT NULL, sender_id TEXT, request_id TEXT,
-                terminal_state TEXT, in_reply_to TEXT, result_status TEXT,
-                pending_active INTEGER NOT NULL,
-                emitted_at_ms INTEGER, ack_pending_at_ms INTEGER, delivered_at_ms INTEGER,
-                acted_at_ms INTEGER, payload TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS entries_by_session_request
-                ON entries(session_handle, sender_id, request_id, feed_seq);
-             CREATE INDEX IF NOT EXISTS entries_by_session_message
-                ON entries(session_handle, request_id, feed_seq);
-             CREATE INDEX IF NOT EXISTS entries_pending_by_session
-                ON entries(session_handle, feed_seq) WHERE pending_active = 1;
-             CREATE INDEX IF NOT EXISTS entries_ack_pending_by_session
-                ON entries(session_handle, feed_seq)
-                WHERE ack_pending_at_ms IS NOT NULL AND delivered_at_ms IS NULL;
              CREATE TABLE IF NOT EXISTS operations (
                 op_id TEXT PRIMARY KEY NOT NULL, session_handle TEXT NOT NULL,
                 kind TEXT NOT NULL, state TEXT NOT NULL, message_id TEXT,
@@ -431,17 +186,6 @@ impl JournalStore {
                 sender TEXT NOT NULL, local_id TEXT NOT NULL, item_id TEXT NOT NULL,
                 PRIMARY KEY(sender, local_id)
              );
-             CREATE TABLE IF NOT EXISTS advisory_cursors (
-                session_handle TEXT PRIMARY KEY NOT NULL, cursor TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS advisories (
-                session_handle TEXT NOT NULL, advisory_seq TEXT NOT NULL,
-                advisory_id TEXT NOT NULL, origin_cursor_at_decision TEXT NOT NULL,
-                delivered INTEGER NOT NULL DEFAULT 0, emitted_at_ms INTEGER,
-                journaled_at_ms INTEGER NOT NULL, payload TEXT NOT NULL,
-                PRIMARY KEY(session_handle, advisory_seq),
-                UNIQUE(session_handle, advisory_id)
-             );
              CREATE INDEX IF NOT EXISTS operations_by_session_message
                 ON operations(session_handle, message_id, op_id);
              CREATE INDEX IF NOT EXISTS operations_pending_by_session
@@ -449,47 +193,29 @@ impl JournalStore {
                 WHERE state IN ('prepared', 'unknown');",
         )?;
 
-        let initialized: Option<String> = connection
-            .query_row("SELECT value FROM meta WHERE key='cursor'", [], |row| {
+        let schema: Option<String> = connection
+            .query_row("SELECT value FROM meta WHERE key='schema'", [], |row| {
                 row.get(0)
             })
             .optional()?;
-        if initialized.is_none() {
-            let tx = connection.transaction()?;
-            tx.execute(
-                "INSERT INTO meta(key,value) VALUES('schema','2')
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [],
-            )?;
-            write_cursor(&tx, 0)?;
-            tx.commit()?;
-            if let Some(parent) = self.journal_path.parent() {
-                File::open(parent)?.sync_all()?;
+        match schema.as_deref() {
+            Some("2") => {}
+            None => {
+                let has_origin_cursor = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM meta WHERE key='cursor')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if has_origin_cursor {
+                    return Err(JournalError::UnsupportedSchema);
+                }
+                connection.execute("INSERT INTO meta(key,value) VALUES('schema','2')", [])?;
+                if let Some(parent) = self.journal_path.parent() {
+                    File::open(parent)?.sync_all()?;
+                }
             }
-        } else {
-            let schema: Option<String> = connection
-                .query_row("SELECT value FROM meta WHERE key='schema'", [], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            if schema.as_deref() != Some("2") {
-                return Err(JournalError::UnsupportedSchema);
-            }
+            Some(_) => return Err(JournalError::UnsupportedSchema),
         }
-
-        connection.execute_batch(
-            "CREATE INDEX IF NOT EXISTS entries_by_session_request_kind
-                ON entries(session_handle, request_id, kind, feed_seq DESC);
-             CREATE INDEX IF NOT EXISTS entries_result_by_target
-                ON entries(session_handle, request_id, in_reply_to, result_status, feed_seq DESC)
-                WHERE kind='result';
-             CREATE INDEX IF NOT EXISTS operations_pending_by_request
-                ON operations(session_handle, message_id, op_id)
-                WHERE state IN ('prepared', 'unknown');
-             CREATE INDEX IF NOT EXISTS operations_committed_revision_by_request
-                ON operations(session_handle, message_id, request_revision DESC)
-                WHERE state='committed' AND kind IN ('send', 'revise');",
-        )?;
         Ok(())
     }
 
@@ -555,407 +281,8 @@ impl JournalStore {
         })
     }
 
-    pub fn cursor(&self) -> Result<u64, JournalError> {
-        self.with_read(read_cursor)
-    }
-
-    pub fn advisory_cursor(&self, session_handle: Uuid) -> Result<u64, JournalError> {
-        self.with_read(|connection| read_advisory_cursor(connection, session_handle))
-    }
-
-    /// Persist a complete advisory-feed response and its cursor atomically.
-    /// The ordinary feed cursor is deliberately untouched.
-    pub fn record_advisory_batch(
-        &mut self,
-        session_handle: Uuid,
-        since: u64,
-        high_water: u64,
-        entries: &[AdvisoryEntry],
-    ) -> Result<(), JournalError> {
-        self.with_transaction(|tx| {
-            let cursor = read_advisory_cursor(tx, session_handle)?;
-            if since > cursor || high_water < since {
-                return Err(JournalError::InvalidCursor);
-            }
-
-            let mut expected = since.checked_add(1);
-            let mut stored_cursor = cursor;
-            for entry in entries {
-                if entry.session_handle != session_handle || expected != Some(entry.advisory_seq) {
-                    return Err(JournalError::AdvisoryGap {
-                        session_handle,
-                        cursor: expected.map_or(since, |value| value.saturating_sub(1)),
-                        sequence: entry.advisory_seq,
-                    });
-                }
-                expected = entry.advisory_seq.checked_add(1);
-
-                if entry.advisory_seq <= cursor {
-                    let existing = read_advisory_by_seq(tx, session_handle, entry.advisory_seq)?
-                        .ok_or(JournalError::AdvisoryConflict {
-                            session_handle,
-                            sequence: entry.advisory_seq,
-                        })?;
-                    if existing.advisory_id != entry.advisory_id
-                        || existing.origin_cursor_at_decision != entry.origin_cursor_at_decision
-                        || existing.raw != entry.raw
-                    {
-                        return Err(JournalError::AdvisoryConflict {
-                            session_handle,
-                            sequence: entry.advisory_seq,
-                        });
-                    }
-                    if entry.delivered && !existing.delivered {
-                        tx.execute(
-                            "UPDATE advisories SET delivered=1
-                             WHERE session_handle=?1 AND advisory_seq=?2",
-                            params![session_handle.to_string(), entry.advisory_seq.to_string()],
-                        )?;
-                    }
-                    continue;
-                }
-
-                if stored_cursor.checked_add(1) != Some(entry.advisory_seq) {
-                    return Err(JournalError::AdvisoryGap {
-                        session_handle,
-                        cursor: stored_cursor,
-                        sequence: entry.advisory_seq,
-                    });
-                }
-                let payload = serde_json::to_string(&entry.raw)?;
-                tx.execute(
-                    "INSERT INTO advisories(
-                        session_handle, advisory_seq, advisory_id,
-                        origin_cursor_at_decision, delivered, emitted_at_ms,
-                        journaled_at_ms, payload
-                     ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![
-                        session_handle.to_string(),
-                        entry.advisory_seq.to_string(),
-                        entry.advisory_id.to_string(),
-                        entry.origin_cursor_at_decision.to_string(),
-                        i64::from(entry.delivered),
-                        entry.emitted_at_ms,
-                        entry.journaled_at_ms as i64,
-                        payload
-                    ],
-                )?;
-                stored_cursor = entry.advisory_seq;
-            }
-
-            if expected.map_or(high_water != since, |next| {
-                next.checked_sub(1) != Some(high_water)
-            }) {
-                return Err(JournalError::AdvisoryGap {
-                    session_handle,
-                    cursor: since,
-                    sequence: high_water,
-                });
-            }
-            if high_water > cursor {
-                write_advisory_cursor(tx, session_handle, high_water)?;
-            }
-            Ok(())
-        })
-    }
-
-    pub fn pending_advisories_for(
-        &self,
-        session_handle: Uuid,
-    ) -> Result<Vec<AdvisoryEntry>, JournalError> {
-        self.with_read(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT session_handle, advisory_seq, advisory_id,
-                        origin_cursor_at_decision, delivered, emitted_at_ms,
-                        journaled_at_ms, payload
-                 FROM advisories
-                 WHERE session_handle=?1 AND delivered=0",
-            )?;
-            let rows = statement.query_map([session_handle.to_string()], advisory_row)?;
-            let rows = rows.collect::<Result<Vec<_>, _>>()?;
-            let mut entries = rows
-                .into_iter()
-                .map(parse_advisory_row)
-                .collect::<Result<Vec<_>, _>>()?;
-            entries.sort_by_key(|entry| entry.advisory_seq);
-            Ok(entries)
-        })
-    }
-
-    pub fn advisory_by_id(
-        &self,
-        session_handle: Uuid,
-        advisory_id: Uuid,
-    ) -> Result<Option<AdvisoryEntry>, JournalError> {
-        self.with_read(|connection| {
-            let row = connection
-                .query_row(
-                    "SELECT session_handle, advisory_seq, advisory_id,
-                            origin_cursor_at_decision, delivered, emitted_at_ms,
-                            journaled_at_ms, payload
-                     FROM advisories WHERE session_handle=?1 AND advisory_id=?2",
-                    params![session_handle.to_string(), advisory_id.to_string()],
-                    advisory_row,
-                )
-                .optional()?;
-            row.map(parse_advisory_row).transpose()
-        })
-    }
-
-    pub fn mark_advisory_emitted(
-        &mut self,
-        session_handle: Uuid,
-        advisory_id: Uuid,
-    ) -> Result<(), JournalError> {
-        let changed = self.with_transaction(|tx| {
-            Ok(tx.execute(
-                "UPDATE advisories SET emitted_at_ms=COALESCE(emitted_at_ms,?3)
-                 WHERE session_handle=?1 AND advisory_id=?2",
-                params![
-                    session_handle.to_string(),
-                    advisory_id.to_string(),
-                    now_ms() as i64
-                ],
-            )?)
-        })?;
-        if changed == 0 {
-            return Err(JournalError::MissingAdvisory {
-                session_handle,
-                advisory_id,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn mark_advisory_delivered(
-        &mut self,
-        session_handle: Uuid,
-        advisory_id: Uuid,
-    ) -> Result<(), JournalError> {
-        let changed = self.with_transaction(|tx| {
-            Ok(tx.execute(
-                "UPDATE advisories SET delivered=1
-                 WHERE session_handle=?1 AND advisory_id=?2",
-                params![session_handle.to_string(), advisory_id.to_string()],
-            )?)
-        })?;
-        if changed == 0 {
-            return Err(JournalError::MissingAdvisory {
-                session_handle,
-                advisory_id,
-            });
-        }
-        Ok(())
-    }
-
-    pub fn snapshot(&self) -> Result<Journal, JournalError> {
-        self.with_read(|connection| {
-            let mut journal = Journal {
-                schema: 1,
-                cursor: read_cursor(connection)?,
-                entries: BTreeMap::new(),
-                operations: BTreeMap::new(),
-            };
-            let mut statement =
-                connection.prepare("SELECT payload FROM entries ORDER BY feed_seq")?;
-            let payloads = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            for payload in payloads {
-                let entry: JournalEntry = serde_json::from_str(&payload)?;
-                journal.entries.insert(entry.feed_seq, entry);
-            }
-            let mut statement = connection.prepare("SELECT payload FROM operations")?;
-            let payloads = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            for payload in payloads {
-                let operation: OperationRecord = serde_json::from_str(&payload)?;
-                journal.operations.insert(operation.op_id, operation);
-            }
-            Ok(journal)
-        })
-    }
-
-    pub fn request_snapshot(
-        &self,
-        session_handle: Uuid,
-        message_id: &str,
-        target_event_id: Option<&str>,
-    ) -> Result<Journal, JournalError> {
-        self.with_read(|connection| {
-            let mut journal = Journal {
-                schema: 1,
-                cursor: read_cursor(connection)?,
-                entries: BTreeMap::new(),
-                operations: BTreeMap::new(),
-            };
-            let session = session_handle.to_string();
-
-            for kind in ["revision", "terminal"] {
-                let payload: Option<String> = connection
-                    .query_row(
-                        "SELECT payload FROM entries
-                         WHERE session_handle=?1 AND request_id=?2 AND kind=?3
-                         ORDER BY feed_seq DESC LIMIT 1",
-                        params![session, message_id, kind],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(payload) = payload {
-                    let entry: JournalEntry = serde_json::from_str(&payload)?;
-                    journal.entries.insert(entry.feed_seq, entry);
-                }
-            }
-
-            if let Some(event_id) = target_event_id {
-                if let Some(entry) = read_entry_by_event(connection, event_id)? {
-                    journal.entries.insert(entry.feed_seq, entry);
-                }
-
-                let payload: Option<String> = connection
-                    .query_row(
-                        "SELECT payload FROM entries
-                         WHERE session_handle=?1 AND request_id=?2 AND kind='result'
-                           AND in_reply_to=?3 AND result_status='received'
-                         ORDER BY feed_seq DESC LIMIT 1",
-                        params![session, message_id, event_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(payload) = payload {
-                    let entry: JournalEntry = serde_json::from_str(&payload)?;
-                    journal.entries.insert(entry.feed_seq, entry);
-                }
-            }
-
-            let current_operation: Option<String> = connection
-                .query_row(
-                    "SELECT payload FROM operations
-                     WHERE session_handle=?1 AND message_id=?2 AND state='committed'
-                       AND kind IN ('send', 'revise') AND request_revision IS NOT NULL
-                     ORDER BY request_revision DESC LIMIT 1",
-                    params![session, message_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(payload) = current_operation {
-                let operation: OperationRecord = serde_json::from_str(&payload)?;
-                journal.operations.insert(operation.op_id, operation);
-            }
-
-            let pending_operation: Option<String> = connection
-                .query_row(
-                    "SELECT payload FROM operations
-                     WHERE session_handle=?1 AND message_id=?2
-                       AND state IN ('prepared', 'unknown')
-                     ORDER BY op_id LIMIT 1",
-                    params![session, message_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(payload) = pending_operation {
-                let operation: OperationRecord = serde_json::from_str(&payload)?;
-                journal.operations.insert(operation.op_id, operation);
-            }
-
-            Ok(journal)
-        })
-    }
-
-    pub fn entry_by_event(&self, event_id: &str) -> Result<Option<JournalEntry>, JournalError> {
-        self.with_read(|connection| read_entry_by_event(connection, event_id))
-    }
-
     pub fn operation(&self, op_id: Uuid) -> Result<Option<OperationRecord>, JournalError> {
         self.with_read(|connection| read_operation(connection, op_id))
-    }
-
-    /// Return operations for one origin session in the order they were first
-    /// journaled. This lets multi-step commands resume the exact pending step
-    /// before creating a later operation.
-    pub fn operations_for_session(
-        &self,
-        session_handle: Uuid,
-    ) -> Result<Vec<OperationRecord>, JournalError> {
-        self.with_read(|connection| {
-            let mut statement = connection
-                .prepare("SELECT payload FROM operations WHERE session_handle=?1 ORDER BY rowid")?;
-            let payloads = statement
-                .query_map([session_handle.to_string()], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            payloads
-                .into_iter()
-                .map(|payload| serde_json::from_str(&payload).map_err(JournalError::from))
-                .collect()
-        })
-    }
-
-    pub fn pending_for(&self, session_handle: Uuid) -> Result<Vec<JournalEntry>, JournalError> {
-        self.with_read(|connection| read_entry_list(
-            connection,
-            "SELECT payload FROM entries WHERE session_handle=?1 AND pending_active=1 ORDER BY feed_seq",
-            &session_handle.to_string(),
-        ))
-    }
-
-    /// One read of the active subset, regardless of how many old handles remain covered.
-    pub fn pending_for_coverage(
-        &self,
-        covered: &BTreeSet<Uuid>,
-    ) -> Result<Vec<JournalEntry>, JournalError> {
-        self.with_read(|connection| {
-            // The partial index keeps closed history out of this scan. Ordering by
-            // feed_seq may sort the active subset, never the lifetime journal.
-            let mut statement = connection.prepare(
-                "SELECT payload FROM entries INDEXED BY entries_pending_by_session \
-                 WHERE pending_active=1 ORDER BY feed_seq",
-            )?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-            let mut pending = Vec::new();
-            for row in rows {
-                let entry: JournalEntry = serde_json::from_str(&row?)?;
-                if covered.contains(&entry.session_handle) {
-                    pending.push(entry);
-                }
-            }
-            Ok(pending)
-        })
-    }
-
-    pub fn pending_acknowledgements_for(
-        &self,
-        session_handle: Uuid,
-    ) -> Result<Vec<JournalEntry>, JournalError> {
-        self.with_read(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT payload FROM entries WHERE session_handle=?1 AND ack_pending_at_ms IS NOT NULL AND delivered_at_ms IS NULL ORDER BY feed_seq",
-            )?;
-            let payloads = statement.query_map([session_handle.to_string()], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-            payloads.into_iter().map(|payload| serde_json::from_str(&payload).map_err(JournalError::from)).collect()
-        })
-    }
-
-    pub fn unknown_operations_for(
-        &self,
-        session_handle: Uuid,
-    ) -> Result<Vec<OperationRecord>, JournalError> {
-        self.with_read(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT payload FROM operations WHERE session_handle=?1 AND state IN ('prepared','unknown') ORDER BY op_id",
-            )?;
-            let payloads = statement.query_map([session_handle.to_string()], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
-            payloads.into_iter().map(|payload| serde_json::from_str(&payload).map_err(JournalError::from)).collect()
-        })
-    }
-
-    pub fn event_file_directory(&self, session_handle: Uuid, event_id: &str) -> PathBuf {
-        self.journal_path
-            .parent()
-            .expect("journal path has a parent")
-            .join("files")
-            .join(session_handle.to_string())
-            .join(event_id)
     }
 
     pub fn upload_staging_directory(&self, session_handle: Uuid, op_id: Uuid) -> PathBuf {
@@ -965,150 +292,6 @@ impl JournalStore {
             .join("upload-staging")
             .join(session_handle.to_string())
             .join(op_id.to_string())
-    }
-
-    pub fn record_entry(&mut self, entry: JournalEntry) -> Result<bool, JournalError> {
-        let session = entry.session_handle;
-        let request_id = entry.request_id.clone();
-        let result = self.with_transaction(|tx| {
-            let cursor = read_cursor(tx)?;
-            if entry.feed_seq <= cursor {
-                let mut existing =
-                    read_entry_by_seq(tx, entry.feed_seq)?.ok_or(JournalError::FeedConflict {
-                        sequence: entry.feed_seq,
-                    })?;
-                if existing.event_id != entry.event_id
-                    || existing.session_handle != entry.session_handle
-                    || existing.kind != entry.kind
-                    || existing.author != entry.author
-                    || immutable_entry(&existing.raw) != immutable_entry(&entry.raw)
-                {
-                    return Err(JournalError::FeedConflict {
-                        sequence: entry.feed_seq,
-                    });
-                }
-                let changed = merge_server_facts(&mut existing, &entry)
-                    | merge_local_file_transfers(&mut existing, &entry);
-                let reconciled = reconcile_own_entry(tx, &entry)?;
-                if changed {
-                    write_entry(tx, &existing)?;
-                }
-                return Ok(changed || reconciled);
-            }
-            if cursor.checked_add(1) != Some(entry.feed_seq) {
-                return Err(JournalError::FeedGap {
-                    cursor,
-                    sequence: entry.feed_seq,
-                });
-            }
-            let mut entry = entry;
-            merge_server_facts_into_new(&mut entry);
-            write_entry(tx, &entry)?;
-            if entry.kind == "terminal" {
-                if let Some((sender, request)) =
-                    entry.sender_id.as_deref().zip(entry.request_id.as_deref())
-                {
-                    close_pending_discussions(tx, entry.session_handle, sender, request)?;
-                }
-            }
-            write_cursor(tx, entry.feed_seq)?;
-            reconcile_own_entry(tx, &entry)?;
-            Ok(true)
-        });
-        if result.is_ok() {
-            if let Some(request_id) = request_id {
-                let _ = self.prune_progress_request(session, &request_id);
-            }
-        }
-        result
-    }
-
-    pub fn mark_emitted(&mut self, event_id: &str) -> Result<(), JournalError> {
-        self.update_entry(event_id, |entry| {
-            entry.emitted_at_ms.get_or_insert_with(now_ms);
-        })
-    }
-
-    pub fn mark_delivered(&mut self, event_id: &str) -> Result<(), JournalError> {
-        self.update_entry(event_id, |entry| {
-            entry.ack_pending_at_ms = None;
-            entry.delivered_at_ms.get_or_insert_with(now_ms);
-            if let Some(raw) = entry.raw.as_object_mut() {
-                raw.insert("delivered".into(), Value::Bool(true));
-            }
-        })
-    }
-
-    pub fn mark_ack_pending(&mut self, event_id: &str) -> Result<(), JournalError> {
-        self.update_entry(event_id, |entry| {
-            if entry.ack_pending_at_ms.is_none() && entry.delivered_at_ms.is_none() {
-                entry.ack_pending_at_ms = Some(now_ms());
-            }
-        })
-    }
-
-    pub fn mark_acted(&mut self, event_id: &str) -> Result<(), JournalError> {
-        self.update_entry(event_id, |entry| {
-            entry.acted_at_ms.get_or_insert_with(now_ms);
-            if let Some(raw) = entry.raw.as_object_mut() {
-                raw.insert("acted".into(), Value::Bool(true));
-            }
-        })
-    }
-
-    pub fn record_file_transfer(
-        &mut self,
-        event_id: &str,
-        file_name: String,
-        transfer: FileTransfer,
-    ) -> Result<(), JournalError> {
-        self.update_entry(event_id, move |entry| {
-            entry.file_transfers.insert(file_name, transfer);
-        })
-    }
-
-    pub fn record_server_file_transfers(
-        &mut self,
-        event_id: &str,
-        transfers: Value,
-    ) -> Result<(), JournalError> {
-        self.update_entry(event_id, move |entry| {
-            if let Some(raw) = entry.raw.as_object_mut() {
-                raw.insert("file_transfers".into(), transfers);
-            }
-        })
-    }
-
-    pub fn record_server_file_use(
-        &mut self,
-        event_id: &str,
-        file_name: &str,
-        outcome: Value,
-    ) -> Result<(), JournalError> {
-        let file_name = file_name.to_owned();
-        self.update_entry(event_id, move |entry| {
-            if let Some(raw) = entry.raw.as_object_mut() {
-                let uses = raw
-                    .entry("file_use")
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                if let Some(uses) = uses.as_object_mut() {
-                    uses.insert(file_name, outcome);
-                }
-            }
-        })
-    }
-
-    fn update_entry(
-        &self,
-        event_id: &str,
-        update: impl FnOnce(&mut JournalEntry),
-    ) -> Result<(), JournalError> {
-        self.with_transaction(|tx| {
-            let mut entry = read_entry_by_event(tx, event_id)?
-                .ok_or_else(|| JournalError::MissingEvent(event_id.to_owned()))?;
-            update(&mut entry);
-            write_entry(tx, &entry)
-        })
     }
 
     pub fn prepare_v2_operation(
@@ -1252,52 +435,6 @@ impl JournalStore {
         })
     }
 
-    pub fn record_operation_upload(
-        &mut self,
-        op_id: Uuid,
-        file_name: &str,
-        upload_id: String,
-    ) -> Result<(), JournalError> {
-        let file_name = file_name.to_owned();
-        self.update_operation(op_id, move |operation| {
-            let source = operation
-                .uploads
-                .iter()
-                .find(|source| source.name == file_name)
-                .ok_or(JournalError::OperationConflict(op_id))?;
-            if let Some(existing) = source.upload_id.as_deref() {
-                if existing != upload_id {
-                    return Err(JournalError::OperationConflict(op_id));
-                }
-                return Ok(false);
-            }
-            let (size, sha256, name) = (
-                source.size_bytes,
-                source.sha256.clone(),
-                source.name.clone(),
-            );
-            operation
-                .uploads
-                .iter_mut()
-                .find(|source| source.name == file_name)
-                .ok_or(JournalError::OperationConflict(op_id))?
-                .upload_id = Some(upload_id.clone());
-            let files = operation.request["files"]
-                .as_array_mut()
-                .ok_or(JournalError::OperationConflict(op_id))?;
-            let slot = files
-                .iter_mut()
-                .find(|file| {
-                    file["name"].as_str() == Some(file_name.as_str())
-                        && file["upload_pending"] == true
-                })
-                .ok_or(JournalError::OperationConflict(op_id))?;
-            *slot =
-                serde_json::json!({"name":name,"upload_id":upload_id,"size":size,"sha256":sha256});
-            Ok(true)
-        })
-    }
-
     fn update_operation(
         &self,
         op_id: Uuid,
@@ -1369,13 +506,7 @@ impl JournalStore {
         })
     }
 
-    pub fn settle_operation(
-        &mut self,
-        op_id: Uuid,
-        response: Value,
-        acted_event_id: Option<&str>,
-    ) -> Result<(), JournalError> {
-        let acted_event_id = acted_event_id.map(str::to_owned);
+    pub fn settle_operation(&mut self, op_id: Uuid, response: Value) -> Result<(), JournalError> {
         let result = self.with_transaction(|tx| {
             let mut operation =
                 read_operation(tx, op_id)?.ok_or(JournalError::MissingOperation(op_id))?;
@@ -1407,18 +538,6 @@ impl JournalStore {
             }
             operation.response = Some(redact_file_payloads(&response));
             write_operation(tx, &operation)?;
-            if let Some(event_id) = acted_event_id {
-                let mut entry = read_entry_by_event(tx, &event_id)?
-                    .ok_or_else(|| JournalError::MissingEvent(event_id.clone()))?;
-                if entry.session_handle != session || !entry.actionable {
-                    return Err(JournalError::MissingEvent(event_id));
-                }
-                entry.acted_at_ms.get_or_insert_with(now_ms);
-                if let Some(raw) = entry.raw.as_object_mut() {
-                    raw.insert("acted".into(), Value::Bool(true));
-                }
-                write_entry(tx, &entry)?;
-            }
             Ok(())
         });
         if result.is_ok() {
@@ -1538,214 +657,6 @@ fn operation_state_name(state: OperationState) -> &'static str {
     }
 }
 
-fn read_cursor(connection: &Connection) -> Result<u64, JournalError> {
-    let value: Option<String> = connection
-        .query_row("SELECT value FROM meta WHERE key='cursor'", [], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    value
-        .ok_or(JournalError::MissingCursor)?
-        .parse()
-        .map_err(|_| JournalError::InvalidCursor)
-}
-
-fn read_advisory_cursor(
-    connection: &Connection,
-    session_handle: Uuid,
-) -> Result<u64, JournalError> {
-    let value: Option<String> = connection
-        .query_row(
-            "SELECT cursor FROM advisory_cursors WHERE session_handle=?1",
-            [session_handle.to_string()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    value
-        .map(|value| value.parse().map_err(|_| JournalError::InvalidCursor))
-        .unwrap_or(Ok(0))
-}
-
-fn write_advisory_cursor(
-    tx: &Transaction<'_>,
-    session_handle: Uuid,
-    cursor: u64,
-) -> Result<(), JournalError> {
-    tx.execute(
-        "INSERT INTO advisory_cursors(session_handle,cursor) VALUES(?1,?2)
-         ON CONFLICT(session_handle) DO UPDATE SET cursor=excluded.cursor",
-        params![session_handle.to_string(), cursor.to_string()],
-    )?;
-    Ok(())
-}
-
-type AdvisoryRow = (
-    String,
-    String,
-    String,
-    String,
-    i64,
-    Option<i64>,
-    i64,
-    String,
-);
-
-fn advisory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdvisoryRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
-}
-
-fn parse_advisory_row(row: AdvisoryRow) -> Result<AdvisoryEntry, JournalError> {
-    let (session, sequence, id, origin_cursor, delivered, emitted_at, journaled_at, payload) = row;
-    let session_handle =
-        Uuid::parse_str(&session).map_err(|_| JournalError::InvalidAdvisoryId(session.clone()))?;
-    let advisory_id =
-        Uuid::parse_str(&id).map_err(|_| JournalError::InvalidAdvisoryId(id.clone()))?;
-    let parse_u64 = |value: &str| value.parse().map_err(|_| JournalError::InvalidCursor);
-    let parse_time = |value: Option<i64>| {
-        value
-            .map(|value| u64::try_from(value).map_err(|_| JournalError::InvalidCursor))
-            .transpose()
-    };
-    let delivered = match delivered {
-        0 => false,
-        1 => true,
-        _ => return Err(JournalError::InvalidCursor),
-    };
-    Ok(AdvisoryEntry {
-        session_handle,
-        advisory_seq: parse_u64(&sequence)?,
-        advisory_id,
-        origin_cursor_at_decision: parse_u64(&origin_cursor)?,
-        raw: serde_json::from_str(&payload)?,
-        journaled_at_ms: u64::try_from(journaled_at).map_err(|_| JournalError::InvalidCursor)?,
-        emitted_at_ms: parse_time(emitted_at)?,
-        delivered,
-    })
-}
-
-fn read_advisory_by_seq(
-    connection: &Connection,
-    session_handle: Uuid,
-    advisory_seq: u64,
-) -> Result<Option<AdvisoryEntry>, JournalError> {
-    let row = connection
-        .query_row(
-            "SELECT session_handle, advisory_seq, advisory_id,
-                    origin_cursor_at_decision, delivered, emitted_at_ms,
-                    journaled_at_ms, payload
-             FROM advisories WHERE session_handle=?1 AND advisory_seq=?2",
-            params![session_handle.to_string(), advisory_seq.to_string()],
-            advisory_row,
-        )
-        .optional()?;
-    row.map(parse_advisory_row).transpose()
-}
-
-fn write_cursor(tx: &Transaction<'_>, cursor: u64) -> Result<(), JournalError> {
-    tx.execute(
-        "INSERT INTO meta(key,value) VALUES('cursor',?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [cursor.to_string()],
-    )?;
-    Ok(())
-}
-
-fn entry_pending_active(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<bool, JournalError> {
-    if !entry.actionable || entry.acted_at_ms.is_some() {
-        return Ok(false);
-    }
-    match entry.kind.as_str() {
-        "discussion" => {
-            let Some((sender_id, request_id)) =
-                entry.sender_id.as_deref().zip(entry.request_id.as_deref())
-            else {
-                return Ok(true);
-            };
-            let terminal_state: Option<String> = tx
-                .query_row(
-                    "SELECT terminal_state FROM entries
-                     WHERE session_handle=?1 AND sender_id=?2 AND request_id=?3 AND kind='terminal'
-                     ORDER BY feed_seq DESC LIMIT 1",
-                    params![entry.session_handle.to_string(), sender_id, request_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(match terminal_state.as_deref() {
-                None => true,
-                Some("answered") => entry.raw["channel"] == "chat",
-                Some(_) => false,
-            })
-        }
-        "terminal" if entry.raw["terminal_state"] == "answered" => Ok(true),
-        "terminal" => Ok(entry.delivered_at_ms.is_none()),
-        _ => Ok(false),
-    }
-}
-
-fn write_entry(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<(), JournalError> {
-    let payload = serde_json::to_string(entry)?;
-    let pending_active = entry_pending_active(tx, entry)?;
-    let terminal_state = entry.raw["terminal_state"].as_str();
-    tx.execute(
-        "INSERT INTO entries(
-            feed_seq,event_id,session_handle,kind,author,actionable,sender_id,request_id,
-            terminal_state,in_reply_to,result_status,pending_active,emitted_at_ms,
-            ack_pending_at_ms,delivered_at_ms,acted_at_ms,payload
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-         ON CONFLICT(feed_seq) DO UPDATE SET
-            event_id=excluded.event_id,session_handle=excluded.session_handle,kind=excluded.kind,
-            author=excluded.author,actionable=excluded.actionable,sender_id=excluded.sender_id,
-            request_id=excluded.request_id,terminal_state=excluded.terminal_state,
-            in_reply_to=excluded.in_reply_to,result_status=excluded.result_status,
-            pending_active=excluded.pending_active,emitted_at_ms=excluded.emitted_at_ms,
-            ack_pending_at_ms=excluded.ack_pending_at_ms,delivered_at_ms=excluded.delivered_at_ms,
-            acted_at_ms=excluded.acted_at_ms,payload=excluded.payload",
-        params![
-            encode_sequence(entry.feed_seq),
-            entry.event_id,
-            entry.session_handle.to_string(),
-            entry.kind,
-            entry.author,
-            if entry.actionable { 1i64 } else { 0i64 },
-            entry.sender_id,
-            entry.request_id,
-            terminal_state,
-            entry.raw["in_reply_to"].as_str(),
-            entry.raw["status"].as_str(),
-            if pending_active { 1i64 } else { 0i64 },
-            entry.emitted_at_ms.map(|value| value as i64),
-            entry.ack_pending_at_ms.map(|value| value as i64),
-            entry.delivered_at_ms.map(|value| value as i64),
-            entry.acted_at_ms.map(|value| value as i64),
-            payload
-        ],
-    )?;
-    Ok(())
-}
-
-fn close_pending_discussions(
-    tx: &Transaction<'_>,
-    session_handle: Uuid,
-    sender_id: &str,
-    request_id: &str,
-) -> Result<(), JournalError> {
-    tx.execute(
-        "UPDATE entries SET pending_active=0
-         WHERE session_handle=?1 AND sender_id=?2 AND request_id=?3 AND kind='discussion'",
-        params![session_handle.to_string(), sender_id, request_id],
-    )?;
-    Ok(())
-}
-
 fn write_operation(tx: &Transaction<'_>, operation: &OperationRecord) -> Result<(), JournalError> {
     let payload = serde_json::to_string(operation)?;
     let message_id = operation.request["message"]["message_id"]
@@ -1773,38 +684,6 @@ fn write_operation(tx: &Transaction<'_>, operation: &OperationRecord) -> Result<
         ],
     )?;
     Ok(())
-}
-
-fn read_entry_by_seq(
-    connection: &Connection,
-    sequence: u64,
-) -> Result<Option<JournalEntry>, JournalError> {
-    let payload: Option<String> = connection
-        .query_row(
-            "SELECT payload FROM entries WHERE feed_seq=?1",
-            [encode_sequence(sequence)],
-            |row| row.get(0),
-        )
-        .optional()?;
-    payload
-        .map(|payload| serde_json::from_str(&payload).map_err(JournalError::from))
-        .transpose()
-}
-
-fn read_entry_by_event(
-    connection: &Connection,
-    event_id: &str,
-) -> Result<Option<JournalEntry>, JournalError> {
-    let payload: Option<String> = connection
-        .query_row(
-            "SELECT payload FROM entries WHERE event_id=?1",
-            [event_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    payload
-        .map(|payload| serde_json::from_str(&payload).map_err(JournalError::from))
-        .transpose()
 }
 
 fn read_v2_item_id(
@@ -1857,33 +736,6 @@ fn read_operation(
         .transpose()
 }
 
-fn read_entry_list(
-    connection: &Connection,
-    query: &str,
-    session: &str,
-) -> Result<Vec<JournalEntry>, JournalError> {
-    let mut statement = connection.prepare(query)?;
-    let payloads = statement
-        .query_map([session], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    payloads
-        .into_iter()
-        .map(|payload| serde_json::from_str(&payload).map_err(JournalError::from))
-        .collect()
-}
-
-fn immutable_entry(value: &Value) -> Value {
-    let mut value = value.clone();
-    strip_file_payloads(&mut value);
-    if let Some(object) = value.as_object_mut() {
-        object.remove("delivered");
-        object.remove("acted");
-        object.remove("file_transfers");
-        object.remove("file_use");
-    }
-    value
-}
-
 fn strip_file_payloads(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -1932,209 +784,6 @@ fn redact_prepared_send(operation: &mut OperationRecord) {
 fn operation_requests_equivalent(left: &Value, right: &Value) -> bool {
     redact_file_payloads(left) == redact_file_payloads(right)
 }
-
-fn reconcile_own_entry(tx: &Transaction<'_>, entry: &JournalEntry) -> Result<bool, JournalError> {
-    if !entry.own_entry() {
-        return Ok(false);
-    }
-
-    let mut changed = false;
-    if let Some(source_event_id) = entry.raw["in_reply_to"].as_str() {
-        if let Some(mut source) = read_entry_by_event(tx, source_event_id)? {
-            if source.session_handle == entry.session_handle
-                && source.actionable
-                && source.acted_at_ms.is_none()
-            {
-                source.acted_at_ms = Some(now_ms());
-                if let Some(raw) = source.raw.as_object_mut() {
-                    raw.insert("acted".into(), Value::Bool(true));
-                }
-                write_entry(tx, &source)?;
-                changed = true;
-            }
-        }
-    }
-
-    let mut matching = Vec::new();
-    if let Some(entry_op_id) = entry.raw["op_id"].as_str() {
-        if let Ok(op_id) = Uuid::parse_str(entry_op_id) {
-            if let Some(operation) = read_operation(tx, op_id)? {
-                if operation.state == OperationState::Unknown
-                    && operation_matches_entry(&operation, entry)
-                {
-                    matching.push(operation);
-                }
-            }
-        }
-    } else if let Some(message_id) = entry.request_id.as_deref() {
-        let mut statement = tx.prepare(
-            "SELECT payload FROM operations
-             WHERE session_handle=?1 AND message_id=?2 AND state='unknown'",
-        )?;
-        let payloads = statement
-            .query_map(
-                params![entry.session_handle.to_string(), message_id],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        for payload in payloads {
-            let operation: OperationRecord = serde_json::from_str(&payload)?;
-            if operation_matches_entry(&operation, entry) {
-                matching.push(operation);
-            }
-        }
-    }
-
-    if matching.len() == 1 {
-        let mut operation = matching.remove(0);
-        operation.state = OperationState::Committed;
-        operation.updated_at_ms = now_ms();
-        if !is_progress(&operation.request["message"]) {
-            operation.request = redact_file_payloads(&operation.request);
-            redact_prepared_send(&mut operation);
-        }
-        operation.response = Some(serde_json::json!({
-            "v":1,
-            "type":"ok",
-            "recovered_from_feed":true,
-            "entry":redact_file_payloads(&entry.raw)
-        }));
-        write_operation(tx, &operation)?;
-        changed = true;
-    }
-    Ok(changed)
-}
-
-fn operation_matches_entry(operation: &OperationRecord, entry: &JournalEntry) -> bool {
-    if operation.session_handle != entry.session_handle || entry.author != "origin" {
-        return false;
-    }
-
-    if let Some(entry_op_id) = entry.raw["op_id"].as_str() {
-        if entry_op_id != operation.op_id.to_string() {
-            return false;
-        }
-        return match operation.kind.as_str() {
-            "send" | "revise" => entry.kind == "revision",
-            "reply" => entry.kind == "reply",
-            "withdraw" => entry.kind == "terminal" && entry.raw["terminal_state"] == "retracted",
-            "result" => entry.kind == "result",
-            _ => false,
-        };
-    }
-
-    let request = &operation.request;
-    let sender_id = if operation.kind == "send" {
-        request["message"]["sender_id"].as_str()
-    } else {
-        request["sender_id"].as_str()
-    };
-    let message_id = if operation.kind == "send" {
-        request["message"]["message_id"].as_str()
-    } else {
-        request["message_id"].as_str()
-    };
-    if sender_id != entry.sender_id.as_deref() || message_id != entry.request_id.as_deref() {
-        return false;
-    }
-
-    match operation.kind.as_str() {
-        "send" => {
-            entry.kind == "revision"
-                && entry.request_revision == Some(1)
-                && entry.raw["message"] == request["message"]
-        }
-        "reply" => {
-            entry.kind == "reply"
-                && entry.raw["in_reply_to"] == request["in_reply_to"]
-                && entry.request_revision == request["request_revision"].as_u64()
-                && entry.raw["text"] == request["text"]
-        }
-        "revise" => {
-            let next_revision = request["base_revision"]
-                .as_u64()
-                .and_then(|revision| revision.checked_add(1));
-            entry.kind == "revision"
-                && entry.request_revision == next_revision
-                && entry.raw["message"] == request["message"]
-        }
-        "withdraw" => entry.kind == "terminal" && entry.raw["terminal_state"] == "retracted",
-        "result" => {
-            entry.kind == "result"
-                && entry.raw["in_reply_to"] == request["in_reply_to"]
-                && entry.raw["status"] == request["status"]
-        }
-        _ => false,
-    }
-}
-
-fn merge_server_facts(existing: &mut JournalEntry, incoming: &JournalEntry) -> bool {
-    let mut changed = false;
-    if incoming.raw["delivered"] == true {
-        if existing.ack_pending_at_ms.is_some() {
-            existing.ack_pending_at_ms = None;
-            changed = true;
-        }
-        if existing.delivered_at_ms.is_none() {
-            existing.delivered_at_ms = Some(now_ms());
-            changed = true;
-        }
-        if existing.raw["delivered"] != true {
-            if let Some(raw) = existing.raw.as_object_mut() {
-                raw.insert("delivered".into(), Value::Bool(true));
-            }
-            changed = true;
-        }
-    }
-    if incoming.raw["acted"] == true && existing.acted_at_ms.is_none() {
-        existing.acted_at_ms = Some(now_ms());
-        if let Some(raw) = existing.raw.as_object_mut() {
-            raw.insert("acted".into(), Value::Bool(true));
-        }
-        changed = true;
-    }
-    for field in ["file_transfers", "file_use"] {
-        if let Some(value) = incoming.raw.get(field) {
-            if existing.raw.get(field) != Some(value) {
-                if let Some(raw) = existing.raw.as_object_mut() {
-                    raw.insert(field.to_owned(), value.clone());
-                }
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
-fn merge_local_file_transfers(existing: &mut JournalEntry, incoming: &JournalEntry) -> bool {
-    if existing.ack_pending_at_ms.is_some() || existing.delivered_at_ms.is_some() {
-        return false;
-    }
-    let mut changed = false;
-    for (name, incoming_transfer) in &incoming.file_transfers {
-        if existing.file_transfers.get(name) != Some(incoming_transfer) {
-            existing
-                .file_transfers
-                .insert(name.clone(), incoming_transfer.clone());
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn merge_server_facts_into_new(entry: &mut JournalEntry) {
-    if entry.raw["delivered"] == true {
-        entry.ack_pending_at_ms = None;
-        entry.delivered_at_ms = Some(now_ms());
-    }
-    if entry.raw["acted"] == true {
-        entry.acted_at_ms = Some(now_ms());
-    }
-}
-
-/// Pacing between checks while another program holds the journal database.
-/// This is not a limit: the wait continues until the holder releases it.
-const OTHER_HOLDER_RECHECK: Duration = Duration::from_millis(10);
 
 fn wait_for_other_database_holder(_attempts: i32) -> bool {
     thread::sleep(OTHER_HOLDER_RECHECK);
@@ -2212,7 +861,7 @@ mod tests {
     fn journal_waits_for_another_program_holding_the_database_past_the_old_limit() {
         let scratch = Scratch::new();
         let session = Uuid::new_v4();
-        let mut store = JournalStore::open(&scratch.0, "device", session).unwrap();
+        let store = JournalStore::open(&scratch.0, "device", session).unwrap();
 
         // Another program (for example an inspecting sqlite3 shell) holds the
         // database longer than the journal used to tolerate.
@@ -2228,416 +877,14 @@ mod tests {
             holder.execute_batch("COMMIT;").unwrap();
         });
 
-        assert!(store.record_entry(entry(session, 1, "held")).unwrap());
+        let journal_id = store.journal_id().unwrap();
         assert!(started.elapsed() >= hold);
         release.join().unwrap();
-        assert!(store.entry_by_event("1").unwrap().is_some());
-    }
-
-    fn entry(session: Uuid, seq: u64, body: &str) -> JournalEntry {
-        JournalEntry::fetched(
-            seq,
-            seq.to_string(),
-            session,
-            "discussion".into(),
-            "person".into(),
-            true,
-            Some("app:test".into()),
-            Some("request-1".into()),
-            Some(1),
-            json!({
-                "event_id": seq.to_string(),
-                "session_handle": session.to_string(),
-                "kind": "discussion",
-                "author": "person",
-                "sender_id": "app:test",
-                "message_id": "request-1",
-                "request_revision": 1,
-                "text": body,
-                "delivered": false,
-                "acted": false
-            }),
-        )
-    }
-
-    fn terminal(session: Uuid, seq: u64, state: &str, delivered: bool) -> JournalEntry {
-        JournalEntry::fetched(
-            seq,
-            seq.to_string(),
-            session,
-            "terminal".into(),
-            "person".into(),
-            true,
-            Some("app:test".into()),
-            Some("request-1".into()),
-            Some(1),
-            json!({
-                "event_id": seq.to_string(),
-                "session_handle": session.to_string(),
-                "kind": "terminal",
-                "author": "person",
-                "sender_id": "app:test",
-                "message_id": "request-1",
-                "request_revision": 1,
-                "terminal_state": state,
-                "delivered": delivered,
-                "acted": false
-            }),
-        )
-    }
-
-    fn origin_terminal(session: Uuid, seq: u64, state: &str, op_id: Option<Uuid>) -> JournalEntry {
-        let mut raw = json!({
-            "event_id": seq.to_string(),
-            "session_handle": session.to_string(),
-            "kind": "terminal",
-            "author": "origin",
-            "sender_id": "app:test",
-            "message_id": "request-1",
-            "request_revision": 1,
-            "terminal_state": state,
-            "delivered": false,
-            "acted": false
-        });
-        if let Some(op_id) = op_id {
-            raw["op_id"] = json!(op_id.to_string());
-        }
-        JournalEntry::fetched(
-            seq,
-            seq.to_string(),
-            session,
-            "terminal".into(),
-            "origin".into(),
-            false,
-            Some("app:test".into()),
-            Some("request-1".into()),
-            Some(1),
-            raw,
-        )
+        assert_eq!(store.journal_id().unwrap(), journal_id);
     }
 
     fn open(root: &Scratch, session: Uuid) -> JournalStore {
         JournalStore::open(&root.0, "enrolled-device", session).unwrap()
-    }
-
-    fn advisory(
-        session: Uuid,
-        sequence: u64,
-        id: Uuid,
-        origin_cursor: u64,
-        delivered: bool,
-    ) -> AdvisoryEntry {
-        AdvisoryEntry::fetched(
-            session,
-            sequence,
-            id,
-            origin_cursor,
-            json!({
-                "kind":"advisory",
-                "advisory_type":"unseen_interval_elapsed",
-                "author":"server",
-                "session_handle":session,
-                "advisory_id":id,
-                "advisory_seq":sequence,
-                "origin_cursor_at_decision":origin_cursor,
-                "text":"No record shows that you opened this message."
-            }),
-            delivered,
-        )
-    }
-
-    #[test]
-    fn advisory_cursor_and_durable_pending_journal_are_independent_of_feed_cursor() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let id = Uuid::new_v4();
-        let mut store = open(&root, session);
-
-        store
-            .record_advisory_batch(session, 0, 1, &[advisory(session, 1, id, 3, false)])
-            .unwrap();
-        assert_eq!(store.cursor().unwrap(), 0);
-        assert_eq!(store.advisory_cursor(session).unwrap(), 1);
-        assert_eq!(
-            store.pending_advisories_for(session).unwrap()[0].advisory_id,
-            id
-        );
-
-        drop(store);
-        let mut store = open(&root, session);
-        let pending = store.pending_advisories_for(session).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].origin_cursor_at_decision, 3);
-        assert_eq!(pending[0].emitted_at_ms, None);
-
-        store.mark_advisory_emitted(session, id).unwrap();
-        assert_eq!(store.pending_advisories_for(session).unwrap().len(), 1);
-        store.mark_advisory_delivered(session, id).unwrap();
-        assert!(store.pending_advisories_for(session).unwrap().is_empty());
-    }
-
-    #[test]
-    fn advisory_batch_gap_rolls_back_entries_and_cursor_together() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        let entries = [
-            advisory(session, 1, Uuid::new_v4(), 0, false),
-            advisory(session, 3, Uuid::new_v4(), 0, false),
-        ];
-
-        assert!(matches!(
-            store.record_advisory_batch(session, 0, 3, &entries),
-            Err(JournalError::AdvisoryGap { .. })
-        ));
-        assert_eq!(store.advisory_cursor(session).unwrap(), 0);
-        assert!(store.pending_advisories_for(session).unwrap().is_empty());
-    }
-
-    #[test]
-    fn advisory_replay_updates_only_the_remote_delivery_projection() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let id = Uuid::new_v4();
-        let mut store = open(&root, session);
-        let first = advisory(session, 1, id, 2, false);
-        store
-            .record_advisory_batch(session, 0, 1, &[first.clone()])
-            .unwrap();
-        assert_eq!(store.pending_advisories_for(session).unwrap().len(), 1);
-
-        let delivered = advisory(session, 1, id, 2, true);
-        store
-            .record_advisory_batch(session, 0, 1, &[delivered])
-            .unwrap();
-        assert!(store.pending_advisories_for(session).unwrap().is_empty());
-        assert_eq!(store.advisory_cursor(session).unwrap(), 1);
-        assert_eq!(store.cursor().unwrap(), 0);
-    }
-
-    #[test]
-    fn request_snapshot_stays_bounded_with_long_entry_and_operation_history() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        let initial = JournalEntry::fetched(
-            1,
-            "1".into(),
-            session,
-            "revision".into(),
-            "person".into(),
-            false,
-            Some("app:test".into()),
-            Some("request-1".into()),
-            Some(1),
-            json!({
-                "event_id":"1",
-                "session_handle":session.to_string(),
-                "kind":"revision",
-                "author":"person",
-                "sender_id":"app:test",
-                "message_id":"request-1",
-                "request_revision":1,
-                "message":{"sender_id":"app:test","message_id":"request-1","title":"initial"}
-            }),
-        );
-        store.record_entry(initial).unwrap();
-
-        for sequence in 2..=201 {
-            store
-                .record_entry(entry(session, sequence, &format!("turn {sequence}")))
-                .unwrap();
-        }
-
-        let send_id = Uuid::new_v4();
-        store
-            .prepare_v2_operation(
-                send_id,
-                session,
-                "send".into(),
-                json!({
-                    "sender":"app:test","session":session,
-                    "message":{"message_id":"request-1","title":"initial"}
-                }),
-                Vec::new(),
-            )
-            .unwrap();
-        store
-            .settle_operation(
-                send_id,
-                json!({"message":{"item_id":"request-1","sender":"app:test","session":session,"revision":1}}),
-                None,
-            )
-            .unwrap();
-
-        for sequence in 0..128 {
-            let op_id = Uuid::new_v4();
-            store
-                .prepare_v2_operation(
-                    op_id,
-                    session,
-                    "reply".into(),
-                    json!({
-                        "message_id":"request-1",
-                        "in_reply_to":sequence.to_string(),
-                        "body":format!("committed action {sequence}")
-                    }),
-                    Vec::new(),
-                )
-                .unwrap();
-            store
-                .settle_operation(op_id, json!({"type":"ok","status":"replied"}), None)
-                .unwrap();
-        }
-
-        let unresolved_id = Uuid::new_v4();
-        store
-            .prepare_v2_operation(
-                unresolved_id,
-                session,
-                "result".into(),
-                json!({
-                    "message_id":"request-1",
-                    "in_reply_to":"201",
-                    "status":"received"
-                }),
-                Vec::new(),
-            )
-            .unwrap();
-        store.mark_operation_unknown(unresolved_id).unwrap();
-
-        let snapshot = store
-            .request_snapshot(session, "request-1", Some("201"))
-            .unwrap();
-        assert_eq!(snapshot.entries.len(), 2);
-        assert!(
-            snapshot
-                .entries
-                .values()
-                .any(|entry| entry.kind == "revision")
-        );
-        assert!(
-            snapshot
-                .entries
-                .values()
-                .any(|entry| entry.event_id == "201")
-        );
-        assert_eq!(snapshot.operations.len(), 2);
-        assert!(snapshot.operations.contains_key(&send_id));
-        assert!(snapshot.operations.contains_key(&unresolved_id));
-        assert!(store.snapshot().unwrap().entries.len() >= 201);
-        assert_eq!(store.snapshot().unwrap().operations.len(), 130);
-
-        store
-            .with_read(|connection| {
-                let mut statement = connection.prepare(
-                    "EXPLAIN QUERY PLAN SELECT payload FROM entries
-                     WHERE session_handle=?1 AND request_id=?2 AND kind='revision'
-                     ORDER BY feed_seq DESC LIMIT 1",
-                )?;
-                let plan = statement
-                    .query_map(params![session.to_string(), "request-1"], |row| {
-                        row.get::<_, String>(3)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(" ");
-                assert!(plan.contains("entries_by_session_request_kind"), "{plan}");
-
-                let mut statement = connection.prepare(
-                    "EXPLAIN QUERY PLAN SELECT payload FROM operations
-                     WHERE session_handle=?1 AND message_id=?2 AND state='committed'
-                       AND kind IN ('send','revise') AND request_revision IS NOT NULL
-                     ORDER BY request_revision DESC LIMIT 1",
-                )?;
-                let plan = statement
-                    .query_map(params![session.to_string(), "request-1"], |row| {
-                        row.get::<_, String>(3)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(" ");
-                assert!(
-                    plan.contains("operations_committed_revision_by_request"),
-                    "{plan}"
-                );
-
-                let mut statement = connection.prepare(
-                    "EXPLAIN QUERY PLAN SELECT payload FROM operations
-                     WHERE session_handle=?1 AND message_id=?2
-                       AND state IN ('prepared','unknown') ORDER BY op_id LIMIT 1",
-                )?;
-                let plan = statement
-                    .query_map(params![session.to_string(), "request-1"], |row| {
-                        row.get::<_, String>(3)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join(" ");
-                assert!(plan.contains("operations_pending_by_request"), "{plan}");
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn cursor_and_entry_commit_together_and_survive_reopen() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        {
-            let mut store = open(&root, session);
-            assert_eq!(store.snapshot().unwrap().cursor, 0);
-            assert!(store.record_entry(entry(session, 1, "hello")).unwrap());
-            assert_eq!(store.snapshot().unwrap().cursor, 1);
-        }
-
-        let mut reopened = open(&root, session);
-        let snapshot = reopened.snapshot().unwrap();
-        assert_eq!(snapshot.cursor, 1);
-        assert_eq!(snapshot.entries.get(&1).unwrap().event_id, "1");
-        assert!(!reopened.record_entry(entry(session, 1, "hello")).unwrap());
-        assert!(matches!(
-            reopened.record_entry(entry(session, 3, "gap")),
-            Err(JournalError::FeedGap {
-                cursor: 1,
-                sequence: 3
-            })
-        ));
-        assert!(matches!(
-            reopened.record_entry(entry(session, 1, "changed")),
-            Err(JournalError::FeedConflict { sequence: 1 })
-        ));
-    }
-
-    #[test]
-    fn emitted_delivered_and_acted_remain_separate_durable_facts() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store.record_entry(entry(session, 1, "hello")).unwrap();
-        assert_eq!(store.snapshot().unwrap().pending_for(session).len(), 1);
-
-        store.mark_emitted("1").unwrap();
-        let after_emit = store.snapshot().unwrap();
-        let emitted = after_emit.entry_by_event("1").unwrap();
-        assert!(emitted.emitted_at_ms.is_some());
-        assert!(emitted.delivered_at_ms.is_none());
-        assert!(emitted.acted_at_ms.is_none());
-
-        store.mark_delivered("1").unwrap();
-        let after_delivery = store.snapshot().unwrap();
-        let delivered = after_delivery.entry_by_event("1").unwrap();
-        assert!(delivered.delivered_at_ms.is_some());
-        assert!(delivered.acted_at_ms.is_none());
-        assert_eq!(after_delivery.pending_for(session).len(), 1);
-
-        store.mark_acted("1").unwrap();
-        let after_action = store.snapshot().unwrap();
-        assert!(
-            after_action
-                .entry_by_event("1")
-                .unwrap()
-                .acted_at_ms
-                .is_some()
-        );
-        assert_eq!(after_action.pending_for(session).len(), 0);
     }
 
     #[test]
@@ -2648,62 +895,67 @@ mod tests {
         assert_eq!(store.journal_path.file_name().unwrap(), "journal.sqlite3");
         assert_eq!(store.journal_lock_path.file_name().unwrap(), "journal.lock");
 
-        // Agent 0.2 wrote the same schema under the original filename pair.
-        let mut existing = JournalStore {
+        let legacy_tables = |journal: &JournalStore| {
+            journal
+                .with_read(|db| {
+                    Ok(db.query_row(
+                        "SELECT count(*) FROM sqlite_schema
+                     WHERE type='table' AND name IN ('entries','advisory_cursors','advisories')",
+                        [],
+                        |row| row.get::<_, u32>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert_eq!(legacy_tables(&store), 0);
+
+        // Reproduce the 0.2 paths and the metadata present in older journals.
+        let existing = JournalStore {
             journal_path: store.journal_path.with_file_name("origin-feed.sqlite3"),
             journal_lock_path: store.journal_lock_path.with_file_name("origin-feed.lock"),
         };
         fs::rename(&store.journal_path, &existing.journal_path).unwrap();
         fs::rename(&store.journal_lock_path, &existing.journal_lock_path).unwrap();
         existing
-            .record_entry(entry(session, 1, "preserved"))
+            .with_transaction(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO meta(key,value) VALUES('cursor','00000000000000000008');
+                 CREATE TABLE entries (payload TEXT);
+                 INSERT INTO entries VALUES ('held-entry');
+                 CREATE TABLE advisories (payload TEXT);
+                 INSERT INTO advisories VALUES ('held-advisory');",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        existing
+            .record_v2_feed("upgrade", None, 1, &[], false)
             .unwrap();
         let journal_id = existing.journal_id().unwrap();
 
-        let mut reopened = open(&root, session);
+        let reopened = open(&root, session);
         assert_eq!(reopened.journal_path, existing.journal_path);
         assert_eq!(reopened.journal_lock_path, existing.journal_lock_path);
         assert_eq!(reopened.journal_id().unwrap(), journal_id);
-        assert_eq!(reopened.cursor().unwrap(), 1);
-        reopened.record_entry(entry(session, 2, "new")).unwrap();
-        assert_eq!(existing.cursor().unwrap(), 2);
+        assert_eq!(reopened.v2_feed_cursor("upgrade").unwrap(), Some(1));
+        reopened
+            .record_v2_feed("upgrade", Some(1), 2, &[], false)
+            .unwrap();
+        assert_eq!(existing.v2_feed_cursor("upgrade").unwrap(), Some(2));
+        assert_eq!(legacy_tables(&reopened), 2);
+        reopened
+            .with_read(|db| {
+                for sql in [
+                    "SELECT payload FROM entries WHERE payload='held-entry'",
+                    "SELECT payload FROM advisories WHERE payload='held-advisory'",
+                    "SELECT value FROM meta WHERE key='cursor' AND value='00000000000000000008'",
+                ] {
+                    db.query_row(sql, [], |row| row.get::<_, String>(0))?;
+                }
+                Ok(())
+            })
+            .unwrap();
         assert!(!store.journal_path.exists());
-    }
-
-    #[test]
-    fn own_entries_are_journaled_but_never_actionable() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        let own = JournalEntry::fetched(
-            1,
-            "1".into(),
-            session,
-            "reply".into(),
-            "origin".into(),
-            true,
-            Some("app:test".into()),
-            Some("request-1".into()),
-            Some(1),
-            json!({
-                "event_id": "1",
-                "session_handle": session.to_string(),
-                "kind": "reply",
-                "author": "origin",
-                "sender_id": "app:test",
-                "message_id": "request-1",
-                "request_revision": 1,
-                "text": "acknowledged",
-                "in_reply_to": "0"
-            }),
-        );
-        assert!(own.own_entry());
-        assert!(!own.actionable);
-        store.record_entry(own).unwrap();
-        let snapshot = store.snapshot().unwrap();
-        assert_eq!(snapshot.cursor, 1);
-        assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(snapshot.pending_for(session).len(), 0);
     }
 
     #[test]
@@ -2737,9 +989,9 @@ mod tests {
             ));
             let admitted = json!({"rev":2,"message":{"sender":sender,"session":session,"item_id":"server/opaque"}});
             let wrong_sender = json!({"rev":2,"message":{"sender":"app:other","session":session,"item_id":"server/opaque"}});
-            assert!(store.settle_operation(key, wrong_sender, None).is_err());
+            assert!(store.settle_operation(key, wrong_sender).is_err());
             assert_eq!(store.v2_item_id(sender, &key.to_string()).unwrap(), None);
-            store.settle_operation(key, admitted, None).unwrap();
+            store.settle_operation(key, admitted).unwrap();
         }
         let store = open(&root, session);
         let saved = store.operation(key).unwrap().unwrap();
@@ -2851,7 +1103,7 @@ mod tests {
             let lock = store.lock_operation(key).unwrap();
             store.begin_v2_write(&lock, wire.clone()).unwrap();
             match terminal {
-                "committed" => store.settle_operation(key, json!({}), None).unwrap(),
+                "committed" => store.settle_operation(key, json!({})).unwrap(),
                 "refused" => store.reject_operation(key, json!({})).unwrap(),
                 "abandoned" => {
                     store.abandon_operation(key).unwrap();
@@ -2920,8 +1172,10 @@ mod tests {
         }
 
         let mut reopened = open(&root, session);
-        let snapshot = reopened.snapshot().unwrap();
-        assert_eq!(snapshot.unknown_operations_for(session).count(), 1);
+        assert_eq!(
+            reopened.operation(op_id).unwrap().unwrap().state,
+            OperationState::Unknown
+        );
         assert_eq!(
             reopened
                 .prepare_v2_operation(
@@ -2939,97 +1193,6 @@ mod tests {
             reopened.prepare_v2_operation(op_id, session, "reply".into(), json!({"body": "two"}), Vec::new()),
             Err(JournalError::OperationConflict(id)) if id == op_id
         ));
-    }
-
-    #[test]
-    fn origin_pending_read_filters_coverage_and_scans_only_active_entries() {
-        let root = Scratch::new();
-        let selected = Uuid::new_v4();
-        let other = Uuid::new_v4();
-        let mut store = open(&root, selected);
-        store.record_entry(entry(selected, 1, "acted")).unwrap();
-        store.record_entry(entry(other, 2, "not covered")).unwrap();
-        store
-            .record_entry(entry(selected, 3, "delivered pending"))
-            .unwrap();
-        store.record_entry(entry(selected, 4, "pending")).unwrap();
-        store.mark_acted("1").unwrap();
-        store.mark_delivered("3").unwrap();
-        let mut covered: BTreeSet<_> = (0..2000).map(|_| Uuid::new_v4()).collect();
-        covered.insert(selected);
-        let pending = store.pending_for_coverage(&covered).unwrap();
-        assert_eq!(
-            pending
-                .iter()
-                .map(|entry| entry.feed_seq)
-                .collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-        assert!(pending[0].delivered_at_ms.is_some());
-        assert!(
-            store
-                .pending_for_coverage(&BTreeSet::new())
-                .unwrap()
-                .is_empty()
-        );
-        store.with_read(|connection| {
-            let plan: String = connection.query_row(
-                "EXPLAIN QUERY PLAN SELECT payload FROM entries INDEXED BY entries_pending_by_session WHERE pending_active=1 ORDER BY feed_seq",
-                [], |row| row.get(3),
-            )?;
-            assert!(plan.contains("entries_pending_by_session"), "{plan}");
-            Ok(())
-        }).unwrap();
-    }
-
-    #[test]
-    fn origin_listeners_share_one_journal_and_record_each_event_once() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut first = open(&root, Uuid::nil());
-        let mut second = open(&root, Uuid::nil());
-
-        // Both listeners fetch the same feed entry; it is stored once.
-        assert!(first.record_entry(entry(session, 1, "hello")).unwrap());
-        assert!(!second.record_entry(entry(session, 1, "hello")).unwrap());
-        assert_eq!(first.cursor().unwrap(), 1);
-        assert_eq!(second.pending_for(session).unwrap().len(), 1);
-
-        // Both see it pending; acking from either keeps one recorded fact.
-        first.mark_ack_pending("1").unwrap();
-        let pending_at = second
-            .entry_by_event("1")
-            .unwrap()
-            .unwrap()
-            .ack_pending_at_ms;
-        assert!(pending_at.is_some());
-        second.mark_ack_pending("1").unwrap();
-        assert_eq!(
-            first
-                .entry_by_event("1")
-                .unwrap()
-                .unwrap()
-                .ack_pending_at_ms,
-            pending_at
-        );
-
-        first.mark_delivered("1").unwrap();
-        let delivered_at = second.entry_by_event("1").unwrap().unwrap().delivered_at_ms;
-        assert!(delivered_at.is_some());
-        second.mark_delivered("1").unwrap();
-        assert_eq!(
-            first.entry_by_event("1").unwrap().unwrap().delivered_at_ms,
-            delivered_at
-        );
-        first.mark_acted("1").unwrap();
-        let acted_at = second.entry_by_event("1").unwrap().unwrap().acted_at_ms;
-        second.mark_acted("1").unwrap();
-        assert_eq!(
-            first.entry_by_event("1").unwrap().unwrap().acted_at_ms,
-            acted_at
-        );
-        assert!(first.pending_for(session).unwrap().is_empty());
-        assert!(second.pending_for(session).unwrap().is_empty());
     }
 
     #[test]
@@ -3053,7 +1216,14 @@ mod tests {
             .prepare_v2_operation(op_id, session, "receipt".into(), request, Vec::new())
             .unwrap();
         assert_eq!(recorded.created_at_ms, again.created_at_ms);
-        assert_eq!(first.operations_for_session(session).unwrap().len(), 1);
+        let operation_count = first
+            .with_read(|db| {
+                Ok(db.query_row("SELECT count(*) FROM operations", [], |row| {
+                    row.get::<_, u32>(0)
+                })?)
+            })
+            .unwrap();
+        assert_eq!(operation_count, 1);
         assert!(
             second
                 .prepare_v2_operation(
@@ -3065,233 +1235,5 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[test]
-    fn operation_commit_and_acted_fact_share_one_snapshot() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let op_id = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store.record_entry(entry(session, 1, "hello")).unwrap();
-        store
-            .prepare_v2_operation(
-                op_id,
-                session,
-                "reply".into(),
-                json!({"body": "done"}),
-                Vec::new(),
-            )
-            .unwrap();
-        store
-            .settle_operation(op_id, json!({"event_id": "2"}), Some("1"))
-            .unwrap();
-
-        let snapshot = store.snapshot().unwrap();
-        assert_eq!(
-            snapshot.operations.get(&op_id).unwrap().state,
-            OperationState::Committed
-        );
-        assert!(snapshot.entry_by_event("1").unwrap().acted_at_ms.is_some());
-        assert_eq!(snapshot.pending_for(session).len(), 0);
-    }
-
-    #[test]
-    fn legacy_feed_cursor_spans_sessions() {
-        let root = Scratch::new();
-        let first_session = Uuid::new_v4();
-        let second_session = Uuid::new_v4();
-        let mut first = open(&root, first_session);
-        let mut second = open(&root, second_session);
-
-        first
-            .record_entry(entry(second_session, 1, "for second"))
-            .unwrap();
-        second
-            .record_entry(entry(first_session, 2, "for first"))
-            .unwrap();
-
-        let snapshot = first.snapshot().unwrap();
-        assert_eq!(snapshot.cursor, 2);
-        assert_eq!(snapshot.pending_for(first_session).len(), 1);
-        assert_eq!(snapshot.pending_for(second_session).len(), 1);
-    }
-
-    #[test]
-    fn replay_refreshes_server_receipts_without_changing_immutable_entry_content() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store.record_entry(entry(session, 1, "hello")).unwrap();
-
-        let mut replay = entry(session, 1, "hello");
-        replay.raw["delivered"] = Value::Bool(true);
-        replay.raw["acted"] = Value::Bool(true);
-        assert!(store.record_entry(replay).unwrap());
-
-        let snapshot = store.snapshot().unwrap();
-        let saved = snapshot.entry_by_event("1").unwrap();
-        assert!(saved.delivered_at_ms.is_some());
-        assert!(saved.acted_at_ms.is_some());
-        assert_eq!(snapshot.pending_for(session).len(), 0);
-
-        assert!(!store.record_entry(entry(session, 1, "hello")).unwrap());
-        assert!(
-            store
-                .snapshot()
-                .unwrap()
-                .entry_by_event("1")
-                .unwrap()
-                .acted_at_ms
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn ack_intent_is_durable_without_claiming_delivery_and_clears_on_receipt() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        {
-            let mut store = open(&root, session);
-            store.record_entry(entry(session, 1, "hello")).unwrap();
-            store.mark_ack_pending("1").unwrap();
-        }
-
-        let mut reopened = open(&root, session);
-        let snapshot = reopened.snapshot().unwrap();
-        let saved = snapshot.entry_by_event("1").unwrap();
-        assert!(saved.ack_pending_at_ms.is_some());
-        assert!(saved.delivered_at_ms.is_none());
-        assert_eq!(snapshot.pending_acknowledgements_for(session).count(), 1);
-
-        reopened.mark_delivered("1").unwrap();
-        let delivered = reopened.snapshot().unwrap();
-        assert!(
-            delivered
-                .entry_by_event("1")
-                .unwrap()
-                .ack_pending_at_ms
-                .is_none()
-        );
-        assert!(
-            delivered
-                .entry_by_event("1")
-                .unwrap()
-                .delivered_at_ms
-                .is_some()
-        );
-        assert_eq!(delivered.pending_acknowledgements_for(session).count(), 0);
-    }
-
-    #[test]
-    fn closed_discussion_is_settled_by_terminal_and_answered_terminal_stays_pending() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        let mut discussion = entry(session, 1, "hello");
-        discussion.raw["delivered"] = Value::Bool(true);
-        store.record_entry(discussion).unwrap();
-        store
-            .record_entry(terminal(session, 2, "answered", true))
-            .unwrap();
-
-        let snapshot = store.snapshot().unwrap();
-        let pending = snapshot.pending_for(session);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].event_id, "2");
-
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store
-            .record_entry(terminal(session, 1, "expired", true))
-            .unwrap();
-        assert!(store.snapshot().unwrap().pending_for(session).is_empty());
-    }
-
-    #[test]
-    fn post_answer_chat_stays_pending_and_non_answer_terminals_still_close_chat() {
-        for terminal_kind in [None, Some("no_comment")] {
-            let root = Scratch::new();
-            let session = Uuid::new_v4();
-            let mut store = open(&root, session);
-            let mut answered = terminal(session, 1, "answered", true);
-            answered.raw["channel"] = json!("reply");
-            if let Some(terminal_kind) = terminal_kind {
-                answered.raw["terminal_kind"] = json!(terminal_kind);
-            }
-            store.record_entry(answered).unwrap();
-
-            let mut chat = entry(session, 2, "chat after answer");
-            chat.raw["channel"] = json!("chat");
-            store.record_entry(chat).unwrap();
-            store.mark_acted("1").unwrap();
-
-            let snapshot = store.snapshot().unwrap();
-            let pending = snapshot.pending_for(session);
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].event_id, "2");
-            assert_eq!(pending[0].raw["channel"], "chat");
-        }
-
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store
-            .record_entry(terminal(session, 1, "expired", true))
-            .unwrap();
-        let mut chat = entry(session, 2, "chat after expiry");
-        chat.raw["channel"] = json!("chat");
-        store.record_entry(chat).unwrap();
-        assert!(store.snapshot().unwrap().pending_for(session).is_empty());
-    }
-
-    #[test]
-    fn origin_retraction_is_journaled_as_nonactionable_and_closes_pending_discussion() {
-        let root = Scratch::new();
-        let session = Uuid::new_v4();
-        let mut store = open(&root, session);
-        store
-            .record_entry(entry(session, 1, "please review"))
-            .unwrap();
-        store
-            .record_entry(origin_terminal(
-                session,
-                2,
-                "retracted",
-                Some(Uuid::new_v4()),
-            ))
-            .unwrap();
-
-        let snapshot = store.snapshot().unwrap();
-        let retraction = snapshot.entry_by_event("2").unwrap();
-        assert!(retraction.own_entry());
-        assert!(!retraction.actionable);
-        assert!(retraction.emitted_at_ms.is_none());
-        assert!(snapshot.pending_for(session).is_empty());
-    }
-
-    #[test]
-    fn server_file_receipts_change_without_changing_immutable_feed_content() {
-        let bytes = STANDARD.encode([7, 8]);
-        let mut first = serde_json::json!({
-            "event_id":"1",
-            "delivered":false,
-            "acted":false,
-            "files":[{"name":"input.bin","tier":"inline","size":2,"sha256":"hash","data_base64":bytes.clone()}],
-            "file_transfers":{},
-            "file_use":{}
-        });
-        let second = serde_json::json!({
-            "event_id":"1",
-            "delivered":true,
-            "acted":true,
-            "files":[{"name":"input.bin","tier":"inline","size":2,"sha256":"hash","data_base64":bytes}],
-            "file_transfers":{"input.bin":{"status":"transferred"}},
-            "file_use":{"input.bin":{"status":"used"}}
-        });
-        strip_file_payloads(&mut first);
-        assert_eq!(immutable_entry(&first), immutable_entry(&second));
-        assert!(first["files"][0].get("data_base64").is_none());
     }
 }
