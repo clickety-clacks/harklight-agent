@@ -526,7 +526,6 @@ impl JournalStore {
                 }
                 write_v2_item_id(tx, sender, &op_id.to_string(), item_id)?;
             }
-            let session = operation.session_handle;
             operation.state = OperationState::Committed;
             operation.updated_at_ms = now_ms();
             if !is_progress(&operation.request["message"]) {
@@ -784,6 +783,9 @@ fn redact_prepared_send(operation: &mut OperationRecord) {
 fn operation_requests_equivalent(left: &Value, right: &Value) -> bool {
     redact_file_payloads(left) == redact_file_payloads(right)
 }
+
+// Keep waiting while another program holds the journal database.
+const OTHER_HOLDER_RECHECK: Duration = Duration::from_millis(10);
 
 fn wait_for_other_database_holder(_attempts: i32) -> bool {
     thread::sleep(OTHER_HOLDER_RECHECK);
