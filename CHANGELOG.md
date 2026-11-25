@@ -1,7 +1,19 @@
 # Release notes
 
-## Unreleased
+## 0.2.6
 
+- `harklight-agent setup <invitation>` connects an agent in one step: it enrolls
+  from the invitation, shows the code to approve and the sender IDs to grant
+  (`app:agent/`), waits for approval (and resumes if stopped), checks the grants,
+  installs the Harklight skill for Claude Code and Codex where they are present,
+  and sends a test question to confirm the answer comes back. With no invitation
+  it reports the current state and refreshes the skill. Only this command writes
+  the skill files.
+- Without `--identity-dir` or `HARKLIGHT_IDENTITY_DIR`, the Agent uses a default
+  per-user identity directory. A flag or the environment variable still wins.
+- A `forbidden` refusal now lists the sender IDs this identity may use.
+- The README has a quick start and Claude Code and Codex sections, including an
+  optional Claude Code notification hook.
 - Explain in the README and `send --help` when a message alerts the phone on
   a Server with quiet-by-default alerts.
 
