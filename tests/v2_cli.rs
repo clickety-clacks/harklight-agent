@@ -1566,3 +1566,30 @@ fn caller_pending_refuses_missing_or_conflicting_scope_before_serving() {
     assert!(!requests[1].line.contains("page="));
     assert!(requests[2].line.contains("page=fresh"));
 }
+
+#[test]
+fn caller_pending_prepare_preserves_only_a_string_answer_capability() {
+    let session = Uuid::new_v4().to_string();
+    for capability in [None, Some(json!("all")), Some(json!(true))] {
+        let mut reply = json!({"rev":15,"next_page":"token"});
+        if let Some(value) = &capability {
+            reply["answers"] = value.clone();
+        }
+        let (server, identity) =
+            SlowServer::mutual_tls_sequence(vec![test_tls::FixtureResponse::json(reply)]);
+        let fixture = CliFixture::new(&server, identity);
+        let result = fixture.run(&["read", "--session", &session, "--pending", "--prepare"]);
+        assert!(result.status.success(), "{result:?}");
+        let mut expected =
+            json!({"kind":"baseline_prepared","session":session,"rev":15,"token":"token"});
+        if let Some(Value::String(value)) = capability {
+            expected["answers"] = json!(value);
+        }
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.stdout).unwrap(),
+            expected
+        );
+        assert!(!fixture.0.join("state").exists());
+        assert!(!server.request_line().contains("page="));
+    }
+}
