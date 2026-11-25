@@ -53,6 +53,11 @@ harklight-agent send --session new --sender-id app:build --type fyi \
   --title 'Build complete' --body 'The verification run passed.'
 ```
 
+On a Server with quiet-by-default alerts, a request or a message with
+`--importance high` or `--importance now` alerts the recipient's phone.
+Other messages arrive quietly unless the recipient has chosen to receive all
+alerts.
+
 Use an existing session UUID to keep the conversation, or omit the session
 for a message without a conversation. Use `--file` to attach a file.
 `--supersedes` takes a Server item ID. `--supersedes-local` resolves a local
