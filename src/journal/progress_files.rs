@@ -220,8 +220,6 @@ fn operation_sender(op: &OperationRecord) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-
     use super::*;
     use serde_json::json;
 
