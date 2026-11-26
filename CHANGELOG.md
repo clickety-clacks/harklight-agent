@@ -1,10 +1,16 @@
 # Release notes
 
-## Unreleased
+## 0.2.10
 
-- Prints “No one will get this” to stderr when the Server reports that a sent
-  message has no eligible recipient device or browser session. JSON output
-  carries the Server’s reach field when present.
+- A committed `send`, and `message-get` without `--revision`, print "No one
+  will get this" on stderr when the Server reports that no phone or signed-in browser can currently
+  receive the message (`recipient_reach` is `none`). The JSON output includes
+  `recipient_reach` when the Server sends it. Exit status and the rest of the
+  output are unchanged, and nothing extra is printed otherwise.
+- No released Harklight Server reports `recipient_reach` yet; it arrives with
+  the Server's new sign-in. Until then nothing new is printed.
+
+Compatibility: protocol 0.2; works with Harklight Server 0.2.16 and later.
 
 ## 0.2.9
 
