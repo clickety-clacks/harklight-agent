@@ -1,5 +1,11 @@
 # Release notes
 
+## Unreleased
+
+- Prints “No one will get this” to stderr when the Server reports that a sent
+  message has no eligible recipient device or browser session. JSON output
+  carries the Server’s reach field when present.
+
 ## 0.2.9
 
 - Shared messages to named people. `send` accepts `--person-id ID`, repeated

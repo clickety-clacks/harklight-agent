@@ -1861,6 +1861,120 @@ fn commands_other_than_setup_leave_skill_directories_untouched() {
 }
 
 #[test]
+fn recipient_reach_notice_preserves_send_and_message_get_json() {
+    use test_tls::FixtureResponse;
+
+    for reach in [Some("none"), Some("reachable"), None, Some("future-value")] {
+        let (server, identity) = SlowServer::mutual_tls_respond_to(move |request| {
+            let content = if request.line.starts_with("POST ") {
+                serde_json::from_slice::<Value>(&request.body).unwrap()["message"].clone()
+            } else {
+                assert_eq!(
+                    request.line.trim_end(),
+                    "GET /v2/agent/messages/item HTTP/1.1"
+                );
+                json!({"title":"Notice","created_at":10})
+            };
+            let mut message = json!({
+                "rev":1,"item_id":"item","sender":"app:test","revision":1,
+                "message":content,"seen":false,"files":[],
+            });
+            if let Some(reach) = reach {
+                message["recipient_reach"] = reach.into();
+            }
+            Some(FixtureResponse::json(json!({"rev":1,"message":message})))
+        });
+        let fixture = CliFixture::new(&server, identity);
+        for args in [
+            &[
+                "send",
+                "--sender-id",
+                "app:test",
+                "--type",
+                "fyi",
+                "--title",
+                "Notice",
+            ][..],
+            &["message-get", "--item-id", "item"][..],
+        ] {
+            let result = fixture.run(args);
+            assert_eq!(result.status.code(), Some(0), "{result:?}");
+            assert_eq!(
+                result.stderr,
+                if reach == Some("none") {
+                    &b"No one will get this\n"[..]
+                } else {
+                    &b""[..]
+                }
+            );
+            let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+            let response = if args[0] == "send" {
+                assert_eq!(output["kind"], "committed");
+                &output["response"]
+            } else {
+                &output
+            };
+            assert_eq!(
+                response["message"]
+                    .get("recipient_reach")
+                    .and_then(Value::as_str),
+                reach
+            );
+            assert_eq!(response["message"]["message"]["title"], "Notice");
+        }
+    }
+}
+
+#[test]
+fn unresolved_send_replay_reports_current_recipient_reach() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_tls::FixtureResponse;
+
+    let requests = AtomicUsize::new(0);
+    let key = Uuid::new_v4().to_string();
+    let expected_key = key.clone();
+    let (server, identity) = SlowServer::mutual_tls_respond_to(move |request| {
+        assert_eq!(request.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
+        assert!(
+            request
+                .headers
+                .contains(&("idempotency-key".into(), expected_key.clone()))
+        );
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        let is_replay = requests.fetch_add(1, Ordering::Relaxed) > 0;
+        let mut response = FixtureResponse::json(json!({"rev":1,"message":{
+            "rev":1,"item_id":"item","sender":sent["sender"],"revision":1,
+            "message":sent["message"],"seen":false,"files":[],
+            "recipient_reach": if is_replay { "none" } else { "reachable" },
+        }}));
+        response.truncate = !is_replay;
+        if is_replay {
+            response.headers = &[("Idempotent-Replayed", "true")];
+        }
+        Some(response)
+    });
+    let fixture = CliFixture::new(&server, identity);
+    let lost = fixture.run(&[
+        "send",
+        "--sender-id",
+        "app:test",
+        "--type",
+        "fyi",
+        "--title",
+        "Notice",
+        "--op-id",
+        &key,
+    ]);
+    assert_eq!(lost.status.code(), Some(7), "{lost:?}");
+    let replay = fixture.run(&["retry", "--op-id", &key]);
+    assert_eq!(replay.status.code(), Some(0), "{replay:?}");
+    assert_eq!(replay.stderr, b"No one will get this\n");
+    let output: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(output["kind"], "committed");
+    assert_eq!(output["response"]["message"]["recipient_reach"], "none");
+}
+
+#[test]
 fn forbidden_send_reports_current_grants_without_changing_machine_output() {
     use test_tls::FixtureResponse;
 

@@ -1421,7 +1421,12 @@ fn run_device_write(cli: &Cli) {
         _ => unreachable!("device write dispatch requires a write command"),
     };
     match result {
-        Ok(output) => println!("{output}"),
+        Ok(output) => {
+            if output["kind"] == "committed" && output["operation"] == "send" {
+                commands::report_recipient_reach(&output["response"]["message"]);
+            }
+            println!("{output}");
+        }
         Err(error) => write_failure(error),
     }
 }

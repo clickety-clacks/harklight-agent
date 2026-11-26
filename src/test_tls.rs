@@ -167,6 +167,22 @@ impl SlowServer {
         .0
     }
 
+    #[allow(dead_code)]
+    pub fn mutual_tls_respond_to(
+        respond: impl Fn(&RecordedRequest) -> Option<FixtureResponse> + Send + Sync + 'static,
+    ) -> (Self, TestIdentity) {
+        let respond = Arc::new(respond);
+        let (server, identity) = Self::serve_requests(
+            Duration::ZERO,
+            std::iter::repeat_with(move || {
+                let respond = Arc::clone(&respond);
+                move |request: &RecordedRequest| respond(request)
+            }),
+            true,
+        );
+        (server, identity.unwrap())
+    }
+
     fn serve_requests(
         delay: Duration,
         handlers: impl IntoIterator<Item = impl FnOnce(&RecordedRequest) -> Option<FixtureResponse>>
