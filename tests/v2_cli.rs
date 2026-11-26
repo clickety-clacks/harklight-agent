@@ -488,7 +488,7 @@ fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
     let (server, identity) = SlowServer::mutual_tls_sequence(vec![
         FixtureResponse::json(json!({"rev":8,"message":{
             "item_id":"item/opaque","revision":3,"rev":7,"session":session,"sender":"app:fixture",
-            "seen":false,"files":[{"file_id":"read-only-id","name":"a","size":1,"sha256":"a".repeat(64)}],
+            "seen":false,"recipient_reach":"none","files":[{"file_id":"read-only-id","name":"a","size":1,"sha256":"a".repeat(64)}],
             "message":{"title":"Progress","created_at":10,"message_type":"fyi",
                 "progress":{"percent":10,"segments":[{"stage":"Build","width":10}]}}
         }})),
@@ -515,6 +515,7 @@ fn binary_progress_preserves_attachments_by_omitting_file_ids_under_if_match() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stderr.is_empty(), "{output:?}");
     let requests = server.requests();
     assert_eq!(
         requests[0].line.trim_end(),

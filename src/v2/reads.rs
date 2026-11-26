@@ -153,7 +153,6 @@ impl AgentClient {
         if message["item_id"] != item_id || !valid_sent_message(message, position) {
             return Err(invalid_response(&request_id));
         }
-        crate::commands::report_recipient_reach(message);
         Ok(response)
     }
 

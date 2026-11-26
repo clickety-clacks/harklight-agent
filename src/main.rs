@@ -915,7 +915,12 @@ fn run_device_read(cli: &Cli) {
         _ => unreachable!("clap requires a complete message selector"),
     };
     match result {
-        Ok(response) => println!("{response}"),
+        Ok(response) => {
+            if matches!(&cli.command, Command::MessageGet { revision: None, .. }) {
+                commands::report_recipient_reach(&response["message"]);
+            }
+            println!("{response}");
+        }
         Err(error) => fail_read(operation, error, false),
     }
 }
