@@ -423,8 +423,6 @@ enum Command {
     /// Verify and save a file from a message or chat entry.
     FileGet {
         #[arg(long)]
-        shared: bool,
-        #[arg(long)]
         file_id: String,
         #[arg(long)]
         output: PathBuf,
@@ -839,7 +837,6 @@ fn run_device_read(cli: &Cli) {
         Command::MessageGet { shared: true, .. } => shared_client(client, "message-get"),
         Command::Messages { shared: true, .. } => shared_client(client, "messages"),
         Command::MessageEntries { shared: true, .. } => shared_client(client, "message-entries"),
-        Command::FileGet { shared: true, .. } => shared_client(client, "file-get"),
         _ => client,
     };
     let (operation, result) = match &cli.command {

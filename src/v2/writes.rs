@@ -297,18 +297,8 @@ fn write(
     {
         return Err(WriteFailure::local("invalid server request path"));
     }
-    let request = PreparedRequest {
-        body: if method == RequestMethod::Delete || operation == "chat-close" {
-            String::new()
-        } else {
-            body.to_string()
-        },
-        method,
-        path: path.iter().map(|part| (*part).to_owned()).collect(),
-        if_match: None,
-    };
     let lock = journal.lock_operation(op_id)?;
-    let mut inputs = json!({"method":request.method,"path":path,"body":body});
+    let mut inputs = json!({"method":method,"path":path,"body":body});
     if client.shared {
         inputs["shared"] = json!(true);
     }
@@ -319,12 +309,6 @@ fn write(
         inputs,
         Vec::new(),
     )?;
-    let operation = match operation.state {
-        OperationState::Prepared | OperationState::Unknown => {
-            journal.begin_v2_write(&lock, request)?
-        }
-        OperationState::Committed | OperationState::Rejected => operation,
-    };
     deliver(client, journal, &lock, operation)
 }
 
@@ -529,6 +513,7 @@ fn deliver_operation(
         OperationState::Prepared | OperationState::Unknown => {}
     }
 
+    let was_unknown = operation.state == OperationState::Unknown;
     let shared_send = operation
         .prepared_send
         .as_ref()
@@ -537,7 +522,7 @@ fn deliver_operation(
     if shared_send {
         match client.capabilities() {
             Ok(features) if features["shared_messages"] == true => {}
-            result if operation.state == OperationState::Unknown => {
+            result if was_unknown => {
                 let detail = match result {
                     Ok(_) => "The Server no longer advertises shared messaging.".to_owned(),
                     Err(error) => error.to_string(),
@@ -673,7 +658,27 @@ fn deliver_operation(
             "server response did not match the operation",
             request_id.as_deref(),
         )),
-        Err(error) => Err(record_failure(journal, &operation, error)?),
+        Err(error) => {
+            // Feature refusal happens before receipt lookup, so it cannot
+            // settle an operation whose earlier delivery may have committed.
+            if was_unknown
+                && client.shared
+                && let V2Error::Http {
+                    status: 400,
+                    token: Some(token),
+                    request_id,
+                    ..
+                } = &error
+                && token == "unsupported"
+            {
+                return Err(correlated_unknown(
+                    &operation,
+                    &error.to_string(),
+                    request_id.as_deref(),
+                ));
+            }
+            Err(record_failure(journal, &operation, error)?)
+        }
     }
 }
 
@@ -1010,6 +1015,72 @@ mod tests {
             server.ca_pem.as_bytes(),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn shared_reply_stays_unresolved_when_disabled_after_losing_its_response() {
+        use crate::test_tls::FixtureResponse;
+
+        let mut journal = TestJournal::new();
+        let key = Uuid::new_v4();
+        let unsupported = FixtureResponse {
+            status: "400 Bad Request",
+            headers: &[],
+            body: r#"{"error":"unsupported","retryable":false,"request_id":"disabled"}"#.into(),
+            truncate: false,
+        };
+        let server = SlowServer::sequence(vec![
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[],
+                body: r#"{"rev":2,"entry":"#.into(),
+                truncate: true,
+            },
+            unsupported,
+            FixtureResponse::json(json!({"rev":2,"entry":{
+                "item_id":"shared-a","entry_id":"entry-a","shared_entry_id":"entry-a",
+                "rev":2,"position":1,"request_revision":1,"kind":"reply","author":"origin",
+                "text":"Thanks",
+            }})),
+        ]);
+        let client = client_for(&server);
+        let initial = super::super::mutations::reply(
+            &client.clone().with_shared(),
+            &mut journal.store,
+            "shared-a",
+            Some("Thanks"),
+            None,
+            None,
+            &[],
+            &[],
+            Some(key),
+        )
+        .unwrap_err();
+        assert_eq!(initial.exit_code, 7);
+        let disabled = retry(&client, &mut journal.store, key, None).unwrap_err();
+        assert_eq!(disabled.exit_code, 7);
+        assert_eq!(disabled.output.unwrap()["request_id"], "disabled");
+        assert_eq!(
+            journal.store.operation(key).unwrap().unwrap().state,
+            OperationState::Unknown
+        );
+        let result = retry(&client, &mut journal.store, key, None).unwrap();
+        assert_eq!(result["response"]["entry"]["entry_id"], "entry-a");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert!(
+                request
+                    .headers
+                    .contains(&("harklight-features".into(), "shared_messages".into()))
+            );
+            assert!(
+                request
+                    .headers
+                    .contains(&("idempotency-key".into(), key.to_string()))
+            );
+            assert_eq!(request.body, requests[0].body);
+        }
     }
 
     #[test]
