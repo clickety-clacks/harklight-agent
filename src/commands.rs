@@ -136,6 +136,12 @@ impl<'de> Deserialize<'de> for UniqueJsonMembers {
     }
 }
 
+pub fn report_recipient_reach(message: &Value) {
+    if message["recipient_reach"].as_str() == Some("none") {
+        eprintln!("No one will get this");
+    }
+}
+
 pub(crate) fn read_answer_ui_file(path: &Path) -> Result<Value, CommandError> {
     let source = std::fs::read_to_string(path).map_err(|error| {
         CommandError::new(

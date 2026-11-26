@@ -915,7 +915,12 @@ fn run_device_read(cli: &Cli) {
         _ => unreachable!("clap requires a complete message selector"),
     };
     match result {
-        Ok(response) => println!("{response}"),
+        Ok(response) => {
+            if matches!(&cli.command, Command::MessageGet { revision: None, .. }) {
+                commands::report_recipient_reach(&response["message"]);
+            }
+            println!("{response}");
+        }
         Err(error) => fail_read(operation, error, false),
     }
 }
@@ -1421,7 +1426,12 @@ fn run_device_write(cli: &Cli) {
         _ => unreachable!("device write dispatch requires a write command"),
     };
     match result {
-        Ok(output) => println!("{output}"),
+        Ok(output) => {
+            if output["kind"] == "committed" && output["operation"] == "send" {
+                commands::report_recipient_reach(&output["response"]["message"]);
+            }
+            println!("{output}");
+        }
         Err(error) => write_failure(error),
     }
 }
