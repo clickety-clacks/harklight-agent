@@ -1,5 +1,11 @@
 # Release notes
 
+## Unreleased
+
+- Send one shared message to people in an organization on a Server that supports
+  shared messaging. Shared activity identifies each speaker and reports personal
+  Seen and answers. Existing individual commands keep their output formats.
+
 ## 0.2.8
 
 - The README and command help describe Harklight as an attention-based UI.

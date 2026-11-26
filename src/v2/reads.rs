@@ -95,6 +95,8 @@ impl AgentClient {
             field: None,
             request_id: None,
             retry_after: None,
+            recipients: None,
+            organization_ids: None,
         })
     }
 

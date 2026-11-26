@@ -231,6 +231,8 @@ fn test_connection(client: &AgentClient, journal: &mut JournalStore, sender: &st
                 ..MessageFieldOptions::default()
             },
             answer_ui: None,
+            choices_json: None,
+            shared: None,
         },
         None,
         false,
@@ -283,6 +285,7 @@ fn test_connection(client: &AgentClient, journal: &mut JournalStore, sender: &st
         ControlWrite::Receipt {
             item_id,
             entry_id: None,
+            answer_id: None,
             not_handed: None,
             agent: None,
             rerouted: false,

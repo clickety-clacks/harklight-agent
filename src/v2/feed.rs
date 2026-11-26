@@ -36,6 +36,8 @@ impl Change {
             "message" => self.data["item_id"].as_str(),
             "entry" => self.data["entry_id"].as_str(),
             "advisory" => self.data["advisory"]["advisory_id"].as_str(),
+            "seen" => self.data["event_id"].as_str(),
+            "answer" => self.data["answer_id"].as_str(),
             _ => None,
         };
         let id = id
@@ -44,7 +46,7 @@ impl Change {
         if self.rev == 0 || !self.data.is_object() {
             return Err(FeedError::InvalidChange);
         }
-        if self.kind != "advisory" && self.data["rev"] != self.rev {
+        if matches!(self.kind.as_str(), "message" | "entry") && self.data["rev"] != self.rev {
             return Err(FeedError::InvalidChange);
         }
         Ok(format!("{}:{id}", self.kind))
@@ -137,6 +139,16 @@ impl AgentClient {
         }
     }
 
+    fn continuation_request(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        match &self.continuation {
+            Some(token) => request.header("Harklight-Continuation", token),
+            None => request,
+        }
+    }
+
     fn change_batch(
         &self,
         session: Option<Uuid>,
@@ -151,11 +163,15 @@ impl AgentClient {
                 .append_pair("session", &session.to_string());
         }
         let request = self.client.get(url).header(ACCEPT, "application/json");
-        let value = self.read_json(Self::delivery_request(request, ack2))?;
+        let value =
+            self.read_json(self.continuation_request(Self::delivery_request(request, ack2)))?;
         let batch: Batch = serde_json::from_value(value).map_err(|_| FeedError::InvalidChange)?;
         let mut previous = after;
         for change in &batch.changes {
             change.resource_key()?;
+            if !self.shared && matches!(change.kind.as_str(), "seen" | "answer") {
+                return Err(FeedError::InvalidChange);
+            }
             if change.rev <= previous || change.rev > batch.rev {
                 return Err(FeedError::InvalidChange);
             }
@@ -183,7 +199,8 @@ impl AgentClient {
             .get(url)
             .header(ACCEPT, "text/event-stream")
             .header("Last-Event-ID", after.to_string());
-        let response = self.send_checked(Self::delivery_request(request, ack2))?;
+        let response =
+            self.send_checked(self.continuation_request(Self::delivery_request(request, ack2)))?;
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -197,6 +214,7 @@ impl AgentClient {
         }
         Ok(EventStream {
             request_id: header(&response, "Request-Id").map(str::to_owned),
+            shared: self.shared,
             reader: BufReader::new(response),
         })
     }
@@ -221,6 +239,7 @@ impl AgentClient {
 }
 
 struct EventStream {
+    shared: bool,
     reader: BufReader<Response>,
     request_id: Option<String>,
 }
@@ -262,7 +281,10 @@ impl EventStream {
                             .ok_or(FeedError::InvalidChange)?
                             .to_owned(),
                     ),
-                    ("message" | "entry" | "advisory", Some(rev)) => {
+                    (kind, Some(rev))
+                        if matches!(kind, "message" | "entry" | "advisory")
+                            || (self.shared && matches!(kind, "seen" | "answer")) =>
+                    {
                         let change = Change {
                             rev,
                             kind: event,
@@ -966,6 +988,89 @@ mod tests {
         assert_eq!(output[1]["kind"], "focus");
         assert!(output[1].get("rev").is_none());
         assert_eq!(output[2]["rev"], 17);
+        assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn shared_pending_baseline_and_reconnect_preserve_event_identity_and_scope() {
+        let (_root, journal) = open();
+        let session = Uuid::new_v4();
+        let speaker = json!({"kind":"person","id":"person-a","display_name":"A","handle":"a"});
+        let answer = json!({"kind":"answer","rev":9,"data":{
+            "item_id":"shared-a","answer_id":"answer-a","person_id":"person-a","request_revision":1,
+            "terminal":{"state":"answered","answer_id":"answer-a","speaker":speaker},
+        }});
+        let seen = json!({"item_id":"shared-a","event_id":"seen-a","request_revision":1,
+            "at_ms":10,"speaker":speaker});
+        let server = SlowServer::sequence(vec![
+            FixtureResponse::json(json!({
+                "rev":10,"next_page":"page","answers":"all","shared_events":true,"continuation":"scope",
+            })),
+            FixtureResponse::json(json!({"rev":10,"changes":[answer]})),
+            FixtureResponse::json(json!({"rev":12,"changes":[],"more":false})),
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[("Content-Type", "text/event-stream")],
+                body: format!(
+                    "id: 17\nevent: seen\ndata: {seen}\n\nevent: closing\ndata: {{\"reason\":\"cursor_expired\"}}\n\n"
+                ),
+                truncate: false,
+            },
+        ]);
+        let client = client(&server).with_shared().with_ack2(true);
+        let mut output = Vec::new();
+        pending::run(&client, session, None, |value| {
+            output.push(value.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            output[0],
+            json!({"kind":"baseline_prepared","session":session,
+            "rev":10,"token":"page","answers":"all","shared_events":true,"continuation":"scope"})
+        );
+        pending::run(&client, session, Some("page"), |value| {
+            output.push(value.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(output[2], answer);
+        assert_eq!(output[3], json!({"kind":"baseline_complete","rev":10}));
+        let error = run(
+            &client.with_continuation(Some("scope".into())),
+            &journal,
+            Some(session),
+            Start::AfterUntilExpired(10),
+            Mode::Follow,
+            |value| {
+                output.push(value.clone());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, FeedError::CursorExpired { rev: 17 }));
+        assert_eq!(output[4], json!({"kind":"caught_up","rev":12}));
+        assert_eq!(output[5], json!({"kind":"seen","rev":17,"data":seen}));
+        let requests = server.requests();
+        for request in &requests {
+            assert!(
+                request
+                    .headers
+                    .contains(&("harklight-features".into(), "shared_messages".into()))
+            );
+        }
+        for request in &requests[2..] {
+            assert!(
+                request
+                    .headers
+                    .contains(&("harklight-continuation".into(), "scope".into()))
+            );
+        }
+        assert!(
+            requests[3]
+                .headers
+                .contains(&("last-event-id".into(), "12".into()))
+        );
         assert_eq!(journal.v2_feed_cursor(&session.to_string()).unwrap(), None);
     }
 

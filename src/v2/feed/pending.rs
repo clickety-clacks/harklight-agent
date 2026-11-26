@@ -64,6 +64,17 @@ pub fn run(
         if let Some(answers) = response["answers"].as_str() {
             prepared["answers"] = json!(answers);
         }
+        if client.shared {
+            let continuation = response["continuation"]
+                .as_str()
+                .filter(|token| !token.is_empty())
+                .ok_or(FeedError::InvalidSnapshot)?;
+            if response["shared_events"] != true || response["answers"] != "all" {
+                return Err(FeedError::InvalidSnapshot.into());
+            }
+            prepared["continuation"] = json!(continuation);
+            prepared["shared_events"] = json!(true);
+        }
         return Ok(emit_value(&mut output, prepared)?);
     };
 

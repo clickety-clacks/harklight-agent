@@ -74,6 +74,7 @@ pub enum ControlWrite<'a> {
     Receipt {
         item_id: &'a str,
         entry_id: Option<&'a str>,
+        answer_id: Option<&'a str>,
         not_handed: Option<&'a str>,
         agent: Option<&'a str>,
         rerouted: bool,
@@ -146,6 +147,7 @@ pub fn control(
         ControlWrite::Receipt {
             item_id,
             entry_id,
+            answer_id,
             not_handed,
             agent,
             rerouted,
@@ -161,9 +163,10 @@ pub fn control(
             if rerouted {
                 body["rerouted"] = true.into();
             }
-            let path = match entry_id {
-                Some(id) => vec!["agent", "messages", item_id, "entries", id, "receipt"],
-                None => vec!["agent", "messages", item_id, "receipt"],
+            let path = match (answer_id, entry_id) {
+                (Some(id), _) => vec!["agent", "messages", item_id, "answers", id, "receipt"],
+                (None, Some(id)) => vec!["agent", "messages", item_id, "entries", id, "receipt"],
+                (None, None) => vec!["agent", "messages", item_id, "receipt"],
             };
             post(client, journal, "receipt", None, op_id, &path, body)
         }
@@ -294,30 +297,18 @@ fn write(
     {
         return Err(WriteFailure::local("invalid server request path"));
     }
-    let request = PreparedRequest {
-        body: if method == RequestMethod::Delete {
-            String::new()
-        } else {
-            body.to_string()
-        },
-        method,
-        path: path.iter().map(|part| (*part).to_owned()).collect(),
-        if_match: None,
-    };
     let lock = journal.lock_operation(op_id)?;
+    let mut inputs = json!({"method":method,"path":path,"body":body});
+    if client.shared {
+        inputs["shared"] = json!(true);
+    }
     let operation = journal.prepare_v2_operation(
         op_id,
         session.unwrap_or_else(Uuid::nil),
         operation.to_owned(),
-        json!({"method":request.method,"path":path,"body":body}),
+        inputs,
         Vec::new(),
     )?;
-    let operation = match operation.state {
-        OperationState::Prepared | OperationState::Unknown => {
-            journal.begin_v2_write(&lock, request)?
-        }
-        OperationState::Committed | OperationState::Rejected => operation,
-    };
     deliver(client, journal, &lock, operation)
 }
 
@@ -522,6 +513,47 @@ fn deliver_operation(
         OperationState::Prepared | OperationState::Unknown => {}
     }
 
+    let was_unknown = operation.state == OperationState::Unknown;
+    let shared_send = operation
+        .prepared_send
+        .as_ref()
+        .is_some_and(|send| send.request.get("recipients").is_some());
+    let client = client.clone().without_shared();
+    if shared_send {
+        match client.capabilities() {
+            Ok(features) if features["shared_messages"] == true => {}
+            result if was_unknown => {
+                let detail = match result {
+                    Ok(_) => "The Server no longer advertises shared messaging.".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                return Err(unknown(&operation, &detail, None));
+            }
+            Ok(_) => {
+                return Err(record_failure(
+                    journal,
+                    &operation,
+                    V2Error::Http {
+                        status: 400,
+                        token: Some("unsupported".into()),
+                        field: None,
+                        request_id: None,
+                        retry_after: None,
+                        recipients: None,
+                        organization_ids: None,
+                    },
+                )?);
+            }
+            Err(error) => return Err(WriteFailure::local(error.to_string())),
+        }
+    }
+    let client = if shared_send || operation.request["shared"] == true {
+        client.with_shared()
+    } else {
+        client
+    };
+    let client = &client;
+
     if operation.kind == "file-upload" {
         let upload = operation
             .uploads
@@ -571,7 +603,7 @@ fn deliver_operation(
             .map_err(|error| WriteFailure::local(error.to_string()))?;
         let path: Vec<String> = serde_json::from_value(operation.request["path"].clone())
             .map_err(|error| WriteFailure::local(error.to_string()))?;
-        let body = if method == RequestMethod::Delete {
+        let body = if method == RequestMethod::Delete || operation.kind == "chat-close" {
             String::new()
         } else {
             operation.request["body"].to_string()
@@ -626,7 +658,27 @@ fn deliver_operation(
             "server response did not match the operation",
             request_id.as_deref(),
         )),
-        Err(error) => Err(record_failure(journal, &operation, error)?),
+        Err(error) => {
+            // Feature refusal happens before receipt lookup, so it cannot
+            // settle an operation whose earlier delivery may have committed.
+            if was_unknown
+                && client.shared
+                && let V2Error::Http {
+                    status: 400,
+                    token: Some(token),
+                    request_id,
+                    ..
+                } = &error
+                && token == "unsupported"
+            {
+                return Err(correlated_unknown(
+                    &operation,
+                    &error.to_string(),
+                    request_id.as_deref(),
+                ));
+            }
+            Err(record_failure(journal, &operation, error)?)
+        }
     }
 }
 
@@ -634,7 +686,12 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
     if request.method == RequestMethod::Delete {
         return response.is_object();
     }
-    let Ok(request_body) = serde_json::from_str::<Value>(&request.body) else {
+    let body = if kind == "chat-close" {
+        "{}"
+    } else {
+        &request.body
+    };
+    let Ok(request_body) = serde_json::from_str::<Value>(body) else {
         return false;
     };
     if kind == "show" {
@@ -671,12 +728,27 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
     match kind {
         "send" => {
             valid_message(message)
+                && (request_body.get("recipients").is_none()
+                    || (message["shared"]["shared_id"] == message["item_id"]
+                        && response["recipients"].as_array().is_some_and(|outcomes| {
+                            !outcomes.is_empty()
+                                && outcomes.iter().all(|outcome| {
+                                    outcome["person_id"]
+                                        .as_str()
+                                        .is_some_and(|id| !id.is_empty())
+                                        && matches!(
+                                            outcome["status"].as_str(),
+                                            Some("reached" | "unreachable")
+                                        )
+                                })
+                        })))
                 && message["sender"] == request_body["sender"]
                 && message["session"] == request_body["session"]
                 && ["title", "body", "created_at", "message_type", "progress"]
                     .into_iter()
                     .all(|field| message["message"][field] == request_body["message"][field])
         }
+        "chat-close" => valid_message(message) && message["shared"]["chat_open"] == false,
         "revise" | "progress" | "retract" | "lifecycle" => {
             valid_message(message)
                 && request_body["in_reply_to"]
@@ -706,6 +778,13 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
                 return false;
             }
             match request.path.as_slice() {
+                [_, _, _, route, id, _] if route == "answers" => {
+                    response["terminal"]["state"] == "answered"
+                        && response["terminal"]["answer_id"] == *id
+                        && response["terminal"]["speaker"]["id"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                }
                 [_, _, _, _, id, _] => valid_entry() && entry["entry_id"] == *id,
                 [_, _, _, _] => valid_message(message),
                 _ => false,
@@ -791,6 +870,8 @@ pub(super) fn record_failure(
         ref field,
         ref request_id,
         retry_after,
+        ref recipients,
+        ref organization_ids,
     } = error
     {
         if (400..500).contains(&status) {
@@ -803,6 +884,18 @@ pub(super) fn record_failure(
             }
             if let Some(id) = request_id {
                 output["request_id"] = id.as_str().into();
+            }
+            if matches!(
+                token.as_deref(),
+                Some("no_recipients" | "decider_unreachable")
+            ) && let Some(recipients) = recipients
+            {
+                output["recipients"] = recipients.clone();
+            }
+            if token.as_deref() == Some("organization_required")
+                && let Some(ids) = organization_ids
+            {
+                output["organization_ids"] = ids.clone();
             }
             journal.reject_operation(operation.op_id, output.clone())?;
             files::cleanup_staged_uploads(&operation.uploads);
@@ -922,6 +1015,130 @@ mod tests {
             server.ca_pem.as_bytes(),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn shared_reply_stays_unresolved_when_disabled_after_losing_its_response() {
+        use crate::test_tls::FixtureResponse;
+
+        let mut journal = TestJournal::new();
+        let key = Uuid::new_v4();
+        let unsupported = FixtureResponse {
+            status: "400 Bad Request",
+            headers: &[],
+            body: r#"{"error":"unsupported","retryable":false,"request_id":"disabled"}"#.into(),
+            truncate: false,
+        };
+        let server = SlowServer::sequence(vec![
+            FixtureResponse {
+                status: "200 OK",
+                headers: &[],
+                body: r#"{"rev":2,"entry":"#.into(),
+                truncate: true,
+            },
+            unsupported,
+            FixtureResponse::json(json!({"rev":2,"entry":{
+                "item_id":"shared-a","entry_id":"entry-a","shared_entry_id":"entry-a",
+                "rev":2,"position":1,"request_revision":1,"kind":"reply","author":"origin",
+                "text":"Thanks",
+            }})),
+        ]);
+        let client = client_for(&server);
+        let initial = super::super::mutations::reply(
+            &client.clone().with_shared(),
+            &mut journal.store,
+            "shared-a",
+            Some("Thanks"),
+            None,
+            None,
+            &[],
+            &[],
+            Some(key),
+        )
+        .unwrap_err();
+        assert_eq!(initial.exit_code, 7);
+        let disabled = retry(&client, &mut journal.store, key, None).unwrap_err();
+        assert_eq!(disabled.exit_code, 7);
+        assert_eq!(disabled.output.unwrap()["request_id"], "disabled");
+        assert_eq!(
+            journal.store.operation(key).unwrap().unwrap().state,
+            OperationState::Unknown
+        );
+        let result = retry(&client, &mut journal.store, key, None).unwrap();
+        assert_eq!(result["response"]["entry"]["entry_id"], "entry-a");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert!(
+                request
+                    .headers
+                    .contains(&("harklight-features".into(), "shared_messages".into()))
+            );
+            assert!(
+                request
+                    .headers
+                    .contains(&("idempotency-key".into(), key.to_string()))
+            );
+            assert_eq!(request.body, requests[0].body);
+        }
+    }
+
+    #[test]
+    fn shared_answer_receipt_retries_with_the_saved_scope() {
+        use crate::test_tls::FixtureResponse;
+
+        let mut journal = TestJournal::new();
+        let key = Uuid::new_v4();
+        let terminal = json!({"state":"answered","answer_id":"answer-a","speaker":{
+            "kind":"person","id":"person-a","display_name":"A"
+        }});
+        let server = SlowServer::sequence(vec![
+            FixtureResponse {
+                status: "503 Service Unavailable",
+                headers: &[],
+                body: r#"{"error":"retry_later","retryable":true,"request_id":"receipt-1"}"#.into(),
+                truncate: false,
+            },
+            FixtureResponse::json(json!({
+                "rev":9,"status":"recorded","stage_outcome":"handed","terminal":terminal,
+            })),
+        ]);
+        let client = client_for(&server);
+        let error = control(
+            &client.clone().with_shared(),
+            &mut journal.store,
+            Some(key),
+            ControlWrite::Receipt {
+                item_id: "shared-a",
+                entry_id: None,
+                answer_id: Some("answer-a"),
+                not_handed: None,
+                agent: None,
+                rerouted: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code, 7);
+        let result = retry(&client, &mut journal.store, key, None).unwrap();
+        assert_eq!(result["response"]["terminal"], terminal);
+        let requests = server.requests();
+        for request in &requests {
+            assert_eq!(
+                request.line.trim_end(),
+                "POST /v2/agent/messages/shared-a/answers/answer-a/receipt HTTP/1.1"
+            );
+            assert!(
+                request
+                    .headers
+                    .contains(&("harklight-features".into(), "shared_messages".into()))
+            );
+            assert!(
+                request
+                    .headers
+                    .contains(&("idempotency-key".into(), key.to_string()))
+            );
+        }
+        assert_eq!(requests[0].body, requests[1].body);
     }
 
     #[test]
@@ -1074,6 +1291,7 @@ mod tests {
                 ControlWrite::Receipt {
                     item_id: "item",
                     entry_id,
+                    answer_id: None,
                     not_handed: None,
                     agent: Some("Desk"),
                     rerouted: true,
@@ -1366,6 +1584,7 @@ mod tests {
             ControlWrite::Receipt {
                 item_id: "item",
                 entry_id: None,
+                answer_id: None,
                 not_handed: None,
                 agent: None,
                 rerouted: false,

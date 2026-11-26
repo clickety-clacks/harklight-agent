@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    commands::{MessageFieldOptions, build_send_content, read_answer_ui_file},
+    commands::{MessageFieldOptions, build_send_content, read_answer_ui_file, read_named_choices},
     files,
     journal::{
         JournalError, JournalStore, OperationLock, OperationRecord, PreparedRequest, PreparedSend,
@@ -28,6 +28,14 @@ pub struct SendInput<'a> {
     pub files: &'a [PathBuf],
     pub fields: &'a MessageFieldOptions,
     pub answer_ui: Option<&'a Path>,
+    pub choices_json: Option<&'a Path>,
+    pub shared: Option<SharedPeople<'a>>,
+}
+
+pub struct SharedPeople<'a> {
+    pub people: &'a [String],
+    pub organization: Option<&'a str>,
+    pub decider: Option<&'a str>,
 }
 
 pub fn send(
@@ -47,14 +55,45 @@ pub fn send(
         fields.answer_ui =
             Some(read_answer_ui_file(path).map_err(|error| WriteFailure::local(error.message))?);
     }
+    if let Some(path) = input.choices_json {
+        fields.named_choices_ui = Some(
+            read_named_choices(path).map_err(|error| WriteFailure::local_refusal(error.message))?,
+        );
+    }
     let normalized = build_send_content(input.title, input.body, input.choices, &fields, 0)
         .map_err(|error| WriteFailure::local(error.message))?;
     let manifest = files::identify(input.files).map_err(WriteFailure::local)?;
-    let inputs = json!({
+    let mut inputs = json!({
         "session":input.session,"sender":input.sender,"message":normalized,
         "supersedes":input.supersedes,"supersedes_local":input.supersedes_local,
         "server_binding":client.server_binding(),"files":manifest,
     });
+    if let Some(shared) = &input.shared {
+        if shared.people.is_empty()
+            || shared.people.iter().any(String::is_empty)
+            || shared.organization == Some("")
+            || shared.decider == Some("")
+            || !input.supersedes.is_empty()
+            || !input.supersedes_local.is_empty()
+        {
+            return Err(WriteFailure::local_refusal(
+                "Invalid shared recipient selection.",
+            ));
+        }
+        let mut selector = json!({"kind":"people","people":shared.people});
+        if let Some(organization) = shared.organization {
+            selector["organization_id"] = organization.into();
+        }
+        inputs["recipients"] = selector;
+        if let Some(decider) = shared.decider {
+            if fields.message_type.as_deref() != Some("request") {
+                return Err(WriteFailure::local_refusal(
+                    "--decider-id requires --type request",
+                ));
+            }
+            inputs["answer_policy"] = json!({"kind":"named","people":[decider]});
+        }
+    }
     if let Some(saved) = journal.operation(key)? {
         if saved.protocol_v2
             && saved.kind == "send"
@@ -88,6 +127,11 @@ pub fn send(
     }
     if !input.supersedes.is_empty() {
         body["supersedes"] = json!(input.supersedes);
+    }
+    for field in ["recipients", "answer_policy"] {
+        if let Some(value) = inputs.get(field) {
+            body[field] = value.clone();
+        }
     }
     let uploads = if input.files.is_empty() {
         Vec::new()
@@ -159,14 +203,20 @@ fn prepared_output(operation: OperationRecord) -> Result<Value, WriteFailure> {
 }
 
 pub(super) fn prepared_metadata(prepared: &PreparedSend) -> Value {
-    json!({
+    let mut metadata = json!({
         "sender":prepared.request["sender"],
         "session":prepared.request["session"],
         "message":prepared.request["message"],
         "supersedes":prepared.request["supersedes"],
         "supersedes_local":prepared.inputs["supersedes_local"],
         "files":prepared.files,
-    })
+    });
+    for field in ["recipients", "answer_policy"] {
+        if let Some(value) = prepared.request.get(field) {
+            metadata[field] = value.clone();
+        }
+    }
+    metadata
 }
 
 pub(super) fn freeze_send(
@@ -296,6 +346,99 @@ mod tests {
     }
 
     #[test]
+    fn shared_execute_checks_discovery_and_preserves_definite_refusals() {
+        use crate::test_tls::FixtureResponse;
+
+        for advertised in [false, true] {
+            let root =
+                Scratch(std::env::temp_dir().join(format!("agent-send-test-{}", Uuid::new_v4())));
+            let mut journal = JournalStore::open(&root.0, "fixture", Uuid::nil()).unwrap();
+            let choices_json = root.0.join("choices.json");
+            std::fs::write(&choices_json, r#"[{"id":"ship","label":"Ship it"}]"#).unwrap();
+            let key = Uuid::new_v4();
+            let people = vec!["person-a".to_owned()];
+            let input = SendInput {
+                session: None,
+                sender: "app:sample",
+                title: "Update",
+                body: None,
+                choices: &[],
+                supersedes: &[],
+                supersedes_local: &[],
+                files: &[],
+                fields: &MessageFieldOptions {
+                    message_type: Some("request".into()),
+                    ..MessageFieldOptions::default()
+                },
+                answer_ui: None,
+                choices_json: Some(&choices_json),
+                shared: Some(SharedPeople {
+                    people: &people,
+                    organization: None,
+                    decider: Some("person-a"),
+                }),
+            };
+            let mut responses = vec![FixtureResponse::json(json!({
+                "features":{"shared_messages":advertised}, "server":{"id":"server-a"},
+            }))];
+            if advertised {
+                responses.push(FixtureResponse {
+                    status: "409 Conflict",
+                    headers: &[],
+                    body: json!({
+                        "error":"organization_required", "retryable":false, "request_id":"refusal",
+                        "organization_ids":["org-a","org-b"],
+                    })
+                    .to_string(),
+                    truncate: false,
+                });
+            }
+            let server = SlowServer::sequence(responses);
+            let client = client_for(&server);
+            let prepared = send(&client, &mut journal, &input, Some(key), true).unwrap();
+            assert_eq!(
+                prepared["prepared"]["recipients"],
+                json!({"kind":"people","people":["person-a"]})
+            );
+            assert_eq!(
+                prepared["prepared"]["message"]["answer_ui"]["actions"],
+                json!([{"id":"ship","label":"Ship it","kind":"value","value":"ship"}])
+            );
+            let refusal = execute(&client, &mut journal, key).unwrap_err();
+            let output = refusal.output.unwrap();
+            assert_eq!(
+                execute(&client, &mut journal, key)
+                    .unwrap_err()
+                    .output
+                    .unwrap(),
+                output
+            );
+            let requests = server.requests();
+            assert_eq!(requests[0].line.trim_end(), "GET /v2/me HTTP/1.1");
+            assert_eq!(requests.len(), if advertised { 2 } else { 1 });
+            if advertised {
+                assert_eq!(refusal.exit_code, 2);
+                assert_eq!(output["error"], "organization_required");
+                assert_eq!(output["organization_ids"], json!(["org-a", "org-b"]));
+                assert!(
+                    requests[1]
+                        .headers
+                        .contains(&("harklight-features".into(), "shared_messages".into()))
+                );
+                let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+                assert_eq!(body["recipients"], prepared["prepared"]["recipients"]);
+                assert_eq!(
+                    body["answer_policy"],
+                    json!({"kind":"named","people":["person-a"]})
+                );
+            } else {
+                assert_eq!(refusal.exit_code, 5);
+                assert_eq!(output["error"], "unsupported");
+            }
+        }
+    }
+
+    #[test]
     fn prepare_execute_retry_and_lookup_bind_the_same_send_to_the_server_item() {
         let root =
             Scratch(std::env::temp_dir().join(format!("agent-send-test-{}", Uuid::new_v4())));
@@ -315,6 +458,8 @@ mod tests {
                 ..MessageFieldOptions::default()
             },
             answer_ui: None,
+            choices_json: None,
+            shared: None,
         };
         use crate::test_tls::FixtureResponse;
         let session = Uuid::new_v4().to_string();
@@ -439,6 +584,8 @@ mod tests {
             files: &paths,
             fields: &fields,
             answer_ui: None,
+            choices_json: None,
+            shared: None,
         };
         let first = SlowServer::sequence(Vec::new());
         let target = client_for(&first);

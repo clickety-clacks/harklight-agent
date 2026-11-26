@@ -20,6 +20,8 @@ pub struct AgentClient {
     server_binding: String,
     identity: EnrolledIdentity,
     ack2: bool,
+    shared: bool,
+    continuation: Option<String>,
 }
 
 impl AgentClient {
@@ -33,7 +35,34 @@ impl AgentClient {
             address: identity.address.clone(),
             identity,
             ack2: false,
+            shared: false,
+            continuation: None,
         })
+    }
+
+    pub fn with_shared(mut self) -> Self {
+        self.shared = true;
+        self
+    }
+
+    fn without_shared(mut self) -> Self {
+        self.shared = false;
+        self
+    }
+
+    pub fn with_continuation(mut self, continuation: Option<String>) -> Self {
+        self.continuation = continuation;
+        self
+    }
+
+    pub fn capabilities(&self) -> Result<Value, V2Error> {
+        let me = self.read(&["me"], &[])?;
+        let shared = me["features"]["shared_messages"] == true;
+        Ok(serde_json::json!({
+            "server_id": me["server"]["id"],
+            "shared_messages": shared,
+            "groups": shared && me["features"]["groups"] == true,
+        }))
     }
 
     pub(crate) fn server_binding(&self) -> &str {
@@ -128,6 +157,11 @@ impl AgentClient {
     }
 
     fn send(&self, request: RequestBuilder) -> Result<Response, V2Error> {
+        let request = if self.shared {
+            request.header("Harklight-Features", "shared_messages")
+        } else {
+            request
+        };
         request
             .send()
             .map_err(|source| self.transport_error(source))
@@ -162,19 +196,26 @@ impl AgentClient {
         {
             return Err(V2Error::UnexpectedClientError { status, request_id });
         }
-        let (token, field) = body
+        let (token, field, recipients, organization_ids) = body
             .and_then(|body| {
                 body.error
                     .filter(|token| error_status(token).is_some())
-                    .map(|token| (token, body.field))
+                    .map(|token| (token, body.field, body.recipients, body.organization_ids))
             })
-            .map_or((None, None), |(token, field)| (Some(token), field));
+            .map_or(
+                (None, None, None, None),
+                |(token, field, recipients, organization_ids)| {
+                    (Some(token), field, recipients, organization_ids)
+                },
+            );
         Err(V2Error::Http {
             status,
             request_id,
             token,
             field,
             retry_after,
+            recipients,
+            organization_ids,
         })
     }
 
@@ -252,23 +293,27 @@ struct ErrorBody {
     retryable: Option<bool>,
     request_id: Option<String>,
     field: Option<String>,
+    recipients: Option<Value>,
+    organization_ids: Option<Value>,
 }
 
 fn error_status(token: &str) -> Option<u16> {
     Some(match token {
         "invalid_field" | "unsupported" => 400,
         "unauthorized" => 401,
-        "forbidden" | "account_paused" => 403,
+        "forbidden" | "account_paused" | "recipient_refused" => 403,
         "not_found" => 404,
         "stale_request"
         | "already_answered"
         | "already_closed"
         | "already_retracted"
         | "not_answered"
-        | "idempotency_conflict" => 409,
+        | "idempotency_conflict"
+        | "organization_required" => 409,
         "cursor_expired" => 410,
         "precondition_failed" => 412,
         "payload_too_large" => 413,
+        "no_recipients" | "decider_unreachable" => 422,
         "internal_error" => 500,
         "retry_later" | "storage_unavailable" => 503,
         _ => return None,
@@ -319,6 +364,8 @@ pub enum V2Error {
         field: Option<String>,
         request_id: Option<String>,
         retry_after: Option<u64>,
+        recipients: Option<Value>,
+        organization_ids: Option<Value>,
     },
 }
 
