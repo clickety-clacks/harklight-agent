@@ -115,6 +115,9 @@ enum Command {
             help = "Send this attention-client.ui/1 answer document (requires --type request)"
         )]
         answer_ui_file: Option<PathBuf>,
+        /// Read an array of choice IDs and labels from a JSON file.
+        #[arg(long, conflicts_with_all = ["choices", "answer_ui_file", "reply"])]
+        choices_json: Option<PathBuf>,
         #[arg(
             long,
             value_name = "PERCENT",
@@ -137,13 +140,23 @@ enum Command {
             help = "Note for this Progress report"
         )]
         progress_note: Option<String>,
+        /// Address this person ID in the shared request. Repeat to reach several people.
+        #[arg(long = "person-id", conflicts_with_all = ["supersedes", "supersedes_local"])]
+        people: Vec<String>,
+        /// Select the organization shared by the sender and all named people.
+        #[arg(long, requires = "people")]
+        organization: Option<String>,
+        /// Only this person ID may settle the shared request.
+        #[arg(long, requires = "people")]
+        decider_id: Option<String>,
         #[arg(long, conflicts_with = "execute")]
         prepare: bool,
         #[arg(long, requires = "op_id", conflicts_with_all = [
             "prepare", "session", "sender_id", "display_name", "title", "body", "choices",
             "message_type", "message_kind", "importance", "reply", "supersedes", "supersedes_local", "by_when",
             "stake", "thread", "default_choice", "default_at", "choice_styles", "files",
-            "answer_ui_file", "progress", "progress_stage", "progress_note"
+            "answer_ui_file", "progress", "progress_stage", "progress_note",
+            "people", "organization", "decider_id", "choices_json"
         ])]
         execute: bool,
         #[arg(long)]
@@ -175,6 +188,9 @@ enum Command {
     /// Read an authoritative sent message and its file references.
     #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "message_id"])))]
     MessageGet {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long, requires = "message_id")]
@@ -184,8 +200,13 @@ enum Command {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         revision: Option<u64>,
     },
+    /// Discover the Server identity and shared messaging capabilities.
+    Capabilities,
     /// List sent messages, newest first.
     Messages {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         session: Option<Uuid>,
         #[arg(long)]
@@ -207,6 +228,9 @@ enum Command {
     /// Read a page of entries, falling back to the account view for another sender.
     #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "message_id"])))]
     MessageEntries {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long)]
@@ -245,10 +269,16 @@ enum Command {
     },
     /// Report handoff of an answer or a person chat entry.
     Receipt {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         item_id: String,
         #[arg(long)]
         entry_id: Option<String>,
+        /// Acknowledge the exact answer delivered for a shared request.
+        #[arg(long, conflicts_with = "entry_id")]
+        answer_id: Option<String>,
         #[arg(long)]
         agent: Option<String>,
         #[arg(long, conflicts_with = "not_handed")]
@@ -258,7 +288,20 @@ enum Command {
         #[arg(long)]
         op_id: Option<Uuid>,
     },
+    /// Close chat on a shared message you sent.
+    ChatClose {
+        #[arg(long)]
+        item_id: String,
+        #[arg(long)]
+        op_id: Option<Uuid>,
+    },
     Reply {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
+        /// Notify only this participant while keeping the reply visible to everyone.
+        #[arg(long, requires = "shared")]
+        notify_person_id: Option<String>,
         #[arg(long)]
         item_id: String,
         #[arg(long)]
@@ -276,6 +319,9 @@ enum Command {
         after_help = "Only after a definite refusal (exit 2), correct the named input and submit a new revision. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed revision."
     )]
     Revise {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         item_id: String,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -339,6 +385,9 @@ enum Command {
     /// Retract an open message in this account.
     #[command(group(ArgGroup::new("message-ref").required(true).args(["item_id", "message_id"])))]
     Retract {
+        /// Enable shared conversation projections on this command.
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long)]
@@ -373,6 +422,8 @@ enum Command {
     },
     /// Verify and save a file from a message or chat entry.
     FileGet {
+        #[arg(long)]
+        shared: bool,
         #[arg(long)]
         file_id: String,
         #[arg(long)]
@@ -468,6 +519,11 @@ struct EnrollStatusArgs {
 
 #[derive(Debug, Args)]
 struct FeedArgs {
+    /// Read shared activity with a caller-owned continuation.
+    #[arg(long)]
+    shared: bool,
+    #[arg(long, requires_all = ["shared", "after"])]
+    continuation: Option<String>,
     /// Take waiting work for this session only.
     #[arg(long, value_name = "UUID")]
     session: Option<Uuid>,
@@ -623,7 +679,8 @@ fn main() {
             },
         ),
         Command::Focus { follow: true } => run_device_feed(&cli, None, feed::Mode::Focus),
-        Command::MessageGet { .. }
+        Command::Capabilities
+        | Command::MessageGet { .. }
         | Command::Messages { .. }
         | Command::Search { .. }
         | Command::MessageEntries { .. }
@@ -650,6 +707,11 @@ fn run_pending_read(cli: &Cli, args: &ReadArgs) {
     let client = AgentClient::new(device_identity(cli))
         .unwrap_or_else(|error| fail(error.to_string(), 1))
         .with_ack2(args.feed.ack2);
+    let client = if args.feed.shared {
+        shared_client(client, "read")
+    } else {
+        client
+    };
     let mut stdout = io::stdout().lock();
     let result = feed::pending::run(&client, session, args.resume.as_deref(), |value| {
         writeln!(stdout, "{value}")?;
@@ -683,12 +745,26 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     let client = AgentClient::new(identity)
         .unwrap_or_else(|error| fail(error.to_string(), 1))
         .with_ack2(args.is_some_and(|args| args.ack2));
+    let shared = args.is_some_and(|args| args.shared);
+    let client = if shared {
+        let args = args.expect("shared feed has arguments");
+        if args.after.is_none() || args.continuation.as_deref().is_none_or(str::is_empty) {
+            fail(
+                "Shared activity needs --after and --continuation from a pending baseline.".into(),
+                2,
+            );
+        }
+        shared_client(client, "feed").with_continuation(args.continuation.clone())
+    } else {
+        client
+    };
     let session = args.and_then(|args| args.session);
     let start = match args {
         Some(FeedArgs {
             after: Some(rev), ..
         }) => {
-            if matches!(&cli.command, Command::Listen(args) if args.on_expired.is_some()) {
+            if shared || matches!(&cli.command, Command::Listen(args) if args.on_expired.is_some())
+            {
                 feed::Start::AfterUntilExpired(*rev)
             } else {
                 feed::Start::After(*rev)
@@ -742,10 +818,32 @@ fn device_identity(cli: &Cli) -> EnrolledIdentity {
         .unwrap_or_else(|error| fail(error.to_string(), 1))
 }
 
+fn shared_client(client: AgentClient, operation: &str) -> AgentClient {
+    let capabilities = client
+        .capabilities()
+        .unwrap_or_else(|error| fail_read(operation, error, false));
+    if capabilities["shared_messages"] != true {
+        println!(
+            "{}",
+            serde_json::json!({"kind":"unsupported","operation":operation})
+        );
+        fail("The Server does not advertise shared messaging.".into(), 5);
+    }
+    client.with_shared()
+}
+
 fn run_device_read(cli: &Cli) {
     let identity = device_identity(cli);
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let client = match &cli.command {
+        Command::MessageGet { shared: true, .. } => shared_client(client, "message-get"),
+        Command::Messages { shared: true, .. } => shared_client(client, "messages"),
+        Command::MessageEntries { shared: true, .. } => shared_client(client, "message-entries"),
+        Command::FileGet { shared: true, .. } => shared_client(client, "file-get"),
+        _ => client,
+    };
     let (operation, result) = match &cli.command {
+        Command::Capabilities => ("capabilities", client.capabilities()),
         Command::MessageGet {
             item_id: Some(id),
             revision,
@@ -781,7 +879,7 @@ fn run_device_read(cli: &Cli) {
                 page.as_deref(),
             ),
         ),
-        Command::Messages { session, page } => {
+        Command::Messages { session, page, .. } => {
             ("messages", client.messages(*session, page.as_deref()))
         }
         Command::MessageEntries {
@@ -789,6 +887,7 @@ fn run_device_read(cli: &Cli) {
             message_id,
             before,
             limit,
+            ..
         } => (
             "message-entries",
             resolve_item(&client, item_id, message_id).and_then(|id| {
@@ -803,7 +902,9 @@ fn run_device_read(cli: &Cli) {
                     })
             }),
         ),
-        Command::FileGet { file_id, output } => (
+        Command::FileGet {
+            file_id, output, ..
+        } => (
             "file-get",
             client.download_file(file_id).map(|mut file| {
                 file.save(output).unwrap_or_else(|error| fail(error, 1));
@@ -935,6 +1036,16 @@ fn run_device_write(cli: &Cli) {
         },
     };
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
+    let client = match &cli.command {
+        Command::Retract { shared: true, .. } | Command::ChatClose { .. } => client.with_shared(),
+        Command::Reply { shared: true, .. } => client.with_shared(),
+        Command::Revise { shared: true, .. } => client.with_shared(),
+        Command::Receipt { shared: true, .. }
+        | Command::Receipt {
+            answer_id: Some(_), ..
+        } => client.with_shared(),
+        _ => client,
+    };
     let result = match &cli.command {
         Command::Send {
             execute: true,
@@ -962,11 +1073,15 @@ fn run_device_write(cli: &Cli) {
             choice_styles,
             files,
             answer_ui_file,
+            choices_json,
             progress,
             progress_stage,
             progress_note,
             prepare,
             op_id,
+            people,
+            organization,
+            decider_id,
             ..
         } => {
             let progress = progress
@@ -1007,24 +1122,42 @@ fn run_device_write(cli: &Cli) {
                     files,
                     fields: &fields,
                     answer_ui: answer_ui_file.as_deref(),
+                    choices_json: choices_json.as_deref(),
+                    shared: (!people.is_empty()).then_some(sends::SharedPeople {
+                        people,
+                        organization: organization.as_deref(),
+                        decider: decider_id.as_deref(),
+                    }),
                 },
                 *op_id,
                 *prepare,
             )
         }
+        Command::ChatClose { item_id, op_id } => writes::post(
+            &client,
+            &mut journal,
+            "chat-close",
+            None,
+            *op_id,
+            &["agent", "messages", item_id, "chat", "close"],
+            serde_json::json!({}),
+        ),
         Command::Reply {
             item_id,
+            notify_person_id,
             in_reply_to,
             body,
             file_ids,
             files,
             op_id,
+            ..
         } => mutations::reply(
             &client,
             &mut journal,
             item_id,
             body.as_deref(),
             in_reply_to.as_deref(),
+            notify_person_id.as_deref(),
             file_ids,
             files,
             *op_id,
@@ -1142,6 +1275,7 @@ fn run_device_write(cli: &Cli) {
             message_id,
             in_reply_to,
             op_id,
+            ..
         } => {
             let item_id = resolve_item(&client, item_id, message_id)
                 .unwrap_or_else(|error| fail_read("retract", error, true));
@@ -1205,10 +1339,12 @@ fn run_device_write(cli: &Cli) {
         Command::Receipt {
             item_id,
             entry_id,
+            answer_id,
             agent,
             rerouted,
             not_handed,
             op_id,
+            ..
         } => writes::control(
             &client,
             &mut journal,
@@ -1216,6 +1352,7 @@ fn run_device_write(cli: &Cli) {
             ControlWrite::Receipt {
                 item_id,
                 entry_id: entry_id.as_deref(),
+                answer_id: answer_id.as_deref(),
                 agent: agent.as_deref(),
                 rerouted: *rerouted,
                 not_handed: not_handed.as_deref(),

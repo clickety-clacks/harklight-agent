@@ -40,6 +40,9 @@ pub fn submit(
         "wire":mutation.draft,
         "file_inputs":manifest,
     });
+    if client.shared {
+        request["shared"] = json!(true);
+    }
     if mutation.draft.method == RequestMethod::Put {
         request["revision_intent"] = mutation.item_id.into();
         if let Ok(body) = serde_json::from_str::<Value>(&mutation.draft.body) {
@@ -105,6 +108,7 @@ pub fn reply(
     item_id: &str,
     text: Option<&str>,
     in_reply_to: Option<&str>,
+    notify_person_id: Option<&str>,
     file_ids: &[String],
     files: &[PathBuf],
     op_id: Option<Uuid>,
@@ -118,6 +122,9 @@ pub fn reply(
     }
     if let Some(entry) = in_reply_to {
         body["in_reply_to"] = entry.into();
+    }
+    if let Some(person_id) = notify_person_id {
+        body["notify_person_id"] = person_id.into();
     }
     if !file_ids.is_empty() {
         body["file_ids"] = json!(file_ids);
@@ -555,6 +562,7 @@ mod tests {
             "item",
             None,
             Some("entry/1"),
+            None,
             &["file-id".into()],
             &[],
             None,

@@ -161,13 +161,22 @@ pub(super) fn valid_pending_change(change: &Change, session: Option<Uuid>) -> bo
                     .as_str()
                     .is_some_and(|id| !id.is_empty())
         }
-        "message" => change.data["terminal"]["state"] == "answered",
+        "message" => {
+            change.data.get("shared").is_none() && change.data["terminal"]["state"] == "answered"
+        }
+        "answer" => {
+            change.data["terminal"]["state"] == "answered"
+                && change.data["terminal"]["answer_id"] == change.data["answer_id"]
+                && change.data["item_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+        }
         _ => false,
     }
 }
 
 pub(super) fn settled_turn(change: &Change) -> bool {
-    let delivery = if change.kind == "message" {
+    let delivery = if matches!(change.kind.as_str(), "message" | "answer") {
         &change.data["terminal"]["delivery"]
     } else {
         &change.data["delivery"]

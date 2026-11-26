@@ -49,6 +49,7 @@ pub struct MessageFieldOptions {
     pub clear_default: bool,
     /// An exact sender-provided UI/1 document accepted only by send.
     pub answer_ui: Option<Value>,
+    pub named_choices_ui: Option<Value>,
     /// Makes a send a Progress FYI carrying this first report.
     pub progress: Option<ProgressReport>,
 }
@@ -185,6 +186,28 @@ pub(crate) fn read_answer_ui_file(path: &Path) -> Result<Value, CommandError> {
         ));
     }
     Ok(value)
+}
+
+pub(crate) fn read_named_choices(path: &Path) -> Result<Value, CommandError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Choice {
+        id: String,
+        label: String,
+    }
+
+    let refused = |detail: String| CommandError::new(detail, EXIT_REFUSED);
+    let source = std::fs::read(path)
+        .map_err(|error| refused(format!("Could not read --choices-json: {error}")))?;
+    let choices: Vec<Choice> = serde_json::from_slice(&source)
+        .map_err(|error| refused(format!("Invalid --choices-json: {error}")))?;
+    let actions: Vec<_> = choices
+        .into_iter()
+        .map(|choice| json!({"id":choice.id,"label":choice.label,"kind":"value","value":choice.id}))
+        .collect();
+    let descriptor = json!({"schema":ANSWER_UI_SCHEMA,"actions":actions});
+    validate_typed_answer_ui(Some(MessageType::Request), &descriptor)?;
+    Ok(descriptor)
 }
 
 #[derive(Debug, Clone)]
@@ -564,13 +587,24 @@ fn validate_send_options(
         ));
     }
     validate_message_kind(fields)?;
-    if fields.answer_ui.is_none() {
+    if let Some(descriptor) = &fields.named_choices_ui {
+        if message_type != Some(MessageType::Request) {
+            return Err(CommandError::new(
+                "--choices-json requires --type request",
+                EXIT_REFUSED,
+            ));
+        }
+        validate_typed_answer_ui(message_type, descriptor)?;
+    } else if fields.answer_ui.is_none() {
         validate_send_controls(message_type, choices, fields)?;
         let answer_ui = answer_ui_for_send(choices, message_type, fields)?;
         validate_typed_answer_ui(message_type, &answer_ui)?;
     }
-    let normalized =
-        normalize_message_fields(fields, &send_choice_targets(choices), include_thread);
+    let targets = match &fields.named_choices_ui {
+        Some(descriptor) => answer_ui_choice_targets(descriptor),
+        None => send_choice_targets(choices),
+    };
+    let normalized = normalize_message_fields(fields, &targets, include_thread);
     first_field_error(&normalized)?;
     Ok((message_type, normalized))
 }
@@ -855,7 +889,11 @@ fn answer_ui_for_send(
     message_type: Option<MessageType>,
     fields: &MessageFieldOptions,
 ) -> Result<Value, CommandError> {
-    if let Some(answer_ui) = &fields.answer_ui {
+    if let Some(answer_ui) = fields
+        .named_choices_ui
+        .as_ref()
+        .or(fields.answer_ui.as_ref())
+    {
         return Ok(answer_ui.clone());
     }
     match message_type {

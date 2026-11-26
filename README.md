@@ -146,6 +146,34 @@ the same intact journal from an unresolved operation after losing state.
 `abandon --op-id UUID` releases an unresolved local operation. An operation
 that already reached the Server can still have taken effect.
 
+## Shared activity
+
+Run `capabilities` to see the enrolled Server's immutable ID and whether it
+supports shared messaging. To send one message to several people, repeat
+`--person-id ID` on `send`. If the Server returns `organization_required`,
+choose one of the returned organization IDs and submit a new send with
+`--organization ID`. The first answer settles a request unless you specify `--decider-id ID`. For choices with stable IDs and separate
+labels, pass `--choices-json PATH` with a JSON array of
+`{"id":"approve","label":"Ship it"}` objects.
+
+Use `message-get --shared --item-id ID` and
+`message-entries --shared --item-id ID` to read a shared conversation.
+Shared replies identify the speaker by Server-scoped ID and show a display
+name and handle when provided. The message identifies who settled it.
+The sender can use `retract --shared --item-id ID` to withdraw the message
+or `chat-close --item-id ID` to stop chat while preserving history.
+
+For integrations, prepare with `read --shared --pending --session UUID --prepare`
+and resume the pending baseline with `--resume TOKEN`. After accepting the
+baseline, use `read --shared --session UUID --after REV --continuation TOKEN`
+to catch up or use the same options with `listen --follow` to stay current.
+Use the continuation from the prepared baseline alongside its revision, then
+advance the revision as you accept changes. Start a fresh baseline if the
+Server reports an expired cursor. The shared feed identifies each person's
+Seen and each answer. Acknowledge an answer with
+`receipt --item-id ID --answer-id ID`, and a reply with
+`receipt --shared --item-id ID --entry-id ID`.
+
 ## Messages, replies and Progress
 
 - `messages [--session UUID] [--page TOKEN]` lists the current identity's
