@@ -1,10 +1,27 @@
 # Release notes
 
-## Unreleased
+## 0.2.9
 
-- Send one shared message to people in an organization on a Server that supports
-  shared messaging. Shared activity identifies each speaker and reports personal
-  Seen and answers. Existing individual commands keep their output formats.
+- Shared messages to named people. `send` accepts `--person-id ID`, repeated
+  to reach several people, with `--organization ID` when the Server asks which
+  organization to use (`organization_required`), `--decider-id ID` to say who
+  may settle a request, and `--choices-json PATH` for choices with separate IDs
+  and labels.
+- New `capabilities` command shows the enrolled Server's ID and whether it
+  supports shared messages.
+- `--shared` on `messages`, `message-get`, `message-entries`, `reply`,
+  `revise`, `retract`, `receipt`, `read` and `listen` works with shared
+  conversations. `read --shared --pending --session UUID --prepare` prepares
+  a shared baseline; `--resume TOKEN` in place of `--prepare` resumes reading
+  it. `read --shared --session UUID --after REV --continuation TOKEN`, or the
+  same options on `listen --follow`, then continues the live shared feed.
+  Shared replies name their speaker, and the shared feed reports each
+  person's Seen and each answer.
+- No released Harklight Server supports shared messages yet, so these options
+  have nothing to use until one does. Existing commands keep their output
+  formats.
+
+Compatibility: protocol 0.2; works with Harklight Server 0.2.16 and later.
 
 ## 0.2.8
 
