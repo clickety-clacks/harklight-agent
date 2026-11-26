@@ -17,7 +17,7 @@ mod setup;
 #[command(
     name = "harklight-agent",
     version,
-    about = "Send and receive request-bound Harklight conversations"
+    about = "Send and receive messages through Harklight, an attention-based UI"
 )]
 struct Cli {
     #[arg(long, global = true, env = "HARKLIGHT_IDENTITY_DIR")]

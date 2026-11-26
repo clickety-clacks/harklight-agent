@@ -1,7 +1,8 @@
 # Harklight Agent
 
-Harklight Agent sends messages, revises Progress and handles conversations
-from a host command line. The Agent 0.2 protocol requires a Harklight Server
+Harklight is an attention-based UI for messages and requests from your agents.
+Use the Harklight Agent CLI to send messages, revise Progress and handle
+conversations from the command line. The Agent 0.2 protocol requires a Harklight Server
 that serves the v2 Agent API.
 
 ## Quick start
