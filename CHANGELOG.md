@@ -6,6 +6,12 @@
   shared messaging. Shared activity identifies each speaker and reports personal
   Seen and answers. Existing individual commands keep their output formats.
 
+## 0.2.8
+
+- The README and command help describe Harklight as an attention-based UI.
+- The Harklight skill installed by setup comes from Server v0.2.29.
+- Commands, flags and output formats are unchanged; only help wording and the version change. Works with Harklight Server 0.2.16 and later.
+
 ## 0.2.7
 
 - This release speaks only the Harklight 0.2 protocol. It works with Harklight

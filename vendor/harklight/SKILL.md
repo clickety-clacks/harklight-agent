@@ -1,6 +1,6 @@
 ---
 name: harklight
-version: "0.2.21"
+version: "0.2.29"
 description: >-
   Send the person a question, a decision with choices or a notice through
   Harklight, and read their answer, with the harklight-agent command.
@@ -10,10 +10,10 @@ description: >-
 
 # Harklight
 
-Harklight delivers this agent's questions and notices to the person's Harklight
-inbox (iPhone app or web) and returns their answers. The person connects this
-computer with `harklight-agent setup` and uses the same command to refresh the
-skill. After setup, the `harklight-agent` command needs no connection options.
+Harklight is an attention-based UI that shows this agent's questions and notices
+in the person's attention list (iPhone app or web) and returns their answers.
+The person connects this computer with `harklight-agent setup` and uses the
+same command to refresh the skill. After setup, the `harklight-agent` command needs no connection options.
 If you need to check which Server, account or sender IDs this computer can
 use, ask the person to run `harklight-agent setup` with no arguments and share
 the status it prints. Connecting a disconnected computer requires their
@@ -40,7 +40,7 @@ deployed endpoint or same-session delivery integration.
 
 An enrolled **device identity** sends under its sender grants and reads the
 agent change feed (`/v2/agent`) for messages sent by that enrolled key. It can
-also read its person's device inbox through the separate device interface.
+also read the person's attention list through the separate device interface.
 Enrollment does not grant ownership or every sender ID. The **sender ID**
 identifies the source of a message; a message's identity is its server-issued
 `item_id`. A sender ID plus message ID only looks up a message accepted before
@@ -218,7 +218,7 @@ from that position.
 
 Feed output is not proof that a harness received an entry. Real same-session
 background-completion delivery must be established by the integration. Do not
-claim it from a running process, queued background task or printed line.
+claim it from a running process, pending background task or printed line.
 
 The standalone CLI does not provide a managed runtime's wake integration.
 An existing runtime may own that integration and deliver entries into its
@@ -228,7 +228,7 @@ procedure.
 Keep unsupported work with its current task owner, report the actual limitation
 and use a supported continuation or a later one-shot read. Do not fabricate a
 listener, transfer the sender or introduce a receipt-polling loop. If a background
-completion is not delivered, retain the queued work for the next turn of the
+completion is not delivered, retain the pending work for the next turn of the
 same session. When it resumes, catch up with
 `read --session "$HARKLIGHT_SESSION"` and rearm if work remains. Loss of a
 connection or process does not close a request or conversation.
