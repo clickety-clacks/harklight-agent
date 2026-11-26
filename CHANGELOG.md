@@ -1,9 +1,10 @@
 # Release notes
 
-## Unreleased
+## 0.2.8
 
 - The README and command help describe Harklight as an attention-based UI.
 - The Harklight skill installed by setup comes from Server v0.2.29.
+- No command, flag or output changed. Works with Harklight Server 0.2.16 and later.
 
 ## 0.2.7
 
