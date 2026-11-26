@@ -11,15 +11,16 @@
   supports shared messages.
 - `--shared` on `messages`, `message-get`, `message-entries`, `reply`,
   `revise`, `retract`, `receipt`, `read` and `listen` works with shared
-  conversations. `read --shared --pending` prepares a baseline, and
-  `--continuation` resumes the shared feed from it. Shared replies name their
+  conversations. `read --shared --pending --session UUID --prepare` prepares
+  a shared baseline (`--resume TOKEN` resumes preparing it), and
+  `read --shared --session UUID --after REV --continuation TOKEN`, or the
+  same options on `listen --follow`, continues the live shared feed from it. Shared replies name their
   speaker, and the shared feed reports each person's Seen and each answer.
 - No released Harklight Server supports shared messages yet, so these options
   have nothing to use until one does. Existing commands keep their output
   formats.
 
-Compatibility: protocol 0.2; works with Harklight Server 0.2.16 and later. The
-Linux builds need glibc 2.38 or newer.
+Compatibility: protocol 0.2; works with Harklight Server 0.2.16 and later.
 
 ## 0.2.8
 
