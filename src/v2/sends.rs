@@ -162,6 +162,16 @@ pub fn send(
             body[field] = value.clone();
         }
     }
+    if body["recipients"]["kind"] == "group" {
+        let capabilities = client
+            .capabilities()
+            .map_err(|error| WriteFailure::local(error.to_string()))?;
+        if capabilities["groups"] != true {
+            return Err(WriteFailure::from_saved_refusal(json!({
+                "kind":"refused","operation":"send","op_id":key,"status":400,"error":"unsupported",
+            })));
+        }
+    }
     let uploads = if input.files.is_empty() {
         Vec::new()
     } else {

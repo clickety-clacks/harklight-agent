@@ -1954,6 +1954,71 @@ fn group_send_preserves_selector_and_replays_with_both_capabilities() {
 }
 
 #[test]
+fn new_group_prepare_checks_discovery_without_saving_a_refused_operation() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"features":{"shared_messages":true}})),
+        FixtureResponse::json(json!({"features":{"shared_messages":true,"groups":true}})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let attachment = fixture.0.join("draft.txt");
+    fs::write(&attachment, "Group attachment").unwrap();
+    let key = Uuid::new_v4().to_string();
+    let args = [
+        "send",
+        "--sender-id",
+        "app:test",
+        "--type",
+        "fyi",
+        "--title",
+        "Notice",
+        "--group-name",
+        "Planning",
+        "--file",
+        attachment.to_str().unwrap(),
+        "--prepare",
+        "--op-id",
+        &key,
+    ];
+
+    let refusal = fixture.run(&args);
+    assert_eq!(refusal.status.code(), Some(5), "{refusal:?}");
+    let refusal: Value = serde_json::from_slice(&refusal.stdout).unwrap();
+    assert_eq!(
+        refusal,
+        json!({
+            "kind":"refused","operation":"send","op_id":key,"status":400,"error":"unsupported"
+        })
+    );
+    let journal: Value = serde_json::from_slice(&fixture.run(&["journal-id"]).stdout).unwrap();
+    let pinned = fixture.run(&[
+        "retry",
+        "--op-id",
+        &key,
+        "--journal-id",
+        journal["journal_id"].as_str().unwrap(),
+    ]);
+    assert_eq!(pinned.status.code(), Some(1), "{pinned:?}");
+    let absent: Value = serde_json::from_slice(&pinned.stdout).unwrap();
+    assert_eq!(absent["kind"], "operation_absent");
+    assert!(!fixture.0.join("state/upload-staging").exists());
+
+    let prepared = fixture.run(&args);
+    assert!(prepared.status.success(), "{prepared:?}");
+    let repeated = fixture.run(&args);
+    assert!(repeated.status.success(), "{repeated:?}");
+    assert_eq!(prepared.stdout, repeated.stdout);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.line.starts_with("GET /v2/me "))
+    );
+}
+
+#[test]
 fn group_capability_refuses_before_any_group_write() {
     use test_tls::FixtureResponse;
     let (server, identity) = SlowServer::mutual_tls_sequence(vec![
