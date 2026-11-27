@@ -314,7 +314,7 @@ fn write(
     deliver(client, journal, &lock, operation)
 }
 
-fn unsupported_alarm(operation: &str, key: Uuid, detail: &str) -> WriteFailure {
+pub(super) fn unsupported_alarm(operation: &str, key: Uuid, detail: &str) -> WriteFailure {
     let mut failure = WriteFailure::from_saved_refusal(json!({
         "kind":"refused","operation":operation,"op_id":key,"status":400,"error":"unsupported",
     }));

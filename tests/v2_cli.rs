@@ -2232,6 +2232,44 @@ fn explicit_alarm_refuses_shared_writes_before_contacting_the_server() {
 }
 
 #[test]
+fn alarm_revision_flags_refuse_shared_scope_before_reading_the_item() {
+    let (server, identity) = SlowServer::mutual_tls_respond_to(|request| {
+        panic!("shared Alarm revision unexpectedly sent {}", request.line);
+    });
+    let fixture = CliFixture::new(&server, identity);
+
+    for scope in ["--shared", "--groups"] {
+        let args = [
+            "revise",
+            scope,
+            "--item-id",
+            "missing-item",
+            "--base-revision",
+            "1",
+            "--title",
+            "Revised",
+        ];
+        for flags in [&["--importance", "alarm"][..], &["--clear-alarm"][..]] {
+            let result = fixture.run(&[&args[..], flags].concat());
+            assert_eq!(result.status.code(), Some(5), "{result:?}");
+            let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(output["kind"], "refused");
+            assert_eq!(output["operation"], "revise");
+            assert_eq!(output["status"], 400);
+            assert_eq!(output["error"], "unsupported");
+        }
+
+        let conflict =
+            fixture.run(&[&args[..], &["--importance", "alarm", "--clear-alarm"]].concat());
+        assert_eq!(conflict.status.code(), Some(2), "{conflict:?}");
+        assert!(
+            String::from_utf8_lossy(&conflict.stderr)
+                .contains("--clear-alarm conflicts with --importance alarm")
+        );
+    }
+}
+
+#[test]
 fn alarm_revision_preserves_ordinary_urgency_and_can_clear_or_omit_marker() {
     use test_tls::FixtureResponse;
 
