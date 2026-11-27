@@ -86,7 +86,7 @@ enum Command {
         message_kind: Option<String>,
         #[arg(
             long,
-            help = "Your importance estimate; Harklight decides the priority the recipient sees. On Servers with quiet-by-default alerts, requests and high/now messages alert the phone. Other messages arrive quietly unless the recipient wants all alerts."
+            help = "Your importance estimate; Harklight decides the priority the recipient sees. Alarm places the message above ordinary activity without changing alerts. On Servers with quiet-by-default alerts, requests and high/now messages alert the phone. Other messages arrive quietly unless the recipient wants all alerts."
         )]
         importance: Option<String>,
         #[arg(long, help = "Add a free-text Reply action to a request")]
@@ -362,7 +362,7 @@ enum Command {
         #[arg(long, conflicts_with_all = [
             "title", "body", "choices", "clear_choices", "message_type", "message_kind",
             "reply", "importance", "by_when", "stake", "default_choice", "default_at",
-            "clear_default", "choice_styles"
+            "clear_default", "choice_styles", "clear_alarm"
         ])]
         message_json: Option<PathBuf>,
         #[arg(long)]
@@ -387,9 +387,12 @@ enum Command {
         reply: bool,
         #[arg(
             long,
-            help = "Your importance estimate; Harklight decides the priority the recipient sees"
+            help = "Your importance estimate; Harklight decides the priority the recipient sees. Alarm places the message above ordinary activity without changing alerts"
         )]
         importance: Option<String>,
+        /// Remove the Alarm marker and keep ordinary importance unless explicitly changed.
+        #[arg(long)]
+        clear_alarm: bool,
         #[arg(long, help = "RFC 3339 time by which this matters")]
         by_when: Option<String>,
         #[arg(long)]
@@ -1282,6 +1285,7 @@ fn run_device_write(cli: &Cli) {
             message_kind,
             reply,
             importance,
+            clear_alarm,
             by_when,
             stake,
             default_choice,
@@ -1300,6 +1304,7 @@ fn run_device_write(cli: &Cli) {
                 message_kind: message_kind.clone(),
                 reply: *reply,
                 importance: importance.clone(),
+                clear_alarm: *clear_alarm,
                 by_when: by_when.clone(),
                 stake: stake.clone(),
                 default_choice: default_choice.clone(),

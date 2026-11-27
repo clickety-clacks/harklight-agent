@@ -172,6 +172,7 @@ pub fn send(
             })));
         }
     }
+    writes::check_new_alarm(client, "send", key, &body["message"])?;
     let uploads = if input.files.is_empty() {
         Vec::new()
     } else {
