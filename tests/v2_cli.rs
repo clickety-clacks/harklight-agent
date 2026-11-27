@@ -1862,6 +1862,199 @@ fn commands_other_than_setup_leave_skill_directories_untouched() {
 }
 
 #[test]
+fn group_send_preserves_selector_and_replays_with_both_capabilities() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_tls::FixtureResponse;
+
+    for (flag, value, selector_field) in [
+        ("--group-id", "group/opaque", "group_id"),
+        ("--group-name", "Release crew", "name"),
+    ] {
+        let attempts = AtomicUsize::new(0);
+        let (server, identity) = SlowServer::mutual_tls_respond_to(move |request| {
+            if request.line.starts_with("GET /v2/me ") {
+                assert!(
+                    !request
+                        .headers
+                        .iter()
+                        .any(|(key, _)| key == "harklight-features")
+                );
+                return Some(FixtureResponse::json(json!({
+                    "features":{"shared_messages":true,"groups":true}
+                })));
+            }
+            assert_eq!(request.line.trim_end(), "POST /v2/agent/messages HTTP/1.1");
+            assert!(
+                request
+                    .headers
+                    .contains(&("harklight-features".into(), "shared_messages,groups".into()))
+            );
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body["recipients"],
+                json!({"kind":"group",selector_field:value})
+            );
+            assert_eq!(
+                body["answer_policy"],
+                json!({"kind":"named","people":["decider"]})
+            );
+            let mut response = FixtureResponse::json(json!({
+                "rev":3,"recipients":{"kind":"group","group_id":"group/opaque"},"message":{
+                    "rev":3,"revision":1,"item_id":"item/opaque","seen":false,"files":[],
+                    "sender":body["sender"],"message":body["message"],
+                    "shared":{"shared_id":"item/opaque","group":{"id":"group/opaque","name":"Release crew"}}
+                }
+            }));
+            response.truncate = attempts.fetch_add(1, Ordering::Relaxed) == 0;
+            Some(response)
+        });
+        let fixture = CliFixture::new(&server, identity);
+        let key = Uuid::new_v4().to_string();
+        let prepared = fixture.run(&[
+            "send",
+            "--sender-id",
+            "app:test",
+            "--type",
+            "request",
+            "--reply",
+            "--title",
+            "Notice",
+            flag,
+            value,
+            "--decider-id",
+            "decider",
+            "--prepare",
+            "--op-id",
+            &key,
+        ]);
+        assert!(prepared.status.success(), "{prepared:?}");
+        let output: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+        assert_eq!(
+            output["prepared"]["recipients"],
+            json!({"kind":"group",selector_field:value})
+        );
+        let first = fixture.run(&["send", "--execute", "--op-id", &key]);
+        assert_eq!(first.status.code(), Some(7), "{first:?}");
+        let journal: Value = serde_json::from_slice(&fixture.run(&["journal-id"]).stdout).unwrap();
+        let replay = fixture.run(&[
+            "retry",
+            "--op-id",
+            &key,
+            "--journal-id",
+            journal["journal_id"].as_str().unwrap(),
+        ]);
+        assert!(replay.status.success(), "{replay:?}");
+        let output: Value = serde_json::from_slice(&replay.stdout).unwrap();
+        assert_eq!(output["item_id"], "item/opaque");
+        assert_eq!(
+            output["response"]["recipients"],
+            json!({"kind":"group","group_id":"group/opaque"})
+        );
+    }
+}
+
+#[test]
+fn new_group_prepare_checks_discovery_without_saving_a_refused_operation() {
+    use test_tls::FixtureResponse;
+
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"features":{"shared_messages":true}})),
+        FixtureResponse::json(json!({"features":{"shared_messages":true,"groups":true}})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    let attachment = fixture.0.join("draft.txt");
+    fs::write(&attachment, "Group attachment").unwrap();
+    let key = Uuid::new_v4().to_string();
+    let args = [
+        "send",
+        "--sender-id",
+        "app:test",
+        "--type",
+        "fyi",
+        "--title",
+        "Notice",
+        "--group-name",
+        "Planning",
+        "--file",
+        attachment.to_str().unwrap(),
+        "--prepare",
+        "--op-id",
+        &key,
+    ];
+
+    let refusal = fixture.run(&args);
+    assert_eq!(refusal.status.code(), Some(5), "{refusal:?}");
+    let refusal: Value = serde_json::from_slice(&refusal.stdout).unwrap();
+    assert_eq!(
+        refusal,
+        json!({
+            "kind":"refused","operation":"send","op_id":key,"status":400,"error":"unsupported"
+        })
+    );
+    let journal: Value = serde_json::from_slice(&fixture.run(&["journal-id"]).stdout).unwrap();
+    let pinned = fixture.run(&[
+        "retry",
+        "--op-id",
+        &key,
+        "--journal-id",
+        journal["journal_id"].as_str().unwrap(),
+    ]);
+    assert_eq!(pinned.status.code(), Some(1), "{pinned:?}");
+    let absent: Value = serde_json::from_slice(&pinned.stdout).unwrap();
+    assert_eq!(absent["kind"], "operation_absent");
+    assert!(!fixture.0.join("state/upload-staging").exists());
+
+    let prepared = fixture.run(&args);
+    assert!(prepared.status.success(), "{prepared:?}");
+    let repeated = fixture.run(&args);
+    assert!(repeated.status.success(), "{repeated:?}");
+    assert_eq!(prepared.stdout, repeated.stdout);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.line.starts_with("GET /v2/me "))
+    );
+}
+
+#[test]
+fn group_capability_refuses_before_any_group_write() {
+    use test_tls::FixtureResponse;
+    let (server, identity) = SlowServer::mutual_tls_sequence(vec![
+        FixtureResponse::json(json!({"features":{"shared_messages":true}})),
+        FixtureResponse::json(json!({"features":{"shared_messages":true}})),
+    ]);
+    let fixture = CliFixture::new(&server, identity);
+    for args in [
+        &[
+            "send",
+            "--sender-id",
+            "app:test",
+            "--type",
+            "fyi",
+            "--title",
+            "Notice",
+            "--group-id",
+            "g",
+        ][..],
+        &["reply", "--groups", "--item-id", "item", "--body", "Notice"][..],
+    ] {
+        let refusal = fixture.run(args);
+        assert_eq!(refusal.status.code(), Some(5), "{refusal:?}");
+        let output: Value = serde_json::from_slice(&refusal.stdout).unwrap();
+        assert_eq!(output["kind"], "refused");
+        assert_eq!(output["error"], "unsupported");
+    }
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.line.starts_with("GET /v2/me "))
+    );
+}
+
+#[test]
 fn recipient_reach_notice_preserves_send_and_message_get_json() {
     use test_tls::FixtureResponse;
 

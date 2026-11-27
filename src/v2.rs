@@ -21,6 +21,7 @@ pub struct AgentClient {
     identity: EnrolledIdentity,
     ack2: bool,
     shared: bool,
+    groups: bool,
     continuation: Option<String>,
 }
 
@@ -36,6 +37,7 @@ impl AgentClient {
             identity,
             ack2: false,
             shared: false,
+            groups: false,
             continuation: None,
         })
     }
@@ -45,8 +47,15 @@ impl AgentClient {
         self
     }
 
+    pub fn with_groups(mut self) -> Self {
+        self.shared = true;
+        self.groups = true;
+        self
+    }
+
     fn without_shared(mut self) -> Self {
         self.shared = false;
+        self.groups = false;
         self
     }
 
@@ -157,7 +166,9 @@ impl AgentClient {
     }
 
     fn send(&self, request: RequestBuilder) -> Result<Response, V2Error> {
-        let request = if self.shared {
+        let request = if self.groups {
+            request.header("Harklight-Features", "shared_messages,groups")
+        } else if self.shared {
             request.header("Harklight-Features", "shared_messages")
         } else {
             request

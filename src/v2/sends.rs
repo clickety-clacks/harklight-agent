@@ -29,13 +29,49 @@ pub struct SendInput<'a> {
     pub fields: &'a MessageFieldOptions,
     pub answer_ui: Option<&'a Path>,
     pub choices_json: Option<&'a Path>,
-    pub shared: Option<SharedPeople<'a>>,
+    pub shared: Option<SharedSend<'a>>,
 }
 
-pub struct SharedPeople<'a> {
-    pub people: &'a [String],
-    pub organization: Option<&'a str>,
+pub struct SharedSend<'a> {
+    pub recipients: Recipients<'a>,
     pub decider: Option<&'a str>,
+}
+
+pub enum Recipients<'a> {
+    People {
+        people: &'a [String],
+        organization: Option<&'a str>,
+    },
+    GroupId(&'a str),
+    GroupName(&'a str),
+}
+
+impl Recipients<'_> {
+    fn selector(&self) -> Result<Value, WriteFailure> {
+        let selector = match self {
+            Self::People {
+                people,
+                organization,
+            } if !people.is_empty()
+                && !people.iter().any(String::is_empty)
+                && *organization != Some("") =>
+            {
+                let mut selector = json!({"kind":"people","people":people});
+                if let Some(organization) = organization {
+                    selector["organization_id"] = (*organization).into();
+                }
+                selector
+            }
+            Self::GroupId(id) if !id.is_empty() => json!({"kind":"group","group_id":id}),
+            Self::GroupName(name) if !name.trim().is_empty() => json!({"kind":"group","name":name}),
+            _ => {
+                return Err(WriteFailure::local_refusal(
+                    "Invalid shared recipient selection.",
+                ));
+            }
+        };
+        Ok(selector)
+    }
 }
 
 pub fn send(
@@ -69,10 +105,7 @@ pub fn send(
         "server_binding":client.server_binding(),"files":manifest,
     });
     if let Some(shared) = &input.shared {
-        if shared.people.is_empty()
-            || shared.people.iter().any(String::is_empty)
-            || shared.organization == Some("")
-            || shared.decider == Some("")
+        if shared.decider == Some("")
             || !input.supersedes.is_empty()
             || !input.supersedes_local.is_empty()
         {
@@ -80,11 +113,7 @@ pub fn send(
                 "Invalid shared recipient selection.",
             ));
         }
-        let mut selector = json!({"kind":"people","people":shared.people});
-        if let Some(organization) = shared.organization {
-            selector["organization_id"] = organization.into();
-        }
-        inputs["recipients"] = selector;
+        inputs["recipients"] = shared.recipients.selector()?;
         if let Some(decider) = shared.decider {
             if fields.message_type.as_deref() != Some("request") {
                 return Err(WriteFailure::local_refusal(
@@ -131,6 +160,16 @@ pub fn send(
     for field in ["recipients", "answer_policy"] {
         if let Some(value) = inputs.get(field) {
             body[field] = value.clone();
+        }
+    }
+    if body["recipients"]["kind"] == "group" {
+        let capabilities = client
+            .capabilities()
+            .map_err(|error| WriteFailure::local(error.to_string()))?;
+        if capabilities["groups"] != true {
+            return Err(WriteFailure::from_saved_refusal(json!({
+                "kind":"refused","operation":"send","op_id":key,"status":400,"error":"unsupported",
+            })));
         }
     }
     let uploads = if input.files.is_empty() {
@@ -372,9 +411,11 @@ mod tests {
                 },
                 answer_ui: None,
                 choices_json: Some(&choices_json),
-                shared: Some(SharedPeople {
-                    people: &people,
-                    organization: None,
+                shared: Some(SharedSend {
+                    recipients: Recipients::People {
+                        people: &people,
+                        organization: None,
+                    },
                     decider: Some("person-a"),
                 }),
             };

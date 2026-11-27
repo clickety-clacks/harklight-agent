@@ -1,5 +1,10 @@
 # Release notes
 
+## Unreleased
+
+- Send to groups by ID or self-hosted name. Use group-scoped activity reads
+  and sender commands on Servers that advertise group messaging.
+
 ## 0.2.10
 
 - A committed `send`, and `message-get` without `--revision`, print "No one
