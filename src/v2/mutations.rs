@@ -40,7 +40,9 @@ pub fn submit(
         "wire":mutation.draft,
         "file_inputs":manifest,
     });
-    if client.shared {
+    if client.groups {
+        request["groups"] = json!(true);
+    } else if client.shared {
         request["shared"] = json!(true);
     }
     if mutation.draft.method == RequestMethod::Put {

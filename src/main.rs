@@ -50,6 +50,7 @@ enum Command {
     #[command(
         after_help = "For picture choices, provide an attention-client.ui/1 document and attach its images with --file:\n  harklight-agent send --session new --sender-id app:example --type request --title \"Choose the cover\" --answer-ui cover.json --file cover-a.jpg --file cover-b.jpg\n\nOnly after a definite refusal (exit 2), correct the named input and submit a new send. A prepared operation stays unchanged; use a new operation for the correction. For an unknown outcome (exit 7), retry only with `harklight-agent retry --op-id <KEY>` using the same key and unchanged inputs; do not submit a changed send."
     )]
+    #[command(group(ArgGroup::new("recipients").args(["people", "group_id", "group_name"])))]
     Send {
         #[arg(long, value_name = "UUID|new")]
         session: Option<String>,
@@ -143,11 +144,17 @@ enum Command {
         /// Address this person ID in the shared request. Repeat to reach several people.
         #[arg(long = "person-id", conflicts_with_all = ["supersedes", "supersedes_local"])]
         people: Vec<String>,
+        /// Address a group by its opaque Server ID.
+        #[arg(long, conflicts_with_all = ["supersedes", "supersedes_local"])]
+        group_id: Option<String>,
+        /// Address a group by its name on a self-hosted Server.
+        #[arg(long, conflicts_with_all = ["supersedes", "supersedes_local"])]
+        group_name: Option<String>,
         /// Select the organization shared by the sender and all named people.
         #[arg(long, requires = "people")]
         organization: Option<String>,
         /// Only this person ID may settle the shared request.
-        #[arg(long, requires = "people")]
+        #[arg(long, requires = "recipients")]
         decider_id: Option<String>,
         #[arg(long, conflicts_with = "execute")]
         prepare: bool,
@@ -156,7 +163,7 @@ enum Command {
             "message_type", "message_kind", "importance", "reply", "supersedes", "supersedes_local", "by_when",
             "stake", "thread", "default_choice", "default_at", "choice_styles", "files",
             "answer_ui_file", "progress", "progress_stage", "progress_note",
-            "people", "organization", "decider_id", "choices_json"
+            "people", "group_id", "group_name", "organization", "decider_id", "choices_json"
         ])]
         execute: bool,
         #[arg(long)]
@@ -191,6 +198,9 @@ enum Command {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long, requires = "message_id")]
@@ -202,11 +212,16 @@ enum Command {
     },
     /// Discover the Server identity and shared messaging capabilities.
     Capabilities,
+    /// List groups the authenticated person has joined.
+    Groups,
     /// List sent messages, newest first.
     Messages {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         session: Option<Uuid>,
         #[arg(long)]
@@ -231,6 +246,9 @@ enum Command {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long)]
@@ -272,6 +290,9 @@ enum Command {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         item_id: String,
         #[arg(long)]
@@ -290,17 +311,24 @@ enum Command {
     },
     /// Close chat on a shared message you sent.
     ChatClose {
+        /// Close chat on a group message.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         item_id: String,
         #[arg(long)]
         op_id: Option<Uuid>,
     },
+    #[command(group(ArgGroup::new("scope").args(["shared", "groups"]).multiple(true)))]
     Reply {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         /// Notify only this participant while keeping the reply visible to everyone.
-        #[arg(long, requires = "shared")]
+        #[arg(long, requires = "scope")]
         notify_person_id: Option<String>,
         #[arg(long)]
         item_id: String,
@@ -322,6 +350,9 @@ enum Command {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         item_id: String,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -388,6 +419,9 @@ enum Command {
         /// Enable shared conversation projections on this command.
         #[arg(long)]
         shared: bool,
+        /// Include group conversations.
+        #[arg(long)]
+        groups: bool,
         #[arg(long)]
         item_id: Option<String>,
         #[arg(long)]
@@ -516,11 +550,15 @@ struct EnrollStatusArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("scope").args(["shared", "groups"]).multiple(true)))]
 struct FeedArgs {
     /// Read shared activity with a caller-owned continuation.
     #[arg(long)]
     shared: bool,
-    #[arg(long, requires_all = ["shared", "after"])]
+    /// Include group conversations with a group-scoped continuation.
+    #[arg(long)]
+    groups: bool,
+    #[arg(long, requires_all = ["scope", "after"])]
     continuation: Option<String>,
     /// Take waiting work for this session only.
     #[arg(long, value_name = "UUID")]
@@ -678,6 +716,7 @@ fn main() {
         ),
         Command::Focus { follow: true } => run_device_feed(&cli, None, feed::Mode::Focus),
         Command::Capabilities
+        | Command::Groups
         | Command::MessageGet { .. }
         | Command::Messages { .. }
         | Command::Search { .. }
@@ -705,8 +744,8 @@ fn run_pending_read(cli: &Cli, args: &ReadArgs) {
     let client = AgentClient::new(device_identity(cli))
         .unwrap_or_else(|error| fail(error.to_string(), 1))
         .with_ack2(args.feed.ack2);
-    let client = if args.feed.shared {
-        shared_client(client, "read")
+    let client = if args.feed.shared || args.feed.groups {
+        shared_client(client, "read", args.feed.groups)
     } else {
         client
     };
@@ -743,7 +782,7 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
     let client = AgentClient::new(identity)
         .unwrap_or_else(|error| fail(error.to_string(), 1))
         .with_ack2(args.is_some_and(|args| args.ack2));
-    let shared = args.is_some_and(|args| args.shared);
+    let shared = args.is_some_and(|args| args.shared || args.groups);
     let client = if shared {
         let args = args.expect("shared feed has arguments");
         if args.after.is_none() || args.continuation.as_deref().is_none_or(str::is_empty) {
@@ -752,7 +791,7 @@ fn run_device_feed(cli: &Cli, args: Option<&FeedArgs>, mode: feed::Mode) {
                 2,
             );
         }
-        shared_client(client, "feed").with_continuation(args.continuation.clone())
+        shared_client(client, "feed", args.groups).with_continuation(args.continuation.clone())
     } else {
         client
     };
@@ -816,31 +855,49 @@ fn device_identity(cli: &Cli) -> EnrolledIdentity {
         .unwrap_or_else(|error| fail(error.to_string(), 1))
 }
 
-fn shared_client(client: AgentClient, operation: &str) -> AgentClient {
+fn shared_client(client: AgentClient, operation: &str, groups: bool) -> AgentClient {
     let capabilities = client
         .capabilities()
         .unwrap_or_else(|error| fail_read(operation, error, false));
-    if capabilities["shared_messages"] != true {
+    let feature = if groups { "groups" } else { "shared_messages" };
+    if capabilities[feature] != true {
         println!(
             "{}",
             serde_json::json!({"kind":"unsupported","operation":operation})
         );
-        fail("The Server does not advertise shared messaging.".into(), 5);
+        let name = if groups {
+            "group messaging"
+        } else {
+            "shared messaging"
+        };
+        fail(format!("The Server does not advertise {name}."), 5);
     }
-    client.with_shared()
+    if groups {
+        client.with_groups()
+    } else {
+        client.with_shared()
+    }
 }
 
 fn run_device_read(cli: &Cli) {
     let identity = device_identity(cli);
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
     let client = match &cli.command {
-        Command::MessageGet { shared: true, .. } => shared_client(client, "message-get"),
-        Command::Messages { shared: true, .. } => shared_client(client, "messages"),
-        Command::MessageEntries { shared: true, .. } => shared_client(client, "message-entries"),
+        Command::MessageGet { shared, groups, .. } if *shared || *groups => {
+            shared_client(client, "message-get", *groups)
+        }
+        Command::Messages { shared, groups, .. } if *shared || *groups => {
+            shared_client(client, "messages", *groups)
+        }
+        Command::MessageEntries { shared, groups, .. } if *shared || *groups => {
+            shared_client(client, "message-entries", *groups)
+        }
+        Command::Groups => client.with_groups(),
         _ => client,
     };
     let (operation, result) = match &cli.command {
         Command::Capabilities => ("capabilities", client.capabilities()),
+        Command::Groups => ("groups", client.read(&["agent", "groups"], &[])),
         Command::MessageGet {
             item_id: Some(id),
             revision,
@@ -1039,6 +1096,11 @@ fn run_device_write(cli: &Cli) {
     };
     let client = AgentClient::new(identity).unwrap_or_else(|error| fail(error.to_string(), 1));
     let client = match &cli.command {
+        Command::Retract { groups: true, .. }
+        | Command::ChatClose { groups: true, .. }
+        | Command::Reply { groups: true, .. }
+        | Command::Revise { groups: true, .. }
+        | Command::Receipt { groups: true, .. } => client.with_groups(),
         Command::Retract { shared: true, .. } | Command::ChatClose { .. } => client.with_shared(),
         Command::Reply { shared: true, .. } => client.with_shared(),
         Command::Revise { shared: true, .. } => client.with_shared(),
@@ -1082,6 +1144,8 @@ fn run_device_write(cli: &Cli) {
             prepare,
             op_id,
             people,
+            group_id,
+            group_name,
             organization,
             decider_id,
             ..
@@ -1125,9 +1189,18 @@ fn run_device_write(cli: &Cli) {
                     fields: &fields,
                     answer_ui: answer_ui_file.as_deref(),
                     choices_json: choices_json.as_deref(),
-                    shared: (!people.is_empty()).then_some(sends::SharedPeople {
-                        people,
-                        organization: organization.as_deref(),
+                    shared: if let Some(id) = group_id {
+                        Some(sends::Recipients::GroupId(id))
+                    } else if let Some(name) = group_name {
+                        Some(sends::Recipients::GroupName(name))
+                    } else {
+                        (!people.is_empty()).then_some(sends::Recipients::People {
+                            people,
+                            organization: organization.as_deref(),
+                        })
+                    }
+                    .map(|recipients| sends::SharedSend {
+                        recipients,
                         decider: decider_id.as_deref(),
                     }),
                 },
@@ -1135,7 +1208,7 @@ fn run_device_write(cli: &Cli) {
                 *prepare,
             )
         }
-        Command::ChatClose { item_id, op_id } => writes::post(
+        Command::ChatClose { item_id, op_id, .. } => writes::post(
             &client,
             &mut journal,
             "chat-close",

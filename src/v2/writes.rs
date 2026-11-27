@@ -299,7 +299,9 @@ fn write(
     }
     let lock = journal.lock_operation(op_id)?;
     let mut inputs = json!({"method":method,"path":path,"body":body});
-    if client.shared {
+    if client.groups {
+        inputs["groups"] = json!(true);
+    } else if client.shared {
         inputs["shared"] = json!(true);
     }
     let operation = journal.prepare_v2_operation(
@@ -514,16 +516,27 @@ fn deliver_operation(
     }
 
     let was_unknown = operation.state == OperationState::Unknown;
-    let shared_send = operation
+    let selector = operation
         .prepared_send
         .as_ref()
-        .is_some_and(|send| send.request.get("recipients").is_some());
+        .and_then(|send| send.request.get("recipients"));
+    let group_scope = operation.request["groups"] == true
+        || selector.is_some_and(|selector| selector["kind"] == "group");
+    let shared_send = selector.is_some();
     let client = client.clone().without_shared();
-    if shared_send {
+    if group_scope || shared_send {
+        let feature = if group_scope {
+            "groups"
+        } else {
+            "shared_messages"
+        };
         match client.capabilities() {
-            Ok(features) if features["shared_messages"] == true => {}
+            Ok(features) if features[feature] == true => {}
             result if was_unknown => {
                 let detail = match result {
+                    Ok(_) if group_scope => {
+                        "The Server no longer advertises group messaging.".to_owned()
+                    }
                     Ok(_) => "The Server no longer advertises shared messaging.".to_owned(),
                     Err(error) => error.to_string(),
                 };
@@ -547,7 +560,9 @@ fn deliver_operation(
             Err(error) => return Err(WriteFailure::local(error.to_string())),
         }
     }
-    let client = if shared_send || operation.request["shared"] == true {
+    let client = if group_scope {
+        client.with_groups()
+    } else if shared_send || operation.request["shared"] == true {
         client.with_shared()
     } else {
         client
@@ -682,6 +697,37 @@ fn deliver_operation(
     }
 }
 
+fn valid_send_recipients(request: &Value, response: &Value) -> bool {
+    let Some(selector) = request.get("recipients") else {
+        return true;
+    };
+    let message = &response["message"];
+    if message["shared"]["shared_id"] != message["item_id"] {
+        return false;
+    }
+    let recipients = &response["recipients"];
+    if selector["kind"] == "group" {
+        return recipients.as_object().is_some_and(|group| group.len() == 2)
+            && recipients["kind"] == "group"
+            && recipients["group_id"].as_str().is_some_and(|id| {
+                !id.is_empty()
+                    && message["shared"]["group"]["id"] == id
+                    && selector["group_id"]
+                        .as_str()
+                        .is_none_or(|requested| requested == id)
+            });
+    }
+    recipients.as_array().is_some_and(|outcomes| {
+        !outcomes.is_empty()
+            && outcomes.iter().all(|outcome| {
+                outcome["person_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+                    && matches!(outcome["status"].as_str(), Some("reached" | "unreachable"))
+            })
+    })
+}
+
 fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value) -> bool {
     if request.method == RequestMethod::Delete {
         return response.is_object();
@@ -728,20 +774,7 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
     match kind {
         "send" => {
             valid_message(message)
-                && (request_body.get("recipients").is_none()
-                    || (message["shared"]["shared_id"] == message["item_id"]
-                        && response["recipients"].as_array().is_some_and(|outcomes| {
-                            !outcomes.is_empty()
-                                && outcomes.iter().all(|outcome| {
-                                    outcome["person_id"]
-                                        .as_str()
-                                        .is_some_and(|id| !id.is_empty())
-                                        && matches!(
-                                            outcome["status"].as_str(),
-                                            Some("reached" | "unreachable")
-                                        )
-                                })
-                        })))
+                && valid_send_recipients(&request_body, response)
                 && message["sender"] == request_body["sender"]
                 && message["session"] == request_body["session"]
                 && ["title", "body", "created_at", "message_type", "progress"]

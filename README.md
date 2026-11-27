@@ -175,6 +175,20 @@ Seen and each answer. Acknowledge an answer with
 `receipt --item-id ID --answer-id ID`, and a reply with
 `receipt --shared --item-id ID --entry-id ID`.
 
+### Groups
+
+On a Server that advertises groups, use `send --group-id ID` to reach the
+group. A self-hosted Server also accepts `send --group-name NAME`. The
+`groups` command lists the groups the authenticated person has joined.
+A group's ID is distinct from the item ID returned by a send.
+
+Use `--groups` on `messages`, `message-get`, `message-entries`, `read`,
+`listen`, `reply`, `revise`, `receipt`, `chat-close`, and `retract`
+for group conversations. Before reading or following group activity, prepare
+and resume a fresh pending baseline with `--groups`. Use the same flag
+and session with its continuation. A retry uses the scope saved in the
+operation journal.
+
 ## Messages, replies and Progress
 
 - `messages [--session UUID] [--page TOKEN]` lists the current identity's
