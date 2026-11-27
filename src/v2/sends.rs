@@ -162,6 +162,13 @@ pub fn send(
             body[field] = value.clone();
         }
     }
+    writes::check_new_alarm(
+        client,
+        "send",
+        key,
+        &body["message"],
+        body.get("recipients").is_some(),
+    )?;
     if body["recipients"]["kind"] == "group" {
         let capabilities = client
             .capabilities()
@@ -172,7 +179,6 @@ pub fn send(
             })));
         }
     }
-    writes::check_new_alarm(client, "send", key, &body["message"])?;
     let uploads = if input.files.is_empty() {
         Vec::new()
     } else {

@@ -150,7 +150,7 @@ that already reached the Server can still have taken effect.
 ### Alarm priority
 
 Use `send --importance alarm` or `revise --importance alarm` to place a
-message above ordinary activity on a Server that advertises Alarm.
+individual message above ordinary activity on a Server that advertises Alarm.
 Alarm preserves the message's ordinary urgency and leaves alerts unchanged.
 Use `revise --clear-alarm` to remove the marker. A revision that omits
 the marker keeps its current value.

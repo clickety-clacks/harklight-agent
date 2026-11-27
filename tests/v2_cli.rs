@@ -2167,6 +2167,71 @@ fn alarm_send_reuses_exact_preparation_and_keeps_unknown_when_capability_is_lost
 }
 
 #[test]
+fn explicit_alarm_refuses_shared_writes_before_contacting_the_server() {
+    let (server, identity) = SlowServer::mutual_tls_respond_to(|request| {
+        panic!("shared Alarm operation unexpectedly sent {}", request.line);
+    });
+    let fixture = CliFixture::new(&server, identity);
+    let input = fixture.0.join("revision.json");
+    fs::write(&input, r#"{"title":"Alarm","created_at":1,"alarm":false}"#).unwrap();
+    for args in [
+        &[
+            "send",
+            "--sender-id",
+            "app:test",
+            "--type",
+            "fyi",
+            "--title",
+            "Alarm",
+            "--importance",
+            "alarm",
+            "--person-id",
+            "person",
+        ][..],
+        &[
+            "send",
+            "--sender-id",
+            "app:test",
+            "--type",
+            "fyi",
+            "--title",
+            "Alarm",
+            "--importance",
+            "alarm",
+            "--group-id",
+            "group",
+        ][..],
+        &[
+            "revise",
+            "--shared",
+            "--item-id",
+            "item",
+            "--base-revision",
+            "1",
+            "--message-json",
+            input.to_str().unwrap(),
+        ][..],
+        &[
+            "revise",
+            "--groups",
+            "--item-id",
+            "item",
+            "--base-revision",
+            "1",
+            "--message-json",
+            input.to_str().unwrap(),
+        ][..],
+    ] {
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["kind"], "refused");
+        assert_eq!(output["status"], 400);
+        assert_eq!(output["error"], "unsupported");
+    }
+}
+
+#[test]
 fn alarm_revision_preserves_ordinary_urgency_and_can_clear_or_omit_marker() {
     use test_tls::FixtureResponse;
 

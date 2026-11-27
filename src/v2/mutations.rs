@@ -57,7 +57,13 @@ pub fn submit(
         }
         return Err(JournalError::OperationConflict(op_id).into());
     }
-    writes::check_new_alarm(client, mutation.operation, op_id, &request["message"])?;
+    writes::check_new_alarm(
+        client,
+        mutation.operation,
+        op_id,
+        &request["message"],
+        client.shared,
+    )?;
     let session = mutation.session.unwrap_or_else(Uuid::nil);
     let uploads = if mutation.files.is_empty() {
         Vec::new()

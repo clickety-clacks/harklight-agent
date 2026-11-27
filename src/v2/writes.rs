@@ -314,11 +314,20 @@ fn write(
     deliver(client, journal, &lock, operation)
 }
 
+fn unsupported_alarm(operation: &str, key: Uuid, detail: &str) -> WriteFailure {
+    let mut failure = WriteFailure::from_saved_refusal(json!({
+        "kind":"refused","operation":operation,"op_id":key,"status":400,"error":"unsupported",
+    }));
+    failure.detail = detail.into();
+    failure
+}
+
 pub(super) fn check_new_alarm(
     client: &AgentClient,
     operation: &str,
     key: Uuid,
     message: &Value,
+    shared: bool,
 ) -> Result<(), WriteFailure> {
     let Some(alarm) = message.get("alarm") else {
         return Ok(());
@@ -328,15 +337,22 @@ pub(super) fn check_new_alarm(
             "message.alarm must be a boolean",
         ));
     }
+    if shared {
+        return Err(unsupported_alarm(
+            operation,
+            key,
+            "Alarm is available only on individual messages.",
+        ));
+    }
     let features = client
-        .clone()
-        .without_shared()
         .capabilities()
         .map_err(|error| WriteFailure::local(error.to_string()))?;
     if features["alarm"] != true {
-        return Err(WriteFailure::from_saved_refusal(json!({
-            "kind":"refused","operation":operation,"op_id":key,"status":400,"error":"unsupported",
-        })));
+        return Err(unsupported_alarm(
+            operation,
+            key,
+            "The Server does not advertise Alarm.",
+        ));
     }
     Ok(())
 }
@@ -555,6 +571,14 @@ fn deliver_operation(
         .as_ref()
         .is_some_and(|send| send.request["message"].get("alarm").is_some())
         || operation.request["message"].get("alarm").is_some();
+    if alarm && (shared_send || group_scope || operation.request["shared"] == true) {
+        let detail = "Alarm is available only on individual messages.";
+        return Err(if was_unknown {
+            unknown(&operation, detail, None)
+        } else {
+            unsupported_alarm(&operation.kind, key, detail)
+        });
+    }
     let client = client.clone().without_shared();
     if group_scope || shared_send || alarm {
         let supported = |features: &Value| {
