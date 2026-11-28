@@ -1,10 +1,14 @@
 # Release notes
 
-## Unreleased
+## 0.2.12
 
 - Use `--importance alarm` on individual send or revise to place a message above ordinary
   activity on a Server that supports Alarm. Use `revise --clear-alarm` to clear
   it. Alarm leaves urgency and alert behavior unchanged.
+Compatibility: protocol 0.2. Alarm requires a Harklight Server that
+advertises the alarm feature; on other Servers an explicit Alarm returns
+`unsupported` (exit 5) before anything is written. Other commands keep their
+current behavior and Server requirements.
 
 ## 0.2.11
 
