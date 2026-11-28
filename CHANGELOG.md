@@ -7,9 +7,10 @@
   it. Alarm leaves urgency and alert behavior unchanged.
 
 Compatibility: protocol 0.2. Alarm requires a Harklight Server that
-advertises the alarm feature; on other Servers an explicit Alarm returns
-`unsupported` (exit 5) before anything is written. Other commands keep their
-current behavior and Server requirements.
+advertises `features.alarm`, which ships in Server 0.2.36 (pending). On
+other Servers an explicit Alarm returns `unsupported` (exit 5) before
+anything is written. Other commands keep their current behavior and Server
+requirements.
 
 ## 0.2.11
 
