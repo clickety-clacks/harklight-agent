@@ -57,6 +57,13 @@ pub fn submit(
         }
         return Err(JournalError::OperationConflict(op_id).into());
     }
+    writes::check_new_alarm(
+        client,
+        mutation.operation,
+        op_id,
+        &request["message"],
+        client.shared,
+    )?;
     let session = mutation.session.unwrap_or_else(Uuid::nil);
     let uploads = if mutation.files.is_empty() {
         Vec::new()
@@ -223,6 +230,20 @@ pub fn revise_interactive(
     revision: InteractiveRevision<'_>,
     op_id: Option<Uuid>,
 ) -> Result<Value, WriteFailure> {
+    let set_alarm = revision.fields.importance.as_deref() == Some("alarm");
+    if set_alarm && revision.fields.clear_alarm {
+        return Err(WriteFailure::local_refusal(
+            "--clear-alarm conflicts with --importance alarm",
+        ));
+    }
+    if client.shared && (set_alarm || revision.fields.clear_alarm) {
+        let key = writes::operation_key(op_id)?;
+        return Err(writes::unsupported_alarm(
+            "revise",
+            key,
+            "Alarm is available only on individual messages.",
+        ));
+    }
     let snapshot = client
         .message(revision.item_id)
         .map_err(|error| read_failure("revise", error))?;

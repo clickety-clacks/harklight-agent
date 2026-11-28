@@ -1,5 +1,11 @@
 # Release notes
 
+## Unreleased
+
+- Use `--importance alarm` on individual send or revise to place a message above ordinary
+  activity on a Server that supports Alarm. Use `revise --clear-alarm` to clear
+  it. Alarm leaves urgency and alert behavior unchanged.
+
 ## 0.2.11
 
 - Send to a group with `send --group-id ID` or, on a self-hosted Server,

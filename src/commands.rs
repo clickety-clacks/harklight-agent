@@ -39,6 +39,7 @@ pub struct MessageFieldOptions {
     pub message_kind: Option<String>,
     pub reply: bool,
     pub importance: Option<String>,
+    pub clear_alarm: bool,
     pub by_when: Option<String>,
     pub stake: Option<String>,
     pub thread: Option<String>,
@@ -275,14 +276,25 @@ fn normalize_message_fields(
 ) -> NormalizedMessageFields {
     let mut normalized = NormalizedMessageFields::default();
 
+    if options.clear_alarm {
+        normalized.members.insert("alarm".into(), false.into());
+    }
     if let Some(importance) = options.importance.as_deref() {
-        if matches!(importance, "low" | "normal" | "high" | "now") {
+        if importance == "alarm" {
+            if options.clear_alarm {
+                normalized
+                    .errors
+                    .push("--clear-alarm conflicts with --importance alarm".into());
+            } else {
+                normalized.members.insert("alarm".into(), true.into());
+            }
+        } else if matches!(importance, "low" | "normal" | "high" | "now") {
             normalized
                 .members
                 .insert("urgency".into(), Value::String(importance.to_owned()));
         } else {
             normalized.errors.push(format!(
-                "--importance must be one of low, normal, high, now; got {importance:?}"
+                "--importance must be one of low, normal, high, now, alarm; got {importance:?}"
             ));
         }
     }
@@ -1079,6 +1091,7 @@ pub(crate) fn revised_message_with_fields(
     }
     if let Some(object) = message.as_object_mut() {
         object.remove("choices");
+        object.remove("alarm");
         if message_type == Some(MessageType::Fyi) {
             object.remove("default");
             object.remove("choice_styles");
@@ -1162,6 +1175,9 @@ pub(crate) fn progress_content(
         ));
     }
     let mut message = current.clone();
+    if let Some(object) = message.as_object_mut() {
+        object.remove("alarm");
+    }
     message["progress"] = progress::next_progress(current, report, at_ms)?;
     message["created_at"] = at_ms.into();
     Ok(message)
@@ -1280,7 +1296,7 @@ mod tests {
         assert_eq!(
             normalized.errors,
             vec![
-                "--importance must be one of low, normal, high, now; got \"urgent\"",
+                "--importance must be one of low, normal, high, now, alarm; got \"urgent\"",
                 "--by-when must be a valid RFC 3339 time; got \"tomorrow\" (for example, 2026-11-01T17:00:00Z)"
             ]
         );

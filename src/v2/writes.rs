@@ -314,6 +314,49 @@ fn write(
     deliver(client, journal, &lock, operation)
 }
 
+pub(super) fn unsupported_alarm(operation: &str, key: Uuid, detail: &str) -> WriteFailure {
+    let mut failure = WriteFailure::from_saved_refusal(json!({
+        "kind":"refused","operation":operation,"op_id":key,"status":400,"error":"unsupported",
+    }));
+    failure.detail = detail.into();
+    failure
+}
+
+pub(super) fn check_new_alarm(
+    client: &AgentClient,
+    operation: &str,
+    key: Uuid,
+    message: &Value,
+    shared: bool,
+) -> Result<(), WriteFailure> {
+    let Some(alarm) = message.get("alarm") else {
+        return Ok(());
+    };
+    if !alarm.is_boolean() {
+        return Err(WriteFailure::local_refusal(
+            "message.alarm must be a boolean",
+        ));
+    }
+    if shared {
+        return Err(unsupported_alarm(
+            operation,
+            key,
+            "Alarm is available only on individual messages.",
+        ));
+    }
+    let features = client
+        .capabilities()
+        .map_err(|error| WriteFailure::local(error.to_string()))?;
+    if features["alarm"] != true {
+        return Err(unsupported_alarm(
+            operation,
+            key,
+            "The Server does not advertise Alarm.",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn operation_key(op_id: Option<Uuid>) -> Result<Uuid, WriteFailure> {
     let key = op_id.unwrap_or_else(Uuid::new_v4);
     if key.get_version_num() != 4 || key.get_variant() != Variant::RFC4122 {
@@ -523,17 +566,34 @@ fn deliver_operation(
     let group_scope = operation.request["groups"] == true
         || selector.is_some_and(|selector| selector["kind"] == "group");
     let shared_send = selector.is_some();
-    let client = client.clone().without_shared();
-    if group_scope || shared_send {
-        let feature = if group_scope {
-            "groups"
+    let alarm = operation
+        .prepared_send
+        .as_ref()
+        .is_some_and(|send| send.request["message"].get("alarm").is_some())
+        || operation.request["message"].get("alarm").is_some();
+    if alarm && (shared_send || group_scope || operation.request["shared"] == true) {
+        let detail = "Alarm is available only on individual messages.";
+        return Err(if was_unknown {
+            unknown(&operation, detail, None)
         } else {
-            "shared_messages"
+            unsupported_alarm(&operation.kind, key, detail)
+        });
+    }
+    let client = client.clone().without_shared();
+    if group_scope || shared_send || alarm {
+        let supported = |features: &Value| {
+            (!group_scope || features["groups"] == true)
+                && (!shared_send || features["shared_messages"] == true)
+                && (!alarm || features["alarm"] == true)
         };
         match client.capabilities() {
-            Ok(features) if features[feature] == true => {}
+            Ok(features) if supported(&features) => {}
             result if was_unknown => {
                 let detail = match result {
+                    Ok(_) if alarm => {
+                        "The Server no longer advertises the requested capabilities for this Alarm."
+                            .to_owned()
+                    }
                     Ok(_) if group_scope => {
                         "The Server no longer advertises group messaging.".to_owned()
                     }
@@ -677,7 +737,7 @@ fn deliver_operation(
             // Feature refusal happens before receipt lookup, so it cannot
             // settle an operation whose earlier delivery may have committed.
             if was_unknown
-                && client.shared
+                && (client.shared || alarm)
                 && let V2Error::Http {
                     status: 400,
                     token: Some(token),
@@ -771,6 +831,12 @@ fn valid_write_response(kind: &str, request: &PreparedRequest, response: &Value)
             )
     };
     let message = &response["message"];
+    if matches!(kind, "send" | "revise")
+        && let Some(marked) = request_body["message"]["alarm"].as_bool()
+        && (message["message"]["alarm"] == true) != marked
+    {
+        return false;
+    }
     match kind {
         "send" => {
             valid_message(message)

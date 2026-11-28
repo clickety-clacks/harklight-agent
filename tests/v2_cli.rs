@@ -2055,6 +2055,282 @@ fn group_capability_refuses_before_any_group_write() {
 }
 
 #[test]
+fn alarm_prepare_refuses_an_older_server_without_saving_the_operation() {
+    use test_tls::FixtureResponse;
+    let (server, identity) =
+        SlowServer::mutual_tls_sequence(vec![FixtureResponse::json(json!({"features":{}}))]);
+    let fixture = CliFixture::new(&server, identity);
+    let key = Uuid::new_v4().to_string();
+    let prepared = fixture.run(&[
+        "send",
+        "--sender-id",
+        "app:test",
+        "--type",
+        "fyi",
+        "--title",
+        "Alarm",
+        "--importance",
+        "alarm",
+        "--prepare",
+        "--op-id",
+        &key,
+    ]);
+    assert_eq!(prepared.status.code(), Some(5), "{prepared:?}");
+    let output: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    assert_eq!(output["error"], "unsupported");
+    assert_eq!(output["status"], 400);
+    let journal: Value = serde_json::from_slice(&fixture.run(&["journal-id"]).stdout).unwrap();
+    let retry = fixture.run(&[
+        "retry",
+        "--op-id",
+        &key,
+        "--journal-id",
+        journal["journal_id"].as_str().unwrap(),
+    ]);
+    let absent: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(absent["kind"], "operation_absent");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].line.trim_end(), "GET /v2/me HTTP/1.1");
+}
+
+#[test]
+fn alarm_send_reuses_exact_preparation_and_keeps_unknown_when_capability_is_lost() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_tls::FixtureResponse;
+
+    let discoveries = AtomicUsize::new(0);
+    let sends = AtomicUsize::new(0);
+    let first_body = std::sync::Mutex::new(None);
+    let (server, identity) = SlowServer::mutual_tls_respond_to(move |request| {
+        if request.line.starts_with("GET ") {
+            let attempt = discoveries.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.line.trim_end(), "GET /v2/me HTTP/1.1");
+            return Some(FixtureResponse::json(
+                json!({"features":{"alarm":attempt != 2}}),
+            ));
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["message"]["alarm"], true);
+        assert!(body["message"].get("urgency").is_none());
+        assert!(
+            !request
+                .headers
+                .iter()
+                .any(|(name, _)| name == "harklight-features")
+        );
+        let mut first_body = first_body.lock().unwrap();
+        if let Some(first) = &*first_body {
+            assert_eq!(&request.body, first);
+        } else {
+            *first_body = Some(request.body.clone());
+        }
+        let mut response = FixtureResponse::json(json!({"rev":1,"message":{
+            "rev":1,"item_id":"item","sender":body["sender"],"revision":1,
+            "message":body["message"],"seen":false,"files":[],
+        }}));
+        response.truncate = sends.fetch_add(1, Ordering::Relaxed) == 0;
+        Some(response)
+    });
+    let fixture = CliFixture::new(&server, identity);
+    let key = Uuid::new_v4().to_string();
+    let args = [
+        "send",
+        "--sender-id",
+        "app:test",
+        "--type",
+        "fyi",
+        "--title",
+        "Alarm",
+        "--importance",
+        "alarm",
+        "--prepare",
+        "--op-id",
+        &key,
+    ];
+    let prepared = fixture.run(&args);
+    assert!(prepared.status.success(), "{prepared:?}");
+    let repeated = fixture.run(&args);
+    assert_eq!(prepared.stdout, repeated.stdout);
+    let lost = fixture.run(&["send", "--execute", "--op-id", &key]);
+    assert_eq!(lost.status.code(), Some(7), "{lost:?}");
+    let disabled = fixture.run(&["retry", "--op-id", &key]);
+    let output: Value = serde_json::from_slice(&disabled.stdout).unwrap();
+    assert_eq!(disabled.status.code(), Some(7), "{disabled:?}");
+    assert_eq!(output["kind"], "outcome_unknown");
+    let recovered = fixture.run(&["retry", "--op-id", &key]);
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert_eq!(
+        fixture.run(&["retry", "--op-id", &key]).stdout,
+        recovered.stdout
+    );
+}
+
+#[test]
+fn explicit_alarm_refuses_shared_writes_before_contacting_the_server() {
+    let (server, identity) = SlowServer::mutual_tls_respond_to(|request| {
+        panic!("shared Alarm operation unexpectedly sent {}", request.line);
+    });
+    let fixture = CliFixture::new(&server, identity);
+    let input = fixture.0.join("revision.json");
+    fs::write(&input, r#"{"title":"Alarm","created_at":1,"alarm":false}"#).unwrap();
+    for args in [
+        &[
+            "send",
+            "--sender-id",
+            "app:test",
+            "--type",
+            "fyi",
+            "--title",
+            "Alarm",
+            "--importance",
+            "alarm",
+            "--person-id",
+            "person",
+        ][..],
+        &[
+            "send",
+            "--sender-id",
+            "app:test",
+            "--type",
+            "fyi",
+            "--title",
+            "Alarm",
+            "--importance",
+            "alarm",
+            "--group-id",
+            "group",
+        ][..],
+        &[
+            "revise",
+            "--shared",
+            "--item-id",
+            "item",
+            "--base-revision",
+            "1",
+            "--message-json",
+            input.to_str().unwrap(),
+        ][..],
+        &[
+            "revise",
+            "--groups",
+            "--item-id",
+            "item",
+            "--base-revision",
+            "1",
+            "--message-json",
+            input.to_str().unwrap(),
+        ][..],
+    ] {
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["kind"], "refused");
+        assert_eq!(output["status"], 400);
+        assert_eq!(output["error"], "unsupported");
+    }
+}
+
+#[test]
+fn alarm_revision_flags_refuse_shared_scope_before_reading_the_item() {
+    let (server, identity) = SlowServer::mutual_tls_respond_to(|request| {
+        panic!("shared Alarm revision unexpectedly sent {}", request.line);
+    });
+    let fixture = CliFixture::new(&server, identity);
+
+    for scope in ["--shared", "--groups"] {
+        let args = [
+            "revise",
+            scope,
+            "--item-id",
+            "missing-item",
+            "--base-revision",
+            "1",
+            "--title",
+            "Revised",
+        ];
+        for flags in [&["--importance", "alarm"][..], &["--clear-alarm"][..]] {
+            let result = fixture.run(&[&args[..], flags].concat());
+            assert_eq!(result.status.code(), Some(5), "{result:?}");
+            let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(output["kind"], "refused");
+            assert_eq!(output["operation"], "revise");
+            assert_eq!(output["status"], 400);
+            assert_eq!(output["error"], "unsupported");
+        }
+
+        let conflict =
+            fixture.run(&[&args[..], &["--importance", "alarm", "--clear-alarm"]].concat());
+        assert_eq!(conflict.status.code(), Some(2), "{conflict:?}");
+        assert!(
+            String::from_utf8_lossy(&conflict.stderr)
+                .contains("--clear-alarm conflicts with --importance alarm")
+        );
+    }
+}
+
+#[test]
+fn alarm_revision_preserves_ordinary_urgency_and_can_clear_or_omit_marker() {
+    use test_tls::FixtureResponse;
+
+    for (flags, expected) in [
+        (&["--importance", "alarm"][..], Some(true)),
+        (&["--clear-alarm"][..], Some(false)),
+        (&[][..], None),
+    ] {
+        let (server, identity) = SlowServer::mutual_tls_respond_to(move |request| {
+            if request.line.starts_with("GET /v2/me ") {
+                assert!(expected.is_some());
+                return Some(FixtureResponse::json(json!({"features":{"alarm":true}})));
+            }
+            let response = |rev, content| {
+                FixtureResponse::json(json!({"rev":rev,"message":{
+                    "rev":rev,"item_id":"item","sender":"app:test","revision":rev,
+                    "message":content,"seen":false,"files":[],
+                }}))
+            };
+            if request.line.starts_with("GET ") {
+                assert_eq!(
+                    request.line.trim_end(),
+                    "GET /v2/agent/messages/item HTTP/1.1"
+                );
+                return Some(response(
+                    1,
+                    json!({"title":"Before","created_at":1,"urgency":"high","alarm":true}),
+                ));
+            }
+            assert_eq!(
+                request.line.trim_end(),
+                "PUT /v2/agent/messages/item HTTP/1.1"
+            );
+            let mut body: Value =
+                serde_json::from_slice::<Value>(&request.body).unwrap()["message"].clone();
+            assert_eq!(body["urgency"], "high");
+            assert_eq!(body.get("alarm").and_then(Value::as_bool), expected);
+            if expected == Some(false) {
+                body.as_object_mut().unwrap().remove("alarm");
+            } else {
+                body["alarm"] = true.into();
+            }
+            Some(response(2, body))
+        });
+        let fixture = CliFixture::new(&server, identity);
+        let mut args = vec![
+            "revise",
+            "--item-id",
+            "item",
+            "--base-revision",
+            "1",
+            "--title",
+            "After",
+        ];
+        args.extend_from_slice(flags);
+        let revised = fixture.run(&args);
+        assert!(revised.status.success(), "{revised:?}");
+    }
+}
+
+#[test]
 fn recipient_reach_notice_preserves_send_and_message_get_json() {
     use test_tls::FixtureResponse;
 

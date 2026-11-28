@@ -67,11 +67,15 @@ impl AgentClient {
     pub fn capabilities(&self) -> Result<Value, V2Error> {
         let me = self.read(&["me"], &[])?;
         let shared = me["features"]["shared_messages"] == true;
-        Ok(serde_json::json!({
+        let mut capabilities = serde_json::json!({
             "server_id": me["server"]["id"],
             "shared_messages": shared,
             "groups": shared && me["features"]["groups"] == true,
-        }))
+        });
+        if me["features"]["alarm"] == true {
+            capabilities["alarm"] = true.into();
+        }
+        Ok(capabilities)
     }
 
     pub(crate) fn server_binding(&self) -> &str {
