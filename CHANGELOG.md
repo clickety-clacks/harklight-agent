@@ -6,8 +6,28 @@
   activity on a Server that supports Alarm. Use `revise --clear-alarm` to clear
   it. Alarm leaves urgency and alert behavior unchanged.
 
-- Send to groups by ID or self-hosted name. Use group-scoped activity reads
-  and sender commands on Servers that advertise group messaging.
+## 0.2.11
+
+- Send to a group with `send --group-id ID` or, on a self-hosted Server,
+  `send --group-name NAME`. Requests can name a decider with
+  `--decider-id PERSON_ID`. The send receipt identifies the group without
+  listing its members.
+- Run `groups` to list the groups the authenticated person has joined.
+  An affiliated sender can still post to a known group without joining it.
+- Use `--groups` for group activity, message reads, Chat, revisions,
+  withdrawal, and entry or answer receipts. Prepare and resume a fresh
+  group-scoped baseline before reading or following group activity. Keep
+  `--groups` with that baseline's session and continuation. Chat and answers
+  retain their individual speaker identities.
+- A fresh group `send --prepare` checks that the Server advertises both
+  shared messaging and groups before staging attachments or saving the
+  operation. Re-preparing the exact saved operation stays offline, and
+  execute and retry reuse its saved group scope.
+
+Compatibility: protocol 0.2. Group messaging requires Harklight Server
+0.2.34 or later with shared messaging and groups enabled. Existing
+individual and shared-people commands retain their current behavior and
+Server requirements.
 
 ## 0.2.10
 
